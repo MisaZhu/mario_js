@@ -2,7 +2,7 @@
  * very tiny js script compiler.
  */
 
-#include "mario.h"
+#include "mario_lex.h"
 #include <stdlib.h>
 
 #ifdef __cplusplus

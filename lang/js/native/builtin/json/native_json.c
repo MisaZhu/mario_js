@@ -1,6 +1,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+#include "json.h"
 #include "native_json.h"
 #include <stdlib.h>
 

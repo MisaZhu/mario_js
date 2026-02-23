@@ -14,6 +14,7 @@ NATIVE_OBJS= $(NATIVE_PATH)/natives.o  \
 	$(NATIVE_PATH_BUILTIN)/string/native_string.o \
 	$(NATIVE_PATH_BUILTIN)/array/native_array.o \
 	$(NATIVE_PATH_BUILTIN)/promise/native_promise.o \
+	$(NATIVE_PATH_BUILTIN)/json/json.o \
 	$(NATIVE_PATH_BUILTIN)/json/native_json.o \
 	$(NATIVE_PATH_BUILTIN)/system/native_system.o \
 	$(NATIVE_PATH_BUILTIN)/fs/native_fs.o \
