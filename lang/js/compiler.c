@@ -1728,16 +1728,14 @@ bool stmt_strict(lex_t* l, bytecode_t* bc) {
 }
 
 bool statement(lex_t* l, bytecode_t* bc) {
-    bool pop = true;
+    bool pop = false;
 
     if (l->tk == '\n') {
         lex_skip_empty(l);
-        pop = false;
     } else if (l->tk == '{') { /* A block of code */
         if (!stmt_block(l, bc, false)) {
             return false;
         }
-        pop = false;
     } else if (l->tk == LEX_STR || 
                l->tk == LEX_INT || l->tk == LEX_FLOAT ||
                l->tk == '[' ||
@@ -1745,9 +1743,7 @@ bool statement(lex_t* l, bytecode_t* bc) {
                l->tk == LEX_PLUSPLUS ||
                l->tk == LEX_MINUSMINUS ||
                l->tk == '-') {
-        if (stmt_strict(l, bc)) {
-            pop = false;
-        } else {
+        if (!stmt_strict(l, bc)) {
             /* Execute a simple statement that only contains basic arithmetic... */
             if (!base(l, bc)) {
                 return false;
@@ -1757,64 +1753,55 @@ bool statement(lex_t* l, bytecode_t* bc) {
                     return false;
                 }
             }
+        	pop = true;
         }
     } else if (l->tk == LEX_R_VAR || l->tk == LEX_R_CONST || l->tk == LEX_R_SAFE_VAR) {
         if (!stmt_var(l, bc)) {
             return false;
         }
-        pop = false;
     } else if (l->tk == LEX_R_CLASS) {
         factor_def_class(l, bc);
+       	pop = true;
     } else if (l->tk == LEX_R_FUNCTION) {
         if (!stmt_function(l, bc)) {
             return false;
         }
-        pop = false;
     } else if (l->tk == LEX_R_INCLUDE) {
         if (!stmt_include(l, bc)) {
             return false;
         }
-        pop = false;
     } else if (l->tk == LEX_R_RETURN) {
         if (!stmt_return(l, bc)) {
             return false;
         }
-        pop = false;
     } else if (l->tk == LEX_R_IF) {
         if (!stmt_if(l, bc)) {
             return false;
         }
-        pop = false;
     } else if (l->tk == LEX_R_WHILE) {
         if (!stmt_while(l, bc)) {
             return false;
         }
-        pop = false;
     } else if (l->tk == LEX_R_FOR) {
         if (!stmt_for(l, bc)) {
             return false;
         }
-        pop = false;
     } else if (l->tk == LEX_R_BREAK) {
         if (!stmt_break(l, bc)) {
             return false;
         }
-        pop = false;
     } else if (l->tk == LEX_R_CONTINUE) {
         if (!stmt_continue(l, bc)) {
             return false;
         }
-        pop = false;
     } else if (l->tk == LEX_R_THROW) {
         if (!stmt_throw(l, bc)) {
             return false;
         }
-        pop = false;
     } else if (l->tk == LEX_R_TRY) {
         if (!stmt_try(l, bc)) {
             return false;
         }
-        pop = false;
     }
 
     if (pop) {
