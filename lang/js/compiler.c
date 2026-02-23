@@ -1206,11 +1206,11 @@ bool base(lex_t* l, bytecode_t* bc) {
     }
 
     if (l->tk == '=' || 
-        l->tk == LEX_PLUSEQUAL ||
-        l->tk == LEX_MULTIEQUAL ||
-        l->tk == LEX_DIVEQUAL ||
-        l->tk == LEX_MODEQUAL ||
-        l->tk == LEX_MINUSEQUAL) {
+			l->tk == LEX_PLUSEQUAL ||
+			l->tk == LEX_MULTIEQUAL ||
+			l->tk == LEX_DIVEQUAL ||
+			l->tk == LEX_MODEQUAL ||
+	        l->tk == LEX_MINUSEQUAL) {
         LEX_TYPES op = (LEX_TYPES)l->tk;
         if (!lex_chkread(l, l->tk)) {
             return false;
@@ -1232,6 +1232,9 @@ bool base(lex_t* l, bytecode_t* bc) {
         } else if (op == LEX_MODEQUAL) {
             bc_gen(bc, INSTR_MODEQ);
         }
+		else {
+			return false;
+		}
     }
     return true;
 }
