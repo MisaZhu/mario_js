@@ -457,6 +457,13 @@ int call_func(lex_t* l, bytecode_t* bc) {
     if (!lex_chkread(l, '(')) {
         return -1;
     }
+
+	lex_skip_empty(l);
+	if(l->tk == ')') {
+		lex_chkread(l, ')');
+		return 0;
+	}
+
     int arg_num = 0;
     while (true) {
         PC pc1 = bc->cindex;
@@ -837,23 +844,27 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
         if (!lex_chkread(l, '(')) {
             return false;
         }
-        if (!base(l, bc)) {
-            return false;
-        }
-        lex_skip_empty(l);
 
-        while (l->tk == ',') {
-            if (!lex_chkread(l, ',')) {
-                return false;
-            }
-            if (!base(l, bc)) {
-                return false;
-            }
-            lex_skip_empty(l);
-        }
-        if (!lex_chkread(l, ')')) {
-            return false;
-        }
+		lex_skip_empty(l);
+		if(l->tk != ')') {
+			if (!base(l, bc)) {
+				return false;
+			}
+			lex_skip_empty(l);
+
+			while (l->tk == ',') {
+				if (!lex_chkread(l, ',')) {
+					return false;
+				}
+				if (!base(l, bc)) {
+					return false;
+				}
+				lex_skip_empty(l);
+			}
+		}
+		if (!lex_chkread(l, ')')) {
+			return false;
+		}
 
         if (l->tk == LEX_R_AFUNCTION) {
             if (!lex_chkread(l, LEX_R_AFUNCTION)) {
@@ -946,7 +957,7 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
         }
         mstr_free(name);
     }
-	else if(l->tk != ')'){
+	else {
 		return false;
 	}
 
