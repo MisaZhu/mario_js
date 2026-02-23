@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-#include "compiler/mario_lex.h"
+#include "lex/mario_lex.h"
 
 extern var_t* json_parse(vm_t* vm, const char* str);
 
