@@ -253,13 +253,10 @@ void lex_get_next_token(lex_t* lex) {
 	lex_token_end(lex);
 }
 
-#ifdef MARIO_DEBUG
-
-const char* lex_get_token_str(int token) {
+const char* lex_get_token_str(int token, char* str) {
 	if (token>32 && token<128) {
-		static char buf[4] = "' '";
-		buf[1] = (char)token;
-		return buf;
+		str[0] = (char)token;
+		return str;
 	}
 	switch (token) {
 		case LEX_EOF            : return "EOF";
@@ -316,16 +313,6 @@ const char* lex_get_token_str(int token) {
 	return "?[UNKNOW]";
 }
 
-#endif
-
-void mario_debug_pos(lex_t* l, int pos) {
-	int line = 1;
-	int col;
-
-	lex_get_pos(l, &line, &col, pos);
-	mario_debug("(line: %d, col: %d)\n",  line, col);
-}
-
 void mario_error_pos(lex_t* l, int pos) {
 	int line = 1;
 	int col;
@@ -345,9 +332,12 @@ bool lex_skip_empty(lex_t* l) {
 
 bool lex_chkread(lex_t* lex, uint32_t expected_tk) { //check read with empty line.
 	if (lex->tk != expected_tk) {
-#ifdef MARIO_DEBUG
-		mario_debug("lex got '%s' expected '%s'", lex_get_token_str(lex->tk), lex_get_token_str(expected_tk));
-#endif
+		char s_tk[2] = {0};
+		char s_expect[2] = {0};
+		const char* stk = lex_get_token_str(lex->tk, s_tk);
+		const char* sexp = lex_get_token_str(expected_tk, s_expect);
+
+		mario_printf("lex got '%s' expected '%s'! ", stk, sexp);
 		mario_error_pos(lex, -1);
 		return false;
 	}
@@ -569,6 +559,10 @@ bool factor_new(lex_t*l, bytecode_t* bc) {
 	if(!lex_chkread(l, LEX_ID)) return false;
 	if (l->tk == '(') {
 		int arg_num = call_func(l, bc);
+		if(arg_num < 0) {
+			mstr_free(class_name);
+			return false;
+		}
 		mstr_t* s = mstr_new("");
 		gen_func_name(class_name->cstr, arg_num, s);
 		bc_gen_str(bc, INSTR_NEW, s->cstr);
@@ -610,7 +604,8 @@ bool factor_array(lex_t*l, bytecode_t* bc) {
 	if(!lex_chkread(l, '[')) return false;
 	bc_gen(bc, INSTR_ARRAY);
 	while (l->tk != ']') {
-		base(l, bc);
+		if(!base(l, bc))
+			return false;
 		bc_gen(bc, INSTR_MEMBER);
 		if (l->tk != ']') {
 			if(!lex_chkread(l, ',')) return false;
@@ -625,6 +620,10 @@ bool factor_call_func(lex_t* l, bytecode_t* bc, mstr_t* name, bool member) {
 	mstr_t* s = mstr_new("");
 
 	int arg_num = call_func(l, bc);
+	if(arg_num < 0) {
+		mstr_free(s);
+		return false;
+	}
 	gen_func_name(name->cstr, arg_num, s);
 	bc_gen_str(bc, member ? INSTR_CALLO:INSTR_CALL, s->cstr); 
 	mstr_free(s);
@@ -712,10 +711,16 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
 	}
 	else if(l->tk==LEX_ID) {
 		mstr_t* name = mstr_new(l->tk_str->cstr);
-		if(!lex_chkread(l, LEX_ID)) return false;
+		if(!lex_chkread(l, LEX_ID)) {
+			mstr_free(name);
+			return false;
+		}
 
 		if (l->tk=='(') { // function call
-			factor_call_func(l, bc, name, member);
+			if(!factor_call_func(l, bc, name, member)) {
+				mstr_free(name);
+				return false;
+			}
 		} 
 		else if (l->tk == '[') { // array access
 			factor_array_access(l, bc, name, member);
@@ -740,9 +745,12 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
 		mstr_free(name);
 	}
 
+
 	if(l->tk == '.')  { // followed by member fetch
-		if(!lex_chkread(l, '.')) return false;
-		if(!factor(l, bc, true)) return false;;
+		if(!lex_chkread(l, '.'))
+			return false;
+		if(!factor(l, bc, true))
+			return false;;
 	}
 	return true;
 }
@@ -946,11 +954,13 @@ bool ternary(lex_t *l, bytecode_t* bc) {
 	if (l->tk=='?') {
 		PC pc1 = bc_reserve(bc); //keep for jump
 		if(!lex_chkread(l, '?')) return false;
-		base(l, bc); //first choice
+		if(!base(l, bc))
+			return false;
 		PC pc2 = bc_reserve(bc); //keep for jump
 		if(!lex_chkread(l, ':')) return false;
 		bc_set_instr(bc, pc1, INSTR_NJMP, ILLEGAL_PC);
-		base(l, bc); //second choice
+		if(!base(l, bc))
+			return false;
 		bc_set_instr(bc, pc2, INSTR_JMP, ILLEGAL_PC);
 	} 
 	return true; 
@@ -961,14 +971,15 @@ bool base(lex_t* l, bytecode_t* bc) {
 		return false;
 
 	if (l->tk=='=' || 
-		l->tk==LEX_PLUSEQUAL ||
-		l->tk==LEX_MULTIEQUAL ||
-		l->tk==LEX_DIVEQUAL ||
-		l->tk==LEX_MODEQUAL ||
-		l->tk==LEX_MINUSEQUAL) {
+			l->tk==LEX_PLUSEQUAL ||
+			l->tk==LEX_MULTIEQUAL ||
+			l->tk==LEX_DIVEQUAL ||
+			l->tk==LEX_MODEQUAL ||
+			l->tk==LEX_MINUSEQUAL) {
 		LEX_TYPES op = (LEX_TYPES)l->tk;
 		if(!lex_chkread(l, l->tk)) return false;
-		base(l, bc);
+		if(!base(l, bc))
+			return false;
 		// sort out initialiser
 		if (op == '=')  {
 			bc_gen(bc, INSTR_ASIGN);
@@ -1021,7 +1032,10 @@ bool stmt_var(lex_t* l, bytecode_t* bc) {
 		if (l->tk == '=') {
 			if(!lex_chkread(l, '=')) return false;
 			bc_gen_str(bc, INSTR_LOAD, vname->cstr);
-			if(!base(l, bc)) return false;
+			if(!base(l, bc)) {
+				mstr_free(vname);
+				return false;
+			}
 			bc_gen(bc, INSTR_ASIGN);
 			bc_gen(bc, INSTR_POP);
 		}
