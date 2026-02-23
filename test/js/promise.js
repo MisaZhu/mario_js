@@ -120,6 +120,7 @@ try {
     console.log("✗ Chained promises failed:", e);
 }
 
+
 // Test 10: Promise with executor
 console.log("\nTest 10: Promise with executor");
 try {
