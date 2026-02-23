@@ -23,11 +23,6 @@ CFLAGS += -O2
 #CXXFLAGS += -O2
 endif
 
-ifneq ($(MARIO_THREAD),no)
-CFLAGS += -DMARIO_THREAD
-#CXXFLAGS += -DMARIO_THREAD
-endif
-
 
 HEADS = -I$(NATIVE_PATH_BUILTIN) \
 	-I$(MARIO_VM)/mario \
