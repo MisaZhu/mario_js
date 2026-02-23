@@ -642,6 +642,7 @@ bool factor_def_class(lex_t* l, bytecode_t* bc) {
     if (l->tk == LEX_ID) {
         mstr_cpy(name, l->tk_str->cstr);
         if (!lex_chkread(l, LEX_ID)) {
+            mstr_free(name);
             return false;
         }
     }
@@ -651,11 +652,13 @@ bool factor_def_class(lex_t* l, bytecode_t* bc) {
     /*read extends*/
     if (l->tk == LEX_R_EXTENDS) {
         if (!lex_chkread(l, LEX_R_EXTENDS)) {
+            mstr_free(name);
             return false;
         }
         lex_skip_empty(l);
         mstr_cpy(name, l->tk_str->cstr);
         if (!lex_chkread(l, LEX_ID)) {
+            mstr_free(name);
             return false;
         }
         bc_gen_str(bc, INSTR_EXTENDS, name->cstr);
@@ -663,6 +666,7 @@ bool factor_def_class(lex_t* l, bytecode_t* bc) {
 
     lex_skip_empty(l);
     if (!lex_chkread(l, '{')) {
+        mstr_free(name);
         return false;
     }
     lex_skip_empty(l);
@@ -670,12 +674,15 @@ bool factor_def_class(lex_t* l, bytecode_t* bc) {
         if (l->tk == LEX_ID && l->next_ch == '=') {
             bc_gen_str(bc, INSTR_LOAD, l->tk_str->cstr);
             if (!lex_chkread(l, LEX_ID)) {
+                mstr_free(name);
                 return false;
             }
             if (!lex_chkread(l, '=')) {
+                mstr_free(name);
                 return false;
             }
             if (!base(l, bc)) {
+                mstr_free(name);
                 return false;
             }
             bc_gen(bc, INSTR_ASIGN);
@@ -684,6 +691,7 @@ bool factor_def_class(lex_t* l, bytecode_t* bc) {
             lex_skip_empty(l);
         } else {
             if (!factor_def_func(l, bc, name)) {
+                mstr_free(name);
                 return false;
             }
             lex_skip_empty(l);
@@ -691,6 +699,7 @@ bool factor_def_class(lex_t* l, bytecode_t* bc) {
         }
     }
     if (!lex_chkread(l, '}')) {
+        mstr_free(name);
         return false;
     }
     bc_gen(bc, INSTR_CLASS_END);
@@ -708,6 +717,7 @@ bool factor_new(lex_t* l, bytecode_t* bc) {
     mstr_cpy(class_name, l->tk_str->cstr);
 
     if (!lex_chkread(l, LEX_ID)) {
+        mstr_free(class_name);
         return false;
     }
     if (l->tk == '(') {
@@ -736,25 +746,29 @@ bool factor_json(lex_t* l, bytecode_t* bc) {
         // we only allow strings or IDs on the left hand side of an initialisation
         if (l->tk == LEX_STR) {
             if (!lex_chkread(l, LEX_STR)) {
+                mstr_free(id);
                 return false;
             }
         } else {
             if (!lex_chkread(l, LEX_ID)) {
+                mstr_free(id);
                 return false;
             }
         }
         
         if (!lex_chkread(l, ':')) {
+            mstr_free(id);
             return false;
         }
         if (!base(l, bc)) {
+            mstr_free(id);
             return false;
         }
         lex_skip_empty(l);
         bc_gen_str(bc, INSTR_MEMBERN, id->cstr);
-        // no need to clean here, as it will definitely be used
         if (l->tk != '}') {
             if (!lex_chkread(l, ',')) {
+                mstr_free(id);
                 return false;
             }
         }
@@ -1483,12 +1497,14 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
                 lex_chkread(l, '=');
                 bc_gen_str(bc, INSTR_LOAD, loop_var->cstr);
                 if (!base(l, bc)) {
+                    mstr_free(loop_var);
                     return false;
                 }
                 bc_gen(bc, INSTR_ASIGN);
                 bc_gen(bc, INSTR_POP);
             }
             if (l->tk != ';') {
+                mstr_free(loop_var);
                 return false;
             }
             lex_chkread(l, ';');
@@ -1511,9 +1527,15 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
     // Standard for loop implementation
     bc_set_instr(bc, pc_condition, INSTR_JMP, bc->cindex);
     if (!base(l, bc)) { //condition
+        if (loop_var) {
+            mstr_free(loop_var);
+        }
         return false;
     }
     if (!lex_chkread(l, ';')) {
+        if (loop_var) {
+            mstr_free(loop_var);
+        }
         return false;
     }
     lex_skip_empty(l);
@@ -1522,9 +1544,15 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
 
     PC pci = bc->cindex;  //iterator anchor;
     if (!base(l, bc)) { //iterator statement
+        if (loop_var) {
+            mstr_free(loop_var);
+        }
         return false;
     }
     if (!lex_chkread(l, ')')) {
+        if (loop_var) {
+            mstr_free(loop_var);
+        }
         return false;
     }
     bc_gen(bc, INSTR_POP); //pop the stack.
@@ -1535,6 +1563,9 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
 
     // Loop body
     if (!stmt_loop_block(l, bc)) {
+        if (loop_var) {
+            mstr_free(loop_var);
+        }
         return false;
     }
 
