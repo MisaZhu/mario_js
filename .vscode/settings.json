@@ -40,7 +40,15 @@
         "utility": "c",
         "initializer_list": "c",
         "__bit_reference": "c",
-        "tuple": "c"
+        "tuple": "c",
+        "unistd.h": "c",
+        "stat.h": "c",
+        "stdio.h": "c",
+        "bcdump.h": "c",
+        "stdlib.h": "c",
+        "mem_debug.h": "c",
+        "exception": "c",
+        "new": "c"
     },
     "C_Cpp.errorSquiggles": "disabled"
 }

@@ -18,6 +18,7 @@ MARIO_OBJS = $(mario_OBJS) $(mvm_OBJS) $(lang_OBJS) \
 ifeq ($(MARIO_DEBUG),yes)
 CFLAGS += -g -DMARIO_DEBUG
 #CXXFLAGS += -g -DMARIO_DEBUG
+mvm_OBJS += bin/mario/mem_debug.o
 else
 CFLAGS += -O2
 #CXXFLAGS += -O2

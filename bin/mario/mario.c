@@ -8,13 +8,35 @@
 #include <fcntl.h>
 #include <stdio.h>
 
+#ifdef MARIO_DEBUG
+#include "mem_debug.h"
+#endif
+
+
+void mario_mem_init(void) {
+#ifdef MARIO_DEBUG
+	mem_init_debug();
+#endif
+}
+
+void mario_mem_quit(void) {
+#ifdef MARIO_DEBUG
+	mem_quit_debug();
+#endif	
+}
+
 static void out(const char* str) {
     write(1, str, strlen(str));
 }
 
 void platform_init(void) {
+#ifdef MARIO_DEBUG
+	_platform_malloc = malloc_debug;
+	_platform_free = free_debug;
+#else
 	_platform_malloc = malloc;
 	_platform_free = free;
+#endif	
     _platform_out = out;
 }
 
@@ -106,9 +128,9 @@ int main(int argc, char** argv) {
 		return -1;
 	}
 
+	mario_mem_init();
 	bool loaded = true;
 
-	mario_mem_init();
 	vm_t* vm = vm_new(js_compile, VAR_CACHE_MAX_DEF, LOAD_NCACHE_MAX_DEF);
 	vm->gc.gc_trig_var_num = 1024;
 	init_args(vm, argc, argv);

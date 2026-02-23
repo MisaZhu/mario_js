@@ -1439,7 +1439,6 @@ bool stmt_for_in(lex_t* l, bytecode_t* bc,
     }
     
     // Increment index
-    PC pci = bc->cindex;  //iterator anchor;
     bc_gen_str(bc, INSTR_LOAD, "__for_in_idx");
     bc_gen(bc, INSTR_PPLUS);
     bc_gen(bc, INSTR_POP);
