@@ -345,9 +345,7 @@ bool lex_skip_empty(lex_t* l) {
 
 bool lex_chkread(lex_t* lex, uint32_t expected_tk) { //check read with empty line.
 	if (lex->tk != expected_tk) {
-#ifdef MARIO_DEBUG
-		mario_debug("Got %s expected %s", lex_get_token_str(lex->tk), lex_get_token_str(expected_tk));
-#endif
+		mario_printf("lex got '%s' expected '%s'", lex_get_token_str(lex->tk), lex_get_token_str(expected_tk));
 		mario_debug_pos(lex, -1);
 		return false;
 	}

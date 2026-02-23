@@ -3,6 +3,7 @@
 #include "number/native_number.h"
 #include "array/native_array.h"
 #include "string/native_string.h"
+#include "promise/native_promise.h"
 //#include "math/native_math.h"
 #include "bytes/native_bytes.h"
 #include "console/native_console.h"
@@ -25,6 +26,7 @@ void reg_basic_natives(vm_t* vm) {
 	reg_native_string(vm);
 	reg_native_console(vm);
 	reg_native_number(vm);
+	reg_native_promise(vm);
 	//reg_native_math(vm);
 	reg_native_json(vm);
 	reg_native_bytes(vm);
