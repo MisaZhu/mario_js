@@ -331,7 +331,7 @@ void mario_error_pos(lex_t* l, int pos) {
 	int col;
 
 	lex_get_pos(l, &line, &col, pos);
-	mario_printf("(line: %d, col: %d)\n",  line, col);
+	mario_printf("compile error at (line: %d, col: %d)\n",  line, col);
 }
 
 bool lex_chkread(lex_t* lex, uint32_t expected_tk);
@@ -345,8 +345,10 @@ bool lex_skip_empty(lex_t* l) {
 
 bool lex_chkread(lex_t* lex, uint32_t expected_tk) { //check read with empty line.
 	if (lex->tk != expected_tk) {
-		mario_printf("lex got '%s' expected '%s'", lex_get_token_str(lex->tk), lex_get_token_str(expected_tk));
-		mario_debug_pos(lex, -1);
+#ifdef MARIO_DEBUG
+		mario_debug("lex got '%s' expected '%s'", lex_get_token_str(lex->tk), lex_get_token_str(expected_tk));
+#endif
+		mario_error_pos(lex, -1);
 		return false;
 	}
 	lex_get_next_token(lex);
