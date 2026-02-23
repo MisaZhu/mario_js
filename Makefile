@@ -9,7 +9,7 @@ endif
 
 include $(MARIO_VM)/lang/js/lang.mk
 
-mario_OBJS = $(MARIO_VM)/mario/mario.o $(MARIO_VM)/mario/mario_lex.o $(MARIO_VM)/mario/bcdump/bcdump.o
+mario_OBJS = $(MARIO_VM)/mario/mario.o $(MARIO_VM)/mario/compiler/mario_lex.o $(MARIO_VM)/mario/bcdump/bcdump.o
 mvm_OBJS = bin/mario/mario.o bin/lib/mbc.o bin/lib/js.o 
 
 MARIO_OBJS = $(mario_OBJS) $(mvm_OBJS) $(lang_OBJS) \
