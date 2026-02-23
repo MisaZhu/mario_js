@@ -403,7 +403,7 @@ const char* lex_get_token_str(int token, char* str) {
     return "?[UNKNOW]";
 }
 
-void mario_error_pos(lex_t* l, int pos) {
+void compile_error_pos(lex_t* l, int pos) {
     int line = 1;
     int col;
 
@@ -431,7 +431,7 @@ bool lex_chkread(lex_t* lex, uint32_t expected_tk) { //check read with empty lin
         const char* sexp = lex_get_token_str(expected_tk, s_expect);
 
         mario_printf("lex got '%s' expected '%s'! ", stk, sexp);
-        mario_error_pos(lex, -1);
+        compile_error_pos(lex, -1);
         return false;
     }
     lex_get_next_token(lex);
@@ -1839,7 +1839,7 @@ bool js_compile(bytecode_t *bc, const char* input) {
         bc_gen(bc, INSTR_END);
     }
 	else {
-        mario_error_pos(&lex, -1);
+        compile_error_pos(&lex, -1);
 	}
     
     lex_release(&lex);
