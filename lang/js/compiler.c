@@ -932,6 +932,9 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
         }
         mstr_free(name);
     }
+	else if(l->tk != ')'){
+		return false;
+	}
 
     if (l->tk == '.') { // followed by member fetch
         if (!lex_chkread(l, '.')) {
@@ -941,6 +944,7 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
             return false;
         }
     }
+
     return true;
 }
 
@@ -1235,12 +1239,14 @@ bool stmt_var(lex_t* l, bytecode_t* bc) {
     while (!is_stmt_end(l->tk)) {
         mstr_t* vname = mstr_new(l->tk_str->cstr);
         if (!lex_chkread(l, LEX_ID)) {
+			mstr_free(vname);
             return false;
         }
         bc_gen_str(bc, op, vname->cstr);
         // sort out initialiser
         if (l->tk == '=') {
             if (!lex_chkread(l, '=')) {
+				mstr_free(vname);
                 return false;
             }
             bc_gen_str(bc, INSTR_LOAD, vname->cstr);
@@ -1253,6 +1259,7 @@ bool stmt_var(lex_t* l, bytecode_t* bc) {
         }
         if (!is_stmt_end(l->tk)) {
             if (!lex_chkread(l, ',')) {
+				mstr_free(vname);
                 return false;
             }
         }
@@ -1786,6 +1793,9 @@ bool js_compile(bytecode_t *bc, const char* input) {
     if (ret) {
         bc_gen(bc, INSTR_END);
     }
+	else {
+        mario_error_pos(&lex, -1);
+	}
     
     lex_release(&lex);
     return ret;
