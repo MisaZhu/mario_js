@@ -2,7 +2,7 @@
 extern "C" {
 #endif
 
-#include "native_string.h"
+#include "native_String.h"
 
 /**======utf8 functions======*/
 
@@ -594,7 +594,7 @@ var_t* native_UTF8ReaderRead(vm_t* vm, var_t* env, void* data) {
 #define CLS_UTF8 "UTF8"
 #define CLS_UTF8_READER "UTF8Reader"
 
-void reg_native_string(vm_t* vm) {
+void reg_native_String(vm_t* vm) {
 	var_t* cls = vm_new_class(vm, CLS_STRING);
 	vm_reg_native(vm, cls, "constructor(str)", native_StringConstructor, NULL); 
 	vm_reg_native(vm, cls, "length()", native_StringLength, NULL); 

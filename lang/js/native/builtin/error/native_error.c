@@ -2,7 +2,7 @@
 extern "C" {
 #endif
 
-#include "native_error.h"
+#include "native_Error.h"
 
 #define CLS_ERROR "Error"
 
@@ -15,7 +15,7 @@ var_t* native_ErrorConstructor(vm_t* vm, var_t* env, void* data) {
 	return thisV;
 }
 
-void reg_native_error(vm_t* vm) {
+void reg_native_Error(vm_t* vm) {
 	var_t* cls = vm_new_class(vm, CLS_ERROR);
 	vm_reg_var(vm, cls, "message", var_new_str(vm, ""), false);
 	vm_reg_native(vm, cls, "constructor(str)", native_ErrorConstructor, NULL); 

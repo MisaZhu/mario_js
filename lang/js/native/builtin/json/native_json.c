@@ -1,8 +1,8 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#include "json.h"
-#include "native_json.h"
+#include "JSON.h"
+#include "native_JSON.h"
 #include <stdlib.h>
 
 /**JSON functions */
@@ -28,7 +28,7 @@ var_t* native_json_parse(vm_t* vm, var_t* env, void* data) {
 
 #define CLS_JSON "JSON"
 
-void reg_native_json(vm_t* vm) {
+void reg_native_JSON(vm_t* vm) {
 	var_t* cls = vm_new_class(vm, CLS_JSON);
 	vm_reg_native(vm, cls, "stringify(var)", native_json_stringify, NULL);
 	vm_reg_native(vm, cls, "parse(str)", native_json_parse, NULL);

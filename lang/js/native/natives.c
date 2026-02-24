@@ -14,6 +14,9 @@ static inline void load_basic_classes(vm_t* vm) {
 	vm->builtin_vars.var_Number = vm_load_var(vm, "Number", false);
 	vm->builtin_vars.var_Error = vm_load_var(vm, "Error", false);
 	vm->builtin_vars.var_Array = vm_load_var(vm, "Array", false);
+
+	var_t* console = new_obj(vm, "Console", 0);
+	var_add(vm->root, "console", console);
 }
 
 void reg_natives(vm_t* vm) {

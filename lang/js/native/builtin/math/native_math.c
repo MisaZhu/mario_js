@@ -1,4 +1,4 @@
-#include "native_math.h"
+#include "native_Math.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -292,7 +292,7 @@ var_t* native_math_randInt(vm_t* vm, var_t* env, void *data) {
 
 #define CLS_MATH "Math"
 
-void reg_native_math(vm_t* vm) {
+void reg_native_Math(vm_t* vm) {
 	var_t* cls = vm_new_class(vm, CLS_MATH);
 	vm_reg_static(vm, cls, "abs(a)", native_math_abs, NULL);
 	vm_reg_static(vm, cls, "round(a)", native_math_round, NULL);

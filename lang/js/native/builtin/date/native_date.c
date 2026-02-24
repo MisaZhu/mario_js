@@ -30,7 +30,7 @@ var_t* native_date_get_time(vm_t* vm, var_t* env, void* data) {
 }
 
 #define CLS_DATE "Date"
-void reg_native_date(vm_t* vm) {
+void reg_native_Date(vm_t* vm) {
     var_t* cls = vm_new_class(vm, CLS_DATE);
     vm_reg_static(vm, cls, "now()", native_date_now, NULL);
     vm_reg_static(vm, cls, "getTime()", native_date_get_time, NULL);

@@ -2,7 +2,7 @@
 extern "C" {
 #endif
 
-#include "native_array.h"
+#include "native_Array.h"
 
 /** Array */
 
@@ -210,7 +210,7 @@ var_t* native_Array_length(vm_t* vm, var_t* env, void* data) {
 
 #define CLS_ARRAY "Array"
 
-void reg_native_array(vm_t* vm) {
+void reg_native_Array(vm_t* vm) {
   var_t* cls = vm_new_class(vm, CLS_ARRAY);
 	vm_reg_native(vm, cls, "constructor()", native_Array_constructor, NULL);
 	vm_reg_native(vm, cls, "toString()", native_Array_toString, NULL); 

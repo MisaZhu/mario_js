@@ -3,6 +3,6 @@
 
 #include "mario.h"
 
-void reg_native_promise(vm_t* vm);
+void reg_native_Promise(vm_t* vm);
 
 #endif

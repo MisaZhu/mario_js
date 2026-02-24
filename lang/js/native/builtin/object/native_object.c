@@ -2,7 +2,7 @@
 extern "C" {
 #endif
 
-#include "native_object.h"
+#include "native_Object.h"
 
 /** Object */
 
@@ -133,7 +133,7 @@ var_t* native_Object_defineProperty(vm_t* vm, var_t* env, void* data) {
 
 #define CLS_OBJECT "Object"
 
-void reg_native_object(vm_t* vm) {
+void reg_native_Object(vm_t* vm) {
 	var_t* cls = vm_new_class(vm, CLS_OBJECT);
 	vm_reg_static(vm, cls, "create(proto)", native_Object_create, NULL); 
 	vm_reg_static(vm, cls, "getPrototypeOf(obj)", native_Object_getPrototypeOf, NULL); 

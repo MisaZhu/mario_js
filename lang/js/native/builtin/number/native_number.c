@@ -2,7 +2,7 @@
 extern "C" {
 #endif
 
-#include "native_number.h"
+#include "native_Number.h"
 
 /** Number */
 
@@ -45,7 +45,7 @@ var_t* native_Number_toString(vm_t* vm, var_t* env, void* data) {
 
 #define CLS_NUMBER "Number"
 
-void reg_native_number(vm_t* vm) {
+void reg_native_Number(vm_t* vm) {
 	var_t* cls = vm_new_class(vm, CLS_NUMBER);
 	vm_reg_native(vm, cls, "toString(radix)", native_Number_toString, NULL); 
 	vm_reg_native(vm, cls, "constructor(value)", native_Number_constructor, NULL); 

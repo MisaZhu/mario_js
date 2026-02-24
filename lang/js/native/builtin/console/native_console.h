@@ -3,6 +3,6 @@
 
 #include "mario.h"
 
-void reg_native_console(vm_t* vm);
+void reg_native_Console(vm_t* vm);
 
 #endif

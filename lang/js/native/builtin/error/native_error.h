@@ -1,8 +1,8 @@
-#ifndef mario_error
-#define mario_error
+#ifndef MARIO_ERROR
+#define MARIO_ERROR
 
 #include "mario.h"
 
-void reg_native_error(vm_t* vm);
+void reg_native_Error(vm_t* vm);
 
 #endif

@@ -3,6 +3,6 @@
 
 #include "mario.h"
 
-void reg_native_date(vm_t* vm);
+void reg_native_Date(vm_t* vm);
 
 #endif

@@ -2,7 +2,7 @@
 extern "C" {
 #endif
 
-#include "native_console.h"
+#include "native_Console.h"
 
 static mstr_t* args_to_str(var_t* args) {
 	mstr_t* ret = mstr_new("");
@@ -43,9 +43,9 @@ var_t* native_println(vm_t* vm, var_t* env, void* data) {
 	return NULL;
 }
 
-#define CLS_CONSOLE "console"
+#define CLS_CONSOLE "Console"
 
-void reg_native_console(vm_t* vm) {
+void reg_native_Console(vm_t* vm) {
 	var_t* cls = vm_new_class(vm, CLS_CONSOLE);
 	vm_reg_static(vm, cls, "write(v)", native_print, NULL); 
 	vm_reg_static(vm, cls, "log(v)", native_println, NULL); 

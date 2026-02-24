@@ -3,7 +3,7 @@
 
 #include "mario.h"
 
-void reg_native_math(vm_t* vm);
+void reg_native_Math(vm_t* vm);
 
 #endif
 

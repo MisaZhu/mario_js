@@ -2,7 +2,7 @@
 extern "C" {
 #endif
 
-#include "native_promise.h"
+#include "native_Promise.h"
 
 #define CLS_PROMISE "Promise"
 
@@ -256,7 +256,7 @@ var_t* native_PromiseRace(vm_t* vm, var_t* env, void* data) {
     return result;
 }
 
-void reg_native_promise(vm_t* vm) {
+void reg_native_Promise(vm_t* vm) {
     var_t* cls = vm_new_class(vm, CLS_PROMISE);
     vm_reg_native(vm, cls, "constructor(executor)", native_PromiseConstructor, NULL);
     vm_reg_static(vm, cls, "resolve(value)", native_PromiseResolve, NULL);

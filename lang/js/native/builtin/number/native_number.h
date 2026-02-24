@@ -3,6 +3,6 @@
 
 #include "mario.h"
 
-void reg_native_number(vm_t* vm);
+void reg_native_Number(vm_t* vm);
 
 #endif
