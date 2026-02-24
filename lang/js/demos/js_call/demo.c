@@ -1,4 +1,5 @@
 #include "mario.h"
+#include "bcdump/bcdump.h"
 
 #include <unistd.h>
 #include <stdio.h>
@@ -34,16 +35,15 @@ int main(int argc, char** argv) {
 		return -1;
 	}
 
-	var_t* args = var_new(vm);
-	var_add(args, "", var_new_str(vm, "JS world"));
-	var_add(args, "", var_new_int(vm, 100));
-	var_t* ret = call_m_func_by_name(vm, vm->root, "jsFunc", args);
+	var_t* ret = call_m_func_by_name(vm, NULL, "jsFunc", 2, 
+		var_new_str(vm, "JS world"),
+		var_new_int(vm, 100));
+
 	if(ret != NULL) {
 		const char* s = var_get_str(ret);
 		mario_printf("%s", s);
 		var_unref(ret);
 	}
-	var_unref(args);
 	
 	vm_close(vm); //release
 	return 0;
