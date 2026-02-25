@@ -48,7 +48,12 @@
         "stdlib.h": "c",
         "mem_debug.h": "c",
         "exception": "c",
-        "new": "c"
+        "new": "c",
+        "natives.h": "c",
+        "native_object.h": "c",
+        "natives_builtin.h": "c",
+        "native_math.h": "c",
+        "native_json.h": "c"
     },
     "C_Cpp.errorSquiggles": "disabled"
 }

@@ -1,5 +1,6 @@
 #include "mario.h"
-#include "native_builtin.h"
+#include "natives_builtin.h"
+#include "natives.h"
 
 static inline var_t* vm_load_var(vm_t* vm, const char* name, bool create) {
 	node_t* n = vm_load_node(vm, name, create);
@@ -22,4 +23,6 @@ static inline void load_basic_classes(vm_t* vm) {
 void reg_natives(vm_t* vm) {
 	reg_basic_natives(vm);
 	load_basic_classes(vm);
+
+	reg_natives(vm);
 }
