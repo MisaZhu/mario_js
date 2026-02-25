@@ -6,7 +6,7 @@ NATIVES_PATH_BUILTIN = $(NATIVE_PATH)/builtin
 NATIVES_PATH = $(NATIVE_PATH)/natives
 
 NATIVE_OBJS= \
-	$(NATIVE_PATH)/natives.o  \
+	$(NATIVE_PATH)/natives_all.o  \
 	\
 	$(NATIVES_PATH_BUILTIN)/natives_builtin.o  \
 	$(NATIVES_PATH_BUILTIN)/Object/native_Object.o  \

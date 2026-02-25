@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-void reg_basic_natives(vm_t* vm);
+void reg_builtin_natives(vm_t* vm);
 
 #ifdef __cplusplus /* __cplusplus */
 }

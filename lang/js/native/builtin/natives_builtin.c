@@ -11,7 +11,7 @@
 extern "C" {
 #endif
 
-void reg_basic_natives(vm_t* vm) {
+void reg_builtin_natives(vm_t* vm) {
 	reg_native_Object(vm);
 	reg_native_Error(vm);
 	reg_native_Array(vm);
