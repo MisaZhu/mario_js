@@ -25,8 +25,8 @@ CFLAGS += -O2
 endif
 
 
-HEADS = -I$(NATIVE_PATH_BUILTIN) \
-	-I$(NATIVE_PATH) \
+HEADS = -I$(NATIVES_PATH_BUILTIN) \
+	-I$(NATIVES_PATH) \
 	-I$(MARIO_VM)/mario \
 	-I$(MARIO_VM)/bin/lib \
 	-I$(MARIO_VM)/platform

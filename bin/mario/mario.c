@@ -45,13 +45,12 @@ void platform_init(void) {
 load extra native libs.
 */
 
-void reg_natives(vm_t* vm);
+void reg_all_natives(vm_t* vm);
 
 void init_args(vm_t* vm, int argc, char** argv) {
 	var_t* args = var_new_array(vm);
 	int i;
 	for(i=0; i<argc; i++) {
-		printf("args[%d] = %s\n", i, argv[i]);
 		var_t* v = var_new_str(vm, argv[i]);
 		var_array_add(args, v);
 	}
@@ -117,7 +116,7 @@ int main(int argc, char** argv) {
 		mario_mem_quit();
 		return -1;
 	}
-	vm_init(vm, reg_natives, NULL);
+	vm_init(vm, reg_all_natives, NULL);
 
 	init_args(vm, argc, argv);
 

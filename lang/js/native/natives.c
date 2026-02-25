@@ -20,9 +20,9 @@ static inline void load_basic_classes(vm_t* vm) {
 	var_add(vm->root, "console", console);
 }
 
-void reg_natives(vm_t* vm) {
+void reg_all_natives(vm_t* vm) {
 	reg_basic_natives(vm);
 	load_basic_classes(vm);
 
-	reg_natives(vm);
+	//reg_natives(vm);
 }
