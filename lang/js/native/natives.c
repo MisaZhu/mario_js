@@ -24,5 +24,5 @@ void reg_all_natives(vm_t* vm) {
 	reg_basic_natives(vm);
 	load_basic_classes(vm);
 
-	//reg_natives(vm);
+	reg_natives(vm);
 }
