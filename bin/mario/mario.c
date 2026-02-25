@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <unistd.h>
 
 #ifdef MARIO_DEBUG
 #include "mem_debug.h"
