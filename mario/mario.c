@@ -178,15 +178,10 @@ hash_map_t* hash_map_new(void) {
 void hash_map_init(hash_map_t* map) {
     map->capacity = HASH_MAP_INITIAL_CAPACITY;
     map->size = 0;
-<<<<<<< HEAD
     map->load_factor_num = 3;   // 分子：3
     map->load_factor_den = 4;   // 分母：4（3/4 = 0.75）
     map->owner = NULL;
     map->keys_borrowed = 0;
-=======
-    map->load_factor_num = 3;   // numerator: 3
-    map->load_factor_den = 4;   // denominator: 4 (3/4 = 0.75)
->>>>>>> b39f893835c582eeda8b2dd07929d70945840b64
     map->buckets = (hash_entry_t**)mario_malloc(sizeof(hash_entry_t*) * map->capacity);
     uint32_t i;
     for (i = 0; i < map->capacity; i++) {
@@ -5042,7 +5037,6 @@ void var_to_json_str(var_t* var, mstr_t* ret, int level, bool compact) {
 				if (strcmp(key, PROTOTYPE) == 0 || strcmp(key, "_ARRAY_") == 0)
 					goto next_entry;
 
-<<<<<<< HEAD
 				/* ES SerializeJSONObject: an own property whose value is
 				 * undefined, a function or a symbol is OMITTED entirely (the
 				 * key never appears). Emitting `"k":undefined` produced invalid
@@ -5058,9 +5052,6 @@ void var_to_json_str(var_t* var, mstr_t* ret, int level, bool compact) {
 					goto next_entry;
 
 				// 添加逗号分隔符
-=======
-				// add the comma separator
->>>>>>> b39f893835c582eeda8b2dd07929d70945840b64
 				if (!first) {
 					mstr_append(ret, compact ? "," : ",\n");
 				} else {
