@@ -11,9 +11,14 @@ var_t* native_json_stringify(vm_t* vm, var_t* env, void* data) {
 	(void)vm; (void)data;
 
 	node_t* n = var_find_own_member(env, "var");
+	/* ES JSON.stringify(undefined | function | symbol) returns the value
+	 * `undefined` (NOT a string). Serialising it as "undefined" text produced
+	 * invalid JSON that servers reject. */
+	if(n == NULL || n->var == NULL || n->var->type == V_UNDEF ||
+	   n->var->is_func || var_is_symbol(n->var))
+		return var_new(vm);
 	mstr_t* s = mstr_new("");
-	if(n != NULL)
-		var_to_json_str(n->var, s, 0, true);
+	var_to_json_str(n->var, s, 0, true);
 
 	var_t* var = var_new_str(vm, s->cstr);
 	mstr_free(s);
@@ -131,7 +136,7 @@ var_t* native_json_parse(vm_t* vm, var_t* env, void* data) {
 #define CLS_JSON "JSON"
 
 void reg_native_JSON(vm_t* vm) {
-	var_t* cls = vm_new_class(vm, CLS_JSON);
+	var_t* cls = vm_new_namespace(vm, CLS_JSON);
 	vm_reg_native(vm, cls, "stringify(var)", native_json_stringify, NULL);
 	vm_reg_native(vm, cls, "parse(str, reviver)", native_json_parse, NULL);
 }

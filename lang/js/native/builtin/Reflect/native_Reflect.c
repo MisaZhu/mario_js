@@ -108,7 +108,7 @@ var_t* native_Reflect_construct(vm_t* vm, var_t* env, void* data) {
 }
 
 void reg_native_Reflect(vm_t* vm) {
-	var_t* cls = vm_new_class(vm, CLS_REFLECT);
+	var_t* cls = vm_new_namespace(vm, CLS_REFLECT);
 	vm_reg_static(vm, cls, "get(target, key, receiver)", native_Reflect_get, NULL);
 	vm_reg_static(vm, cls, "set(target, key, value, receiver)", native_Reflect_set, NULL);
 	vm_reg_static(vm, cls, "has(target, key)", native_Reflect_has, NULL);

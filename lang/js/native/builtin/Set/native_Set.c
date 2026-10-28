@@ -118,11 +118,30 @@ var_t* native_Set_constructor(vm_t* vm, var_t* env, void* data) {
     kn->be_unenumerable = 1;
 
     var_t* iter = get_obj(env, "iterable");
-    if (iter != NULL && iter->type == V_OBJECT && iter->is_array) {
-        uint32_t n = var_array_size(iter);
-        for (uint32_t i = 0; i < n; ++i) {
-            var_t* v = var_array_get_var(iter, i);
-            if (v != NULL) set_add_impl(this_v, sd, v);
+    if (iter != NULL && iter->type != V_UNDEF && iter->type != V_NULL) {
+        if (iter->type == V_OBJECT && iter->is_array) {
+            uint32_t n = var_array_size(iter);
+            for (uint32_t i = 0; i < n; ++i) {
+                var_t* v = var_array_get_var(iter, i);
+                if (v != NULL) set_add_impl(this_v, sd, v);
+            }
+        } else {
+            /* ES: the ctor accepts ANY iterable (Set/Map instance, generator,
+             * custom [Symbol.iterator]); array-only handling silently produced an
+             * empty Set for `new Set(otherSet)` / `new Set(gen)`. */
+            var_t* it = vm_get_iterator(vm, iter);
+            while (it != NULL) {
+                var_t* step = vm_iter_next(vm, it);
+                if (step == NULL) break;
+                var_t* donev = var_find_member_var(step, "done");
+                bool dn = (donev != NULL) && (donev->type == V_BOOL ? var_get_bool(donev)
+                        : (donev->type != V_UNDEF && donev->type != V_NULL));
+                if (dn) { var_unref(step); break; }
+                var_t* val = var_find_member_var(step, "value");
+                if (val != NULL) set_add_impl(this_v, sd, val);
+                var_unref(step);
+            }
+            if (it != NULL) var_unref(it);
         }
     }
     return this_v;

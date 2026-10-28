@@ -208,7 +208,7 @@ var_t* native_Atomics_isLockFree(vm_t* vm, var_t* env, void* data) {
 }
 
 void reg_native_Atomics(vm_t* vm) {
-	var_t* cls = vm_new_class(vm, CLS_ATOMICS);
+	var_t* cls = vm_new_namespace(vm, CLS_ATOMICS);
 	vm_reg_static(vm, cls, "load(typedArray, index)", native_Atomics_load, NULL);
 	vm_reg_static(vm, cls, "store(typedArray, index, value)", native_Atomics_store, NULL);
 	vm_reg_static(vm, cls, "add(typedArray, index, value)", native_Atomics_add, NULL);

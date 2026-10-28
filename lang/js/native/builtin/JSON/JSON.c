@@ -148,11 +148,20 @@ static var_t* json_parse_factor(vm_t* vm, lex_t *l) {
 	}
 	if (l->tk==LEX_R_TRUE) {
 		lex_json_chkread(l, LEX_R_TRUE);
-		return var_new_int(vm, 1);
+		/* JSON true/false MUST parse to V_BOOL, exactly like the true/false
+		 * literals the compiler emits (INSTR_TRUE/INSTR_FALSE). Returning
+		 * var_new_int(1/0) made every parsed boolean the NUMBER 1/0, so typeof
+		 * said "number", `x === false` never matched, JSON.stringify round-tripped
+		 * false->0, and - fatally for React - `flag && <C/>` with flag===0 renders
+		 * the text "0" instead of nothing. github's overview payload carries false
+		 * banner flags; parsing them as 0 made the client hydrate a "0" text node
+		 * into an SSR-empty container -> hydration mismatch #519 -> root
+		 * element=null -> blank page. */
+		return var_new_bool(vm, true);
 	}
 	else if (l->tk==LEX_R_FALSE) {
 		lex_json_chkread(l, LEX_R_FALSE);
-		return var_new_int(vm, 0);
+		return var_new_bool(vm, false);
 	}
 	else if (l->tk==LEX_R_NULL) {
 		lex_json_chkread(l, LEX_R_NULL);

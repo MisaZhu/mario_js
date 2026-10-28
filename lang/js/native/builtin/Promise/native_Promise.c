@@ -340,6 +340,33 @@ var_t* native_await(vm_t* vm, var_t* env, void* data) {
             return NULL; /* await of an empty promise -> undefined */
         }
         if (pd->state == PROMISE_STATE_PENDING) {
+            /* True coroutine suspension (ES2017): when this await runs inside an
+             * async function body driven by mario.c's async driver, park the
+             * frame instead of blocking. The vm_run dispatch drops the
+             * placeholder result func_call pushed for this __await call and
+             * returns; func_call then detaches the body's scope/value segments
+             * and hands the caller a PENDING promise, which the frame's reaction
+             * settles when this promise does. async_depth>0 guarantees a driver
+             * exists to catch the suspension - a top-level await (module body)
+             * has none and keeps the legacy synchronous spin below. */
+            if (vm->async_enabled && vm->async_depth > 0) {
+                if (getenv("MARIO_AWAITDBG") != NULL) {
+                    fprintf(stderr, "[awaitdbg] pc=%u id=%u SUSPEND tag=%s\n",
+                        (unsigned)vm->pc, pd->dbg_id,
+                        vm->dbg_tag != NULL ? vm->dbg_tag : "-");
+                    if (getenv("MARIO_SRCMAP") != NULL) {
+                        mstr_t* loc = mstr_new("");
+                        if (bc_srcmap_locate(&vm->bc, vm->pc, loc))
+                            fprintf(stderr, "[awaitdbg]   at %s\n", loc->cstr);
+                        mstr_free(loc);
+                    }
+                }
+                vm->yielded = true;
+                vm->frame_events = 1;
+                vm->await_susp = true;
+                vm->yield_value = var_ref(x);
+                return NULL;
+            }
             /* The awaited promise settles later (timer / message-queue /
              * network callback). Without suspension the only way to honour the
              * await is to let the embedder pump its event loop until it
@@ -356,6 +383,17 @@ var_t* native_await(vm_t* vm, var_t* env, void* data) {
                     vm->dbg_tag != NULL ? vm->dbg_tag : "-");
             if (pd->state == PROMISE_STATE_PENDING) return NULL;
             if (pd->value == NULL) return NULL;
+        }
+        else if (pd->state == PROMISE_STATE_REJECTED &&
+                 vm->async_enabled && vm->async_depth > 0) {
+            /* ES2017: awaiting a REJECTED promise throws the reason at the await
+             * point. Delivering it through native_thrown makes it a normal throw
+             * inside the async body, so the body's own try/catch (or the promise
+             * the caller got) handles it, instead of the await silently yielding
+             * the error object as its value. */
+            var_t* reason = (pd->value != NULL) ? pd->value : var_new(vm);
+            vm->native_thrown = var_ref(reason);
+            return NULL;
         }
         x = pd->value;
     }
@@ -483,6 +521,45 @@ static void promise_schedule_drain(vm_t* vm, var_t* promise) {
     }
 }
 
+/* Register a C-side reaction on a promise, for the VM's async/await coroutine
+ * driver (mario.c): the handlers are native closures that resume (or reject)
+ * the suspended async frame. Unlike .then() no chained promise is meaningful
+ * here - the handlers do their work through the frame's own deferred promise -
+ * so a throwaway already-resolved promise occupies the chained slot the drain
+ * settles. The handlers take a ref via the callback lists; a reaction added to
+ * an already-settled promise schedules the drain like .then() does.
+ * NOTE: the gc does not follow func->data, so the caller must keep whatever the
+ * handlers capture reachable on its own (the async driver roots its frame). */
+void promise_await_reaction(vm_t* vm, var_t* promise, var_t* onF, var_t* onRej) {
+    if (promise == NULL || !is_promise(vm, promise))
+        return;
+    promise_data* pd = (promise_data*)promise->value;
+    if (pd == NULL)
+        return;
+    var_t* np = promise_new_resolved(vm, NULL); /* dummy chained promise */
+    promise_add_reaction(vm, pd, onF, onRej, np);
+    if (pd->state != PROMISE_STATE_PENDING)
+        promise_schedule_drain(vm, promise);
+}
+
+/* Inspect a promise for the VM's async driver (mario.c): 0 = not a promise,
+ * 1 = PENDING, 2 = FULFILLED, 3 = REJECTED. For 2/3 *out receives the settled
+ * value/reason as a BORROWED reference (the promise_data owns it), or NULL. */
+int promise_peek(vm_t* vm, var_t* v, var_t** out) {
+    if (out != NULL) *out = NULL;
+    if (v == NULL || !is_promise(vm, v))
+        return 0;
+    promise_data* pd = (promise_data*)v->value;
+    if (pd == NULL)
+        return 0;
+    switch (pd->state) {
+        case PROMISE_STATE_PENDING:   return 1;
+        case PROMISE_STATE_FULFILLED: if (out != NULL) *out = pd->value; return 2;
+        case PROMISE_STATE_REJECTED:  if (out != NULL) *out = pd->value; return 3;
+        default: return 0;
+    }
+}
+
 /* Drop the @@pend_prom gc root once a settled promise's reactions have run.
  * Skipped when a reaction re-armed the drain (a .then() on this same promise
  * from inside the loop): the promise must stay rooted until that drain too.
@@ -491,6 +568,15 @@ static void promise_schedule_drain(vm_t* vm, var_t* promise) {
  * caller's trailing var_unref(promise). */
 static void promise_drain_unroot(vm_t* vm, var_t* promise, promise_data* pd) {
     if (pd != NULL && pd->drain_armed)
+        return;
+    /* A PENDING promise may have handed its __resolve/__reject closures to a
+     * thenable during adoption; those closures carry a RAW pointer to it and the
+     * gc does not follow func->data. Unrooting it here (e.g. a drain that finds
+     * no reactions) let a later gc sweep the promise, and the thenable's
+     * settlement task - which runs after the main script in cli_poll - then
+     * called native_promise_resolve_cb on freed memory (heap-use-after-free).
+     * Keep it rooted until it actually settles. */
+    if (pd != NULL && pd->state == PROMISE_STATE_PENDING)
         return;
     var_ref(promise);
     promise_unroot_pending(vm, promise);
@@ -587,14 +673,26 @@ static var_t* native_promise_drain(vm_t* vm, var_t* env, void* data) {
             var_array_add(args, (value != NULL) ? value : var_new(vm));
             result = call_m_func(vm, promise, cb, args);
             var_unref(args);
+            if (getenv("MARIO_RSDBG") != NULL) {
+                func_t* rf = (func_t*)cb->value;
+                fprintf(stderr, "[rsdbg]   after cb#%u func=%p entrypc=%u result=%p rtype=%d prop_err=%d native_thrown=%d\n",
+                    (unsigned)i, (void*)cb, (unsigned)(rf != NULL ? rf->pc : 0u), (void*)result,
+                    (result != NULL) ? (int)result->type : -1,
+                    (int)(vm->propagating_err != NULL), (int)(vm->native_thrown != NULL));
+            }
             if (npd != NULL && promise_settle_propagated(vm, npd, np)) {
                 if (result != NULL) var_unref(result);
                 promise_schedule_drain(vm, np);
                 continue;
             }
         } else if (!fulfilled) {
-            /* no onRejected: the rejection propagates to the chained promise */
-            if (npd != NULL) {
+            /* no onRejected: the rejection propagates to the chained promise.
+             * A promise settles exactly once (ES ResolvePromise/RejectPromise
+             * are no-ops afterwards): the chained promise may already have been
+             * settled by another reaction -- Promise.race points every input's
+             * identity reaction at the SAME result, so the losers must not
+             * overwrite the winner's state/value. */
+            if (npd != NULL && npd->state == PROMISE_STATE_PENDING) {
                 var_t* old = npd->value;
                 npd->state = PROMISE_STATE_REJECTED;
                 npd->value = (value != NULL) ? var_ref(value) : var_ref(var_new(vm));
@@ -607,6 +705,21 @@ static var_t* native_promise_drain(vm_t* vm, var_t* env, void* data) {
             result = (value != NULL) ? var_ref(value) : NULL;   /* identity */
         }
         if (npd != NULL) {
+            /* ES result adoption: a reaction that returns a promise/thenable which
+             * has NOT settled yet must leave the chained promise PENDING and adopt
+             * it (link our resolve/reject into it), so it settles with the inner
+             * promise's eventual value. Unwrapping synchronously instead read
+             * pd->value==NULL and fulfilled the chained promise with null - this
+             * is the nested-adoption shape every async/await chain compiles to. */
+            if (result != NULL && result != np &&
+                (is_promise(vm, result) || is_thenable(vm, result))) {
+                promise_data* rpd0 = is_promise(vm, result) ? (promise_data*)result->value : NULL;
+                bool is_pending = (rpd0 == NULL) || (rpd0->state == PROMISE_STATE_PENDING);
+                if (is_pending && promise_adopt_thenable(vm, np, result)) {
+                    var_unref(result);
+                    continue;   /* np stays PENDING until `result` settles */
+                }
+            }
             if (getenv("MARIO_DRAINDBG") != NULL && result != NULL) {
                 promise_data* rpd0 = is_promise(vm, result) ? (promise_data*)result->value : NULL;
                 fprintf(stderr, "[draindbg] pre-unwrap result=%p isprom=%d state=%d inner=%p innertype=%d\n",
@@ -620,6 +733,12 @@ static var_t* native_promise_drain(vm_t* vm, var_t* env, void* data) {
                 fprintf(stderr, "[draindbg] post-unwrap result=%p type=%d hasStatus=%d\n",
                     (void*)result, result ? (int)result->type : -1,
                     (result && var_find_own_member_var(result, "status") != NULL) ? 1 : 0);
+            }
+            if (npd->state != PROMISE_STATE_PENDING) {
+                /* already settled (Promise.race loser): drop the value, never
+                 * overwrite the winner. */
+                if (result != NULL) var_unref(result);
+                continue;
             }
             var_t* old = npd->value;
             npd->state = PROMISE_STATE_FULFILLED;
@@ -667,6 +786,16 @@ var_t* native_PromiseConstructor(vm_t* vm, var_t* env, void* data) {
         rn->be_unenumerable = 1;
         jn->invisable = 1;
         jn->be_unenumerable = 1;
+
+        /* Root the promise in @@pend_prom for as long as it stays PENDING. The
+         * __resolve/__reject closures handed to the executor carry a RAW pointer
+         * to obj (func->data), which the gc does not follow; if the executor
+         * defers them (setTimeout / network / stream callback) and no JS variable
+         * keeps obj alive, a gc during the main script swept obj and the later
+         * callback called native_promise_resolve_cb on freed memory. A pending
+         * promise with an outstanding resolve/reject must stay reachable until it
+         * settles; native_promise_drain unroots it afterwards. */
+        promise_root_pending(vm, obj);
 
         var_t* resolve_args = var_new_array(vm);
         var_array_add(resolve_args, rn->var);
@@ -871,9 +1000,16 @@ var_t* native_PromiseCatch(vm_t* vm, var_t* env, void* data) {
     var_t* new_env = var_new(vm);
     var_ref(new_env); /* keep it off the gc list while Then may run callbacks */
     var_add(new_env, THIS, promise);
-    var_t* null_var = var_new_null(vm);
-    var_add(new_env, "onFulfilled", null_var);
-    var_unref(null_var);
+    /* `.catch(onRejected)` is exactly `.then(undefined, onRejected)`: pass a
+     * live V_UNDEF onFulfilled. var_add()/node_new() takes its own ref on the
+     * added var, so the fresh var (refs 0 -> 1) must NOT be var_unref()'d here:
+     * doing so dropped it to 0 and freed it while the node still pointed at it,
+     * so native_PromiseThen's get_obj(env,"onFulfilled") read back NULL. With a
+     * NULL onFulfilled the drain identity-passes but the downstream reaction of
+     * a LATER-resolved promise was lost (chained promise never settled), which
+     * stalled React's Suspense ping on the fetchOptimistic().catch() chain. */
+    var_t* undef_var = var_new(vm);
+    var_add(new_env, "onFulfilled", undef_var);
     var_add(new_env, "onRejected", onRejected);
 
     var_t* result = native_PromiseThen(vm, new_env, NULL);
@@ -897,50 +1033,218 @@ var_t* native_PromiseFinally(vm_t* vm, var_t* env, void* data) {
     return result;
 }
 
-var_t* native_PromiseAll(vm_t* vm, var_t* env, void* data) {
-    (void)data;
-    (void)env;
-    var_t* promises = get_obj(env, "promises");
+/* ---- Promise.all / Promise.allSettled over still-pending inputs ----
+ * The previous implementations snapshotted each input's state at call time and
+ * fulfilled the result immediately: a PENDING input contributed its pd->value
+ * (NULL) as undefined and NO reaction was ever registered to wait for it. React
+ * and Pinterest aggregate async fetches with Promise.all, so `await
+ * Promise.all([...])` handed back an all-undefined array while the fetch bodies
+ * were still parked - the feed's response then read `resp.headers.get(...)` on
+ * undefined and threw, stranding the Suspense boundary. These helpers register a
+ * real reaction per pending input (mirroring native_PromiseRace) and settle the
+ * result only once every input has settled. */
+typedef struct promise_agg_ctx {
+    vm_t*    vm;
+    var_t*   result;     /* borrowed: rooted in @@pend_prom until it settles */
+    var_t*   values;     /* owned ref: the result array (also result's pd->value) */
+    void*    slots;      /* owned: promise_agg_slot[len] backing each reaction */
+    uint32_t remaining;  /* inputs not yet settled */
+    uint32_t live;       /* reactions not yet fired; ctx is freed when this hits 0 */
+    bool     settled;    /* result already settled (all(): first rejection wins) */
+    bool     allsettled; /* allSettled(): record rejections, never reject result */
+} promise_agg_ctx;
 
-    promise_data* pd = promise_data_alloc(vm);
-    pd->state = PROMISE_STATE_FULFILLED;
-    /* promise_free() unrefs pd->value, so promise_data must OWN a reference on the
-     * result array (matching native_PromiseResolve's var_ref(value)); @@keep adds a
-     * second gc-only ref. Without this own ref the array sat at refs=1 (anchor only)
-     * and, when a then-callback returned this promise, promise_unwrap()'s release of
-     * the promise let promise_free drop the array to 0 -- freeing the adopted value,
-     * so the chained .then saw undefined. */
-    pd->value = var_ref(var_new_array(vm));
-    promise_alloc_callbacks(vm, pd);
+typedef struct { promise_agg_ctx* ctx; uint32_t index; } promise_agg_slot;
 
-    if (promises != NULL && promises->is_array) {
-        uint32_t len = var_array_size(promises);
-        for (uint32_t i = 0; i < len; i++) {
-            var_t* item = var_array_get_var(promises, i);
-            if (item == NULL) {
-                continue;
-            }
-            if (is_promise(vm, item)) {
-                promise_data* ipd = (promise_data*)item->value;
-                if (ipd != NULL && ipd->state == PROMISE_STATE_REJECTED) {
-                    /* reject fast: the result adopts the first rejection reason */
-                    pd->state = PROMISE_STATE_REJECTED;
-                    var_t* old = pd->value;
-                    pd->value = ipd->value ? var_ref(ipd->value) : var_ref(var_new(vm));
-                    if (old != NULL) var_unref(old);
-                    break;
-                }
-                var_array_add(pd->value, (ipd != NULL && ipd->value != NULL) ? ipd->value : var_new(vm));
-            } else {
-                var_array_add(pd->value, item);
-            }
+static void promise_agg_ctx_free(promise_agg_ctx* c) {
+    if (c == NULL) return;
+    if (c->values != NULL) var_unref(c->values);
+    if (c->slots != NULL) mario_free(c->slots);
+    mario_free(c);
+}
+
+/* Drop one reaction's claim on the ctx; free it once the last input settles. */
+static void promise_agg_release(promise_agg_ctx* c) {
+    if (c == NULL) return;
+    if (c->live > 0) c->live--;
+    if (c->live == 0) promise_agg_ctx_free(c);
+}
+
+static void promise_agg_finish(vm_t* vm, promise_agg_ctx* c) {
+    promise_data* rpd = (c->result != NULL) ? (promise_data*)c->result->value : NULL;
+    c->settled = true;
+    if (rpd == NULL || rpd->state != PROMISE_STATE_PENDING) return;
+    rpd->state = PROMISE_STATE_FULFILLED;   /* value is already the result array */
+    promise_anchor(vm, c->result, rpd);
+    promise_schedule_drain(vm, c->result);
+}
+
+static void promise_agg_fail(vm_t* vm, promise_agg_ctx* c, var_t* reason) {
+    promise_data* rpd = (c->result != NULL) ? (promise_data*)c->result->value : NULL;
+    c->settled = true;
+    if (rpd == NULL || rpd->state != PROMISE_STATE_PENDING) return;
+    var_t* old = rpd->value;                /* the (now unused) result array */
+    rpd->state = PROMISE_STATE_REJECTED;
+    rpd->value = (reason != NULL) ? var_ref(reason) : var_ref(var_new(vm));
+    promise_anchor(vm, c->result, rpd);
+    if (old != NULL) var_unref(old);
+    promise_schedule_drain(vm, c->result);
+}
+
+static var_t* promise_agg_entry(vm_t* vm, const char* status, const char* key, var_t* val) {
+    var_t* entry = var_new_obj(vm, NULL, NULL, NULL);
+    var_add(entry, "status", var_new_str(vm, status));
+    var_add(entry, key, (val != NULL) ? val : var_new(vm));
+    return entry;
+}
+
+/* Store an already-known fulfillment at index i, wrapping it in a
+ * {status,value} entry for allSettled() and storing it bare for all(). */
+static void promise_agg_store(vm_t* vm, var_t* values, uint32_t i, var_t* val, bool allsettled) {
+    if (allsettled)
+        var_array_set(values, (int32_t)i, promise_agg_entry(vm, "fulfilled", "value", val));
+    else
+        var_array_set(values, (int32_t)i, (val != NULL) ? val : var_new(vm));
+}
+
+static var_t* promise_agg_onfulfilled(vm_t* vm, var_t* env, void* data) {
+    promise_agg_slot* s = (promise_agg_slot*)data;
+    promise_agg_ctx* c = (s != NULL) ? s->ctx : NULL;
+    if (c == NULL) return NULL;
+    var_t* args = get_obj(env, "arguments");
+    var_t* v = (args != NULL) ? var_array_get_var(args, 0) : NULL;
+    if (!c->settled) {
+        if (c->allsettled)
+            var_array_set(c->values, (int32_t)s->index, promise_agg_entry(vm, "fulfilled", "value", v));
+        else
+            var_array_set(c->values, (int32_t)s->index, (v != NULL) ? v : var_new(vm));
+        if (c->remaining > 0) c->remaining--;
+        if (c->remaining == 0) promise_agg_finish(vm, c);
+    }
+    promise_agg_release(c);
+    return NULL;
+}
+
+static var_t* promise_agg_onrejected(vm_t* vm, var_t* env, void* data) {
+    promise_agg_slot* s = (promise_agg_slot*)data;
+    promise_agg_ctx* c = (s != NULL) ? s->ctx : NULL;
+    if (c == NULL) return NULL;
+    var_t* args = get_obj(env, "arguments");
+    var_t* reason = (args != NULL) ? var_array_get_var(args, 0) : NULL;
+    if (!c->settled) {
+        if (c->allsettled) {
+            var_array_set(c->values, (int32_t)s->index, promise_agg_entry(vm, "rejected", "reason", reason));
+            if (c->remaining > 0) c->remaining--;
+            if (c->remaining == 0) promise_agg_finish(vm, c);
+        } else {
+            promise_agg_fail(vm, c, reason);   /* all(): first rejection wins */
         }
     }
+    promise_agg_release(c);
+    return NULL;
+}
 
+/* Build the aggregation promise and wire one reaction per pending input.
+ * Shared by Promise.all (allsettled=false) and Promise.allSettled (=true). */
+static var_t* promise_agg_build(vm_t* vm, var_t* promises, bool allsettled) {
+    promise_data* pd = promise_data_alloc(vm);
+    pd->state = PROMISE_STATE_PENDING;
+    /* promise_free() unrefs pd->value, so promise_data must OWN a reference on
+     * the result array; @@keep (promise_anchor) adds a second, gc-only ref. */
+    pd->value = var_ref(var_new_array(vm));
+    promise_alloc_callbacks(vm, pd);
     var_t* proto = get_promise_proto(vm);
     var_t* result = var_new_obj(vm, proto, pd, promise_free);
     promise_anchor(vm, result, pd);
+    promise_root_pending(vm, result);         /* survives until it settles */
+    var_ref(result); /* protection ref (mirrors native_PromiseThen): a synchronous
+                      * settle below drains in-line (CLI has no microtask table),
+                      * and that drain unroots + unrefs `result`. Without this ref
+                      * the promise is freed before promise_agg_build returns it.
+                      * Dropped with a bare decrement at every return. */
+    var_t* values = pd->value;                /* borrowed alias */
+
+    uint32_t len = (promises != NULL && promises->is_array) ? var_array_size(promises) : 0;
+    for (uint32_t i = 0; i < len; i++) var_array_add(values, var_new(vm)); /* positional holes */
+
+    promise_agg_ctx* c = (promise_agg_ctx*)mario_malloc(sizeof(promise_agg_ctx));
+    if (c == NULL) { pd->state = PROMISE_STATE_FULFILLED; promise_schedule_drain(vm, result); result->refs -= 1; return result; }
+    c->vm = vm; c->result = result; c->values = var_ref(values);
+    c->remaining = 0; c->live = 0; c->settled = false; c->allsettled = allsettled;
+    c->slots = (len > 0) ? mario_malloc(sizeof(promise_agg_slot) * len) : NULL;
+    if (len > 0 && c->slots == NULL) {
+        pd->state = PROMISE_STATE_FULFILLED; promise_agg_ctx_free(c);
+        promise_schedule_drain(vm, result); result->refs -= 1; return result;
+    }
+    promise_agg_slot* slots = (promise_agg_slot*)c->slots;
+    for (uint32_t i = 0; i < len; i++) { slots[i].ctx = c; slots[i].index = i; }
+
+    for (uint32_t i = 0; i < len; i++) {
+        if (c->settled) break;                /* all(): a rejection ended the race */
+        var_t* item = var_array_get_var(promises, i);
+        if (item == NULL) { promise_agg_store(vm, values, i, NULL, allsettled); continue; } /* hole -> fulfilled undefined */
+
+        if (is_promise(vm, item)) {
+            promise_data* ipd = (promise_data*)item->value;
+            if (ipd == NULL) continue;
+            if (ipd->state == PROMISE_STATE_FULFILLED) {
+                if (allsettled)
+                    var_array_set(values, (int32_t)i, promise_agg_entry(vm, "fulfilled", "value", ipd->value));
+                else
+                    var_array_set(values, (int32_t)i, (ipd->value != NULL) ? ipd->value : var_new(vm));
+                continue;
+            }
+            if (ipd->state == PROMISE_STATE_REJECTED) {
+                if (allsettled) {
+                    var_array_set(values, (int32_t)i, promise_agg_entry(vm, "rejected", "reason", ipd->value));
+                    continue;
+                }
+                promise_agg_fail(vm, c, ipd->value);   /* reject fast */
+                break;
+            }
+            /* PENDING: fall through to reaction registration */
+        } else if (is_thenable(vm, item)) {
+            /* Adopt the thenable into a fresh deferred promise, then wait on it. */
+            var_t* rf = NULL; var_t* jf = NULL;
+            var_t* wp = promise_new_deferred(vm, &rf, &jf);
+            if (rf != NULL) var_unref(rf);
+            if (jf != NULL) var_unref(jf);
+            if (wp == NULL) { promise_agg_store(vm, values, i, item, allsettled); continue; }
+            if (!promise_adopt_thenable(vm, wp, item)) {
+                promise_agg_store(vm, values, i, item, allsettled);   /* `then` vanished: use the value */
+                continue;
+            }
+            item = wp;                        /* now a PENDING native promise */
+        } else {
+            promise_agg_store(vm, values, i, item, allsettled);   /* plain value: fulfilled */
+            continue;
+        }
+
+        /* Register a reaction on the pending promise `item`. The closures return
+         * at refs=0 (on the gc list); promise_add_reaction takes the owning ref
+         * into the input's callback lists, so no matching unref here. */
+        vm->gc.gc_defer++;
+        var_t* onF = var_new_native_func(vm, promise_agg_onfulfilled, &slots[i]);
+        var_t* onR = var_new_native_func(vm, promise_agg_onrejected, &slots[i]);
+        var_t* np  = promise_new_resolved(vm, NULL);       /* dummy chained slot */
+        promise_add_reaction(vm, (promise_data*)item->value, onF, onR, np);
+        vm->gc.gc_defer--;
+        promise_root_pending(vm, item);       /* input must survive until it settles */
+        c->remaining++;
+        c->live++;
+    }
+
+    if (!c->settled && c->remaining == 0)
+        promise_agg_finish(vm, c);            /* empty or fully synchronous */
+    if (c->live == 0)
+        promise_agg_ctx_free(c);              /* no reaction owns the ctx */
+    result->refs -= 1;                        /* drop the protection ref */
     return result;
+}
+
+var_t* native_PromiseAll(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    return promise_agg_build(vm, get_obj(env, "promises"), false);
 }
 
 var_t* native_PromiseRace(vm_t* vm, var_t* env, void* data) {
@@ -953,71 +1257,64 @@ var_t* native_PromiseRace(vm_t* vm, var_t* env, void* data) {
     pd->value = NULL;
     promise_alloc_callbacks(vm, pd);
 
+    var_t* proto = get_promise_proto(vm);
+    var_t* result = var_new_obj(vm, proto, pd, promise_free);
+    promise_anchor(vm, result, pd);
+
+    /* ES Promise.race: the result settles with the FIRST input to settle. Every
+     * input gets an identity reaction (no callbacks) pointed at `result`; the
+     * drain's settle-once guard makes the later settlements no-ops. The previous
+     * version only inspected the inputs' state at call time, so a race over
+     * still-pending promises (React/Pinterest's `await Promise.race([hydration,
+     * timeout])`) returned a promise that could NEVER settle and parked the
+     * awaiting async function forever. */
     if (promises != NULL && promises->is_array) {
         uint32_t len = var_array_size(promises);
-        /* settle with the first already-settled entry (pending ones lose the race) */
-        for (uint32_t i = 0; i < len; i++) {
+        for (uint32_t i = 0; i < len && pd->state == PROMISE_STATE_PENDING; i++) {
             var_t* item = var_array_get_var(promises, i);
             if (item == NULL) {
                 continue;
             }
             if (is_promise(vm, item)) {
                 promise_data* ipd = (promise_data*)item->value;
-                if (ipd != NULL && ipd->state != PROMISE_STATE_PENDING) {
+                if (ipd == NULL) {
+                    continue;
+                }
+                if (ipd->state != PROMISE_STATE_PENDING) {
                     pd->state = ipd->state;
                     pd->value = ipd->value ? var_ref(ipd->value) : var_ref(var_new(vm));
-                    break;
+                } else {
+                    promise_add_reaction(vm, ipd, NULL, NULL, result);
+                    /* The input carries the reaction lists that keep `result`
+                     * reachable, so it must survive until it settles even when
+                     * the caller drops it (spec: race holds its inputs). */
+                    promise_root_pending(vm, item);
                 }
+            } else if (is_thenable(vm, item)) {
+                promise_adopt_thenable(vm, result, item);
             } else {
+                /* a plain value is an already-fulfilled promise: first one wins */
                 pd->state = PROMISE_STATE_FULFILLED;
                 pd->value = var_ref(item);
-                break;
             }
         }
     }
 
-    var_t* proto = get_promise_proto(vm);
-    var_t* result = var_new_obj(vm, proto, pd, promise_free);
+    /* Re-anchor AFTER the loop: the pre-loop promise_anchor() mirrored a
+     * then-NULL pd->value into @@keep, so a value adopted here (an already-
+     * settled input's value or a plain first-winner) would be reachable only
+     * from the C-side promise_data. The gc mark phase ignores refcounts, so an
+     * explicit gc() before this promise drains would sweep that value and leave
+     * pd->value dangling - promise_free() then var_unref()'s freed memory at
+     * vm_close (heap-use-after-free). promise_anchor() is idempotent and skips a
+     * NULL value, so the still-pending race (no value adopted) is unaffected. */
     promise_anchor(vm, result, pd);
     return result;
 }
 
 var_t* native_PromiseAllSettled(vm_t* vm, var_t* env, void* data) {
     (void)data;
-    var_t* promises = get_obj(env, "promises");
-
-    promise_data* pd = promise_data_alloc(vm);
-    pd->state = PROMISE_STATE_FULFILLED;
-    /* Own a ref on the result array; see the identical note in native_PromiseAll. */
-    pd->value = var_ref(var_new_array(vm));
-    promise_alloc_callbacks(vm, pd);
-
-    if (promises != NULL && promises->is_array) {
-        uint32_t len = var_array_size(promises);
-        for (uint32_t i = 0; i < len; i++) {
-            var_t* item = var_array_get_var(promises, i);
-            var_t* entry = var_new_obj(vm, NULL, NULL, NULL);
-            if (item != NULL && is_promise(vm, item)) {
-                promise_data* ipd = (promise_data*)item->value;
-                if (ipd != NULL && ipd->state == PROMISE_STATE_REJECTED) {
-                    var_add(entry, "status", var_new_str(vm, "rejected"));
-                    var_add(entry, "reason", ipd->value);
-                } else {
-                    var_add(entry, "status", var_new_str(vm, "fulfilled"));
-                    var_add(entry, "value", (ipd != NULL) ? ipd->value : NULL);
-                }
-            } else {
-                var_add(entry, "status", var_new_str(vm, "fulfilled"));
-                var_add(entry, "value", item);
-            }
-            var_array_add(pd->value, entry);
-        }
-    }
-
-    var_t* proto = get_promise_proto(vm);
-    var_t* result = var_new_obj(vm, proto, pd, promise_free);
-    promise_anchor(vm, result, pd);
-    return result;
+    return promise_agg_build(vm, get_obj(env, "promises"), true);
 }
 
 /* Promise.any (ES2021): fulfills with the first fulfilled input; a non-promise
@@ -1139,6 +1436,22 @@ var_t* promise_new_deferred(vm_t* vm, var_t** out_resolve, var_t** out_reject) {
     rn->invisable = 1; rn->be_unenumerable = 1;
     jn->invisable = 1; jn->be_unenumerable = 1;
 
+    /* Root the deferred promise in @@pend_prom for as long as it stays PENDING -
+     * exactly what the `new Promise(executor)` constructor does (see the note
+     * there). A deferred promise hands its __resolve/__reject closures to a
+     * C-side settler (async fetch's fetch_job_t, Promise.withResolvers, the
+     * async/await driver) that runs LATER, off the creating script's stack. The
+     * closures carry a RAW pointer to obj (func->data) which the gc does not
+     * follow, and the settler's own var_ref on them is ignored by the mark
+     * phase (it walks reachability, not refcounts). So if no live JS variable
+     * keeps obj reachable - React discarding the component that issued a fetch,
+     * a dropped withResolvers() result - a gc during the main script sweeps obj
+     * AND its member __resolve/__reject closures, and the later settle (e.g.
+     * js_web_fetch_poll -> call_m_func(j->resolve)) enters func_call on a
+     * recycled var_t -> SIGSEGV. promise_root_pending keeps obj (hence its
+     * closures) reachable until native_promise_drain unroots it after settle. */
+    promise_root_pending(vm, obj);
+
     if (out_resolve != NULL) *out_resolve = var_ref(rn->var);
     if (out_reject != NULL) *out_reject = var_ref(jn->var);
     return obj;
@@ -1207,6 +1520,11 @@ void reg_native_Promise(vm_t* vm) {
     vm_reg_native(vm, NULL, "__await(x)", native_await, NULL);
     vm_reg_native(vm, NULL, "__promise_resolve(value)", native_PromiseResolve, NULL);
     vm_reg_native(vm, NULL, "setTimeout(cb, ms)", native_setTimeout, NULL);
+    /* Bind the async-throw conversion hook: func_call calls this to turn a throw
+     * escaping an async function body into an already-rejected promise (ECMA-262:
+     * an async function never throws synchronously). promise_new_rejected takes a
+     * ref on the reason and returns a builtin-prototype rejected promise. */
+    vm->async_reject = promise_new_rejected;
 }
 
 /* Debug: walk the live-promise ledger and report every PENDING promise that
@@ -1222,7 +1540,12 @@ void mario_promise_ledger_dump(vm_t* vm) {
         if (p->state != PROMISE_STATE_PENDING) continue;
         pending++;
         unsigned fc = (p->fulfilled_callbacks != NULL) ? (unsigned)var_array_size(p->fulfilled_callbacks) : 0u;
-        if (fc == 0) continue;
+        if (fc == 0) {
+            /* PENDING with no consumer: an orphan deferred nobody ever settles.
+             * Log its creation pc so it can be mapped back to a chunk. */
+            fprintf(stderr, "[promledger] PENDING-ORPHAN id=%u pc=%u\n", p->dbg_id, p->dbg_pc);
+            continue;
+        }
         awaited++;
         fprintf(stderr, "[promledger] PENDING-AWAITED id=%u pc=%u onFulfilled=%u onRejected=%u\n",
             p->dbg_id, p->dbg_pc, fc,

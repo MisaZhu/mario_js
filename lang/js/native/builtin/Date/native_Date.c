@@ -148,6 +148,7 @@ static bool date_parse_ms(const char* str, int64_t* out) {
 		p++;
 
 	int64_t year = 0, month = 1, day = 1, hour = 0, min = 0, sec = 0, frac = 0;
+	bool has_time = false, has_tz = false;
 	int n = 0;
 	bool year_neg = false;
 	if((*p == '-' || *p == '+') && p[1] >= '0' && p[1] <= '9') {
@@ -193,6 +194,7 @@ static bool date_parse_ms(const char* str, int64_t* out) {
 		const char* save = p;
 		p++;
 		if(parse_digits(&p, &hour, &n)) {
+			has_time = true;
 			if(*p == ':') { p++; parse_digits(&p, &min, &n); }
 			if(*p == ':') { p++; parse_digits(&p, &sec, &n); }
 			if(*p == '.' || *p == ',') {
@@ -214,9 +216,11 @@ static bool date_parse_ms(const char* str, int64_t* out) {
 	int64_t off_ms = 0;
 	if(*p == 'Z' || *p == 'z') {
 		p++;
+		has_tz = true;
 	} else if(*p == '+' || *p == '-') {
 		bool neg = (*p == '-');
 		p++;
+		has_tz = true;
 		int64_t oh = 0, om = 0;
 		if(parse_digits(&p, &oh, &n)) {
 			if(*p == ':') {
@@ -236,6 +240,29 @@ static bool date_parse_ms(const char* str, int64_t* out) {
 
 	if(month < 1 || month > 12)
 		return false;
+	/* Spec: a date-TIME without a zone designator is LOCAL wall time (a date-only
+	 * stays UTC midnight, handled by the civil path below). mktime resolves the
+	 * zone and DST. Restricted to the 4-digit year range so out-of-range years
+	 * keep the old civil/UTC behaviour rather than relying on mktime overflow. */
+	if(has_time && !has_tz && year >= 1 && year <= 9999) {
+		struct tm ltm;
+		memset(&ltm, 0, sizeof(ltm));
+		ltm.tm_year = (int)year - 1900;
+		ltm.tm_mon  = (int)month - 1;
+		ltm.tm_mday = (int)day;
+		ltm.tm_hour = (int)hour;
+		ltm.tm_min  = (int)min;
+		ltm.tm_sec  = (int)sec;
+		ltm.tm_isdst = -1;
+		time_t tsec = mktime(&ltm);
+		if(tsec == (time_t)-1)
+			return false;
+		int64_t lms = (int64_t)tsec * 1000LL + frac;
+		if(lms < DATE_MIN_MS || lms > DATE_MAX_MS)
+			return false;
+		*out = lms;
+		return true;
+	}
 	int64_t days = days_from_civil(year, (int)month, (int)day);
 	int64_t ms = days * MS_PER_DAY
 	           + ((hour * 60 + min) * 60 + sec) * 1000LL
@@ -351,6 +378,25 @@ var_t* native_DateConstructor(vm_t* vm, var_t* env, void* data) {
 	node_t* tn = var_add(obj, "@@t", var_new_int64(vm, ms));
 	tn->be_unenumerable = 1;
 	tn->invisable = 1;
+	/* Derived classes (`class D extends Date {}`): the construction path builds a
+	 * fresh object here and the derived instance (the ambient `this`) keeps its own
+	 * prototype - mario does NOT replace `this` with the base-constructed object
+	 * the way the spec does. Copy the timestamp slot onto `this` as well so the
+	 * derived instance is a working Date; without it every formatter on such an
+	 * instance read "Invalid Date" (missing @@t). Guard: a real object that is not
+	 * the scope root (plain `Date(x)` calls / global new) and not a function. */
+	var_t* thisV = get_obj(env, THIS);
+	if(thisV != NULL && thisV != obj && thisV->type == V_OBJECT &&
+	   thisV != vm->root && !thisV->is_func) {
+		node_t* sn = var_find_own_member(thisV, "@@t");
+		if(sn != NULL && sn->var != NULL)
+			var_set_int64(sn->var, ms);
+		else {
+			sn = var_add(thisV, "@@t", var_new_int64(vm, ms));
+			sn->be_unenumerable = 1;
+			sn->invisable = 1;
+		}
+	}
 	return obj;
 }
 
@@ -712,7 +758,8 @@ var_t* native_date_toUTCString(vm_t* vm, var_t* env, void* data) {
 var_t* native_date_toString(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	int64_t ms;
-	if(!date_this_ms(env, &ms) || ms == DATE_INVALID)
+	bool have_ms = date_this_ms(env, &ms);
+	if(!have_ms || ms == DATE_INVALID)
 		return var_new_str(vm, "Invalid Date");
 	struct tm tm; int msec;
 	if(!local_fields(ms, &tm, &msec))
@@ -836,8 +883,17 @@ void reg_native_Date(vm_t* vm) {
 	/* Formatting. */
 	vm_reg_native(vm, cls, "toISOString()", native_date_toISOString, NULL);
 	vm_reg_native(vm, cls, "toJSON()", native_date_toISOString, NULL);
-	vm_reg_native(vm, cls, "toUTCString()", native_date_toUTCString, NULL);
-	vm_reg_native(vm, cls, "toString()", native_date_toString, NULL);
+	vm_reg_native(vm, cls, "toUTCString()", native_date_toUTCString, NULL); 
+	vm_reg_native(vm, cls, "toString()", native_date_toString, NULL); 
+	/* ECMA-262 locale-aware formatters: github's commit date cells call
+	 * toLocaleDateString(); without them the fused call misses and the throw
+	 * lands in React's error boundary. Locale is ignored - local wall-clock
+	 * text (same as toString) keeps the cells populated. */
+	vm_reg_native(vm, cls, "toLocaleDateString()", native_date_toString, NULL); 
+	vm_reg_native(vm, cls, "toLocaleTimeString()", native_date_toString, NULL); 
+	vm_reg_native(vm, cls, "toLocaleString()", native_date_toString, NULL); 
+	vm_reg_native(vm, cls, "toDateString()", native_date_toString, NULL); 
+	vm_reg_native(vm, cls, "toTimeString()", native_date_toString, NULL); 
 }
 
 #ifdef __cplusplus

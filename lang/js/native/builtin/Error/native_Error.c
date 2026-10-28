@@ -3,6 +3,7 @@ extern "C" {
 #endif
 
 #include "native_Error.h"
+#include <stdlib.h>  /* free */
 
 #define CLS_ERROR "Error"
 
@@ -33,6 +34,22 @@ var_t* native_ErrorConstructor(vm_t* vm, var_t* env, void* data) {
 	var_t* thisV = get_obj(env, THIS);
 	error_set_str_member(thisV, "message", s);
 	error_set_str_member(thisV, "name", name);
+	/* ES Error.stack: capture the trace at construction. Without it React's
+	 * component-stack builder called .trim() on undefined and every caught
+	 * error lost its origin ("Error generating stack: can not find function
+	 * 'trim'"). */
+	{
+		mstr_t* head = mstr_new("");
+		mstr_append(head, name);
+		if(s != NULL && s[0] != 0) {
+			mstr_append(head, ": ");
+			mstr_append(head, s);
+		}
+		char* stk = mario_format_stack(vm, head->cstr);
+		mstr_free(head);
+		error_set_str_member(thisV, "stack", (stk != NULL) ? stk : "");
+		free(stk);
+	}
 	return thisV;
 }
 

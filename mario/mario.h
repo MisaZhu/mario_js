@@ -71,6 +71,15 @@ typedef struct st_hash_map {
 	uint32_t            capacity;
 	uint32_t            load_factor_num;   // 负载因子分子
 	uint32_t            load_factor_den;   // 负载因子分母
+	/* Entry-pool owner: when non-NULL (a var_t children map) entries are
+	 * recycled through the owning VM's hentry pool instead of mario_free.
+	 * Survives hash_map_clean and the lazy self-heal re-init in add. */
+	void*               owner;
+	/* When non-zero every entry->key is BORROWED from its node value
+	 * (node->name): add stores the pointer without strdup, remove/clean
+	 * skip the key free. Only var children maps set this; the key pointer
+	 * passed to hash_map_add must then be node->name (outlives entry). */
+	uint32_t            keys_borrowed;
 } hash_map_t;
 
 // Hash map functions
@@ -78,6 +87,7 @@ hash_map_t* hash_map_new(void);
 void        hash_map_free(hash_map_t* map, free_func_t free_key, free_func_t free_value);
 void        hash_map_init(hash_map_t* map);
 void        hash_map_add(hash_map_t* map, const char* key, void* value);
+void        hash_map_add_fresh(hash_map_t* map, const char* key, void* value); /* key verified absent by caller */
 void*       hash_map_get(hash_map_t* map, const char* key);
 void*       hash_map_remove(hash_map_t* map, const char* key);
 uint32_t    hash_map_size(hash_map_t* map);
@@ -96,11 +106,35 @@ typedef struct st_mstr {
 } mstr_t;
 
 void        mstr_reset(mstr_t* str);
+/* Inlinable fast path for the per-token reset in lex_get_next_token: the
+ * buffer is almost always already allocated, so len=0 + NUL suffices. Falls
+ * back to the real mstr_reset (which lazily allocates) on first use. */
+#define mstr_reset_fast(str) do { \
+	if((str)->cstr != NULL) { (str)->cstr[0] = 0; (str)->len = 0; } \
+	else mstr_reset(str); \
+} while(0)
 char*       mstr_ncpy(mstr_t* str, const char* src, uint32_t l);
 char*       mstr_cpy(mstr_t* str, const char* src);
 mstr_t*     mstr_new(const char* s);
 mstr_t*     mstr_new_by_size(uint32_t sz);
 char*       mstr_append(mstr_t* str, const char* src);
+char*       mstr_append_n(mstr_t* str, const char* src, uint32_t len);
+
+/* Fast no-growth append for hot bulk lanes (lexer spans): skips the call when
+ * the span fits live capacity (the common case); falls back to mstr_append_n
+ * for growth. Same capacity invariant as mstr_append_n (max > len+len_add). */
+static inline void mstr_append_span(mstr_t* str, const char* src, uint32_t len) {
+if (str->len + len < str->max) {
+char* d = str->cstr + str->len;
+uint32_t k;
+for (k = 0; k < len; k++)
+d[k] = src[k];
+str->len += len;
+str->cstr[str->len] = 0;
+} else {
+mstr_append_n(str, src, len);
+}
+}
 char*       mstr_add(mstr_t* str, char c);
 char*       mstr_add_int(mstr_t* str, int i, int base);
 char*       mstr_add_float(mstr_t* str, float f);
@@ -182,6 +216,12 @@ typedef struct st_bytecode {
 	 * bundles' top-level `export const` of the same runtime name never
 	 * collide. Reset by vm_load before every compile. */
 	bool                chunk_is_module;
+	/* Compiler facility: while set, bc_getstrindex returns OFF_MASK without
+	 * touching mstr_table/mstr_index. hoist_begin sets this on its scratch
+	 * bytecode for the scan pass (its code_buf is discarded unread), and
+	 * clears it before the real pass reuses the scratch for declaration
+	 * re-emission (func_def reads those LOAD payloads back). */
+	bool                skip_strtab;
 } bytecode_t;
 
 /*
@@ -373,12 +413,20 @@ typedef struct st_bytecode {
 #define INSTR_WTARGET      0x098 // WTARGET name : resolve the write target on the base under the nearest @@wanchor, replacing the anchor with the [obj,]node slot(s) beneath the RHS value
 #define INSTR_FINALLY_END  0x099 // FINALLY_END : end of a `finally` block; resumes a return/break/continue that was deferred to run this finally (see vm_t.pending_op)
 #define INSTR_FUNC_NAMED   0x09A // FUNC_NAMED name : define a NAMED function EXPRESSION; the operand is the function's own name, bound to itself in its per-call scope so the body can self-reference it (ES named-function-expression semantics), while staying invisible outside
+#define INSTR_FUNC_GEN_NAMED 0x0A2 // FUNC_GEN_NAMED name : a NAMED generator function EXPRESSION; like INSTR_FUNC_GEN (body suspends at yield) but ALSO carries the function's own name as a string operand so the body can self-reference it for recursion (ES named-function-expression semantics). GitHub's protobuf tree walker `for(let t of function* e(t){... yield* e(n) ...}(root))` relies on this.
 #define INSTR_LOADV        0x09B // LOADV x : like LOAD, but pushes the binding's CURRENT VALUE (a snapshot) instead of the binding node. Source-level rvalue reads of a bare identifier use this so an operand already on the value stack is not aliased by a later reassignment of the same binding (e.g. `f(m, m++, m)` must pass m's pre-increment value as the first argument). Write targets keep the node form (LOADW).
 #define INSTR_MODULE_V     0x09C // MODULE_V : pop a specifier string (dynamic `import(expr)`), ensure that module is loaded/evaluated, push its namespace object
 #define INSTR_IMPORT_META  0x09D // IMPORT_META : push the `import.meta` object of the running module ({url}); a fresh object for a non-module script
 #define INSTR_STATIC_BLK   0x09E // STATIC_BLK : pop a hidden zero-arg function (class `static { ... }` body) and run it once with `this` = the class under definition
+#define INSTR_ASYNC        0x09F // ASYNC : mark the function var on top of the stack as `async` (emitted right after the body of an async function/arrow/method; peeks, does not pop)
+#define INSTR_GETLA        0x0A0 // GETLA x : member fetch as a LOGICAL-ASSIGN target (`o.x ??=/||=/&&= v`). Reads exactly like INSTR_GET, except an ABSENT own member on a persistent plain object is materialized as an empty writable node first, so handle_logic_assign has a node to write through (a plain GET read pushes a bare undefined rvalue for a missing member, leaving the logical assign a no-op).
+#define INSTR_LOADP        0x0A1 // LOADP k : push the current function scope's param-slot k - the env binding NODE for func->args[k], filled once per call by scope_fill_pslots. LOADW-equivalent (a raw node, never an accessor: the env object is unreachable from JS, so no getter can ever be installed on a param binding). Only emitted for params the compiler proved unshadowed by any block-lexical binding, with eval/with absent.
+#define INSTR_LOADPV       0x0A3 // LOADPV k : like LOADP but pushes the binding's CURRENT VALUE snapshot (LOADV-equivalent) for rvalue reads.
+#define INSTR_FUNCLOC      0x0A4 // FUNCLOC name : function-header metadata between the FUNC* opcode and its JMP sentinel (never executed: the sentinel skips the whole header region, and func_def consumes it while scanning). Declares one hoisted `var` local of the body; func_def appends `name` to func->locals so scope_fill_pslots can pre-create the env binding and alias it into the param-slot cache right after the true parameters (slot k <-> (args ++ locals)[k]).
+#define INSTR_FUNCARGU     0x0A5 // FUNCARGU "arguments" : function-header metadata (same never-executed region as FUNCLOC). Marks that the body references `arguments` (a bare read/write, a template interpolation, a default-value initialiser, or a rest parameter, which compiles to arguments.slice) - func_def sets func->uses_arguments so func_call can skip materializing the arguments array for bodies that provably never read it.
+#define INSTR_CLASS_EXPR   0x0A6 // CLASS_EXPR name : a NAMED class EXPRESSION (`x = class N {...}`). Like INSTR_CLASS but the self-name N is bound ONLY inside the class body (a fresh, distinct class var under a unique internal binding, never reusing/clobbering an enclosing `N`), so several `class N` expressions in one scope stay distinct and `new N` inside a method resolves to the right class. Handled by handle_class.
 
-#define INSTR_MAX          0x09F // Maximum instruction opcode value
+#define INSTR_MAX          0x0A7 // Instruction-table size / opcode guard: one past the highest defined opcode (INSTR_CLASS_EXPR).
 
 /* vm_t.pending_op: the kind of control transfer parked while a `finally` block
  * runs (see the pending_value comment in the vm struct). */
@@ -397,6 +445,9 @@ PC          bc_gen(bytecode_t* bc, opr_code_t instr);
 PC          bc_gen_str(bytecode_t* bc, opr_code_t instr, const char* s);
 PC          bc_gen_int(bytecode_t* bc, opr_code_t instr, int32_t i);
 PC          bc_gen_short(bytecode_t* bc, opr_code_t instr, int32_t i);
+/* Append a one-word instruction whose OFF field carries an immediate operand
+ * (a param-slot index for INSTR_LOADP/LOADPV), not a string-table index. */
+PC          bc_gen_imm(bytecode_t* bc, opr_code_t instr, uint32_t imm);
 void        bc_set_instr(bytecode_t* bc, PC anchor, opr_code_t op, PC target);
 void        bc_remove_instr(bytecode_t* bc, PC from, uint32_t num);
 uint32_t    bc_getstrindex(bytecode_t* bc, const char* str);
@@ -406,6 +457,11 @@ void        bc_srcmap_begin(bytecode_t* bc, const char* src);       /* new sourc
 void        bc_srcmap_add(bytecode_t* bc, PC pc, uint32_t pos);     /* statement starts at pos */
 bool        bc_srcmap_locate(bytecode_t* bc, PC pc, mstr_t* out);   /* "src#n line:col | snippet" */
 const char* mario_last_throw_loc(void);   /* DIAG: source trace of the most recent throw (MARIO_SRCMAP) */
+/* Error.stack trace captured at construction: malloc'd string, caller frees.
+ * (struct st_vm is vm_t, typedef'd further down; the forward tag keeps this
+ * prototype valid at its position.) */
+struct st_vm;
+char* mario_format_stack(struct st_vm* vm, const char* msg);
 PC          bc_add_instr(bytecode_t* bc, PC anchor, opr_code_t op, PC target);
 PC          bc_reserve(bytecode_t* bc);
 
@@ -441,6 +497,13 @@ extern const char* _mario_lang;
 /* Hidden own member on an arrow function object. It stores the exact `this`
  * value visible when the arrow is created, including an explicit undefined. */
 #define ARROW_THIS "@@arrow_this"
+/* Hidden own member on a class-method function object: the class var it belongs
+ * to. A NAMED class EXPRESSION (`var x = class N {...}`) binds its own name N
+ * only inside the class body (ES semantics), never in the enclosing scope. Since
+ * a method's closure skips the transient class-definition scope and captures the
+ * enclosing function env, the self-name is re-bound per call from this member
+ * (see func_call), mirroring the named-function-expression nfe_name path. */
+#define CLS_SELF "@@clsself"
 #define PROTOTYPE "prototype"
 /* A callable's [[Prototype]] is stored separately from its `.prototype`
  * own-property (which doubles as the instance prototype read by `new`). See
@@ -580,6 +643,12 @@ typedef struct st_var {
 	struct st_var*      next; //for var list
 	hash_map_t          children;
 	struct st_vm*       vm;
+	/* Incarnation serial: assigned from the owning vm's var_serial counter at
+	 * var_new (after the memset), so a recycled var body always carries a fresh
+	 * id. The inline cache (mic in vm_t) keys entries by (site, name, var
+	 * pointer, serial); the serial is what makes a freed-and-reused var address
+	 * safe as a cache key. */
+	uint64_t            serial;
 } var_t;
 
 typedef var_t* (*native_func_t)(struct st_vm *, var_t*, void*);
@@ -591,6 +660,7 @@ typedef struct st_func {
 	int8_t              is_static: 4;
 	int8_t              is_generator: 4; // ES6 `function*` / generator method
 	int8_t              is_arrow: 4;     // ES6 arrow function: lexical `this`, no `prototype`, not constructible
+	int8_t              is_async: 4;     // ES2017 `async function`: called as a coroutine (see the async driver in mario.c)
 	PC                  pc;
 	void*               data;
 	/* ES named-function-expression self-binding: for `var f = function name(){...}`
@@ -598,7 +668,32 @@ typedef struct st_func {
 	 * (and nowhere outside). func_call binds this name into the per-call env when
 	 * non-NULL. Owned (mario_malloc'd); freed in func_free(). */
 	char*               nfe_name;
+	/* ES named-class-expression self-binding: for `var x = class N {...}` the
+	 * identifier N must resolve to the class itself INSIDE the body (methods,
+	 * constructor, field initializers) and nowhere outside. The class var rides
+	 * the CLS_SELF hidden member of this function's object var; func_call binds
+	 * this name -> that class var into the per-call env when non-NULL. Owned
+	 * (mario_malloc'd); freed in func_free(). */
+	char*               cls_self_name;
+	/* ES2015 module lexical binding of the DEFINING module: the registry-key URL
+	 * of the <script type=module>/import whose body created this function, or
+	 * NULL for classic-script functions. func_call re-installs it as
+	 * vm->cur_module_spec for the duration of each call so that `import.meta.url`
+	 * and relative dynamic `import()` inside LATER callbacks (promise reactions,
+	 * timers) resolve against the defining module's URL exactly as a real engine
+	 * binds them statically to the import call site - not against whatever
+	 * script happens to be running (or nothing) when the callback fires. Points
+	 * at the module registry's own key string (stable, not owned here). */
+	const char*         module_spec;
 	m_array_t           args; //argument names
+	/* Hoisted `var` locals of the body, in source order (collected from the
+	 * INSTR_FUNCLOC header metadata by func_def). Slot k of the scope pslot
+	 * cache aliases (args ++ locals)[k]; scope_fill_pslots pre-creates these
+	 * bindings in the call env (identical to the hoisted INSTR_VARs the body
+	 * runs anyway - handle_var is idempotent) so reads of an unshadowed local
+	 * skip the name hash. Empty for native functions and for functions whose
+	 * compiler frame was disabled (eval/with/destructuring/rest params). */
+	m_array_t           locals;
 	var_t*              owner;
 	/* Back-pointer to the var_t that owns this func_t (var->value == this, set by
 	 * var_new_func). A closure captures the next-outer function via the RAW
@@ -620,6 +715,36 @@ typedef struct st_func {
 	 * vm_find_in_scopes() walks. Holding the owner var keeps that func_t alive
 	 * exactly as long as this closure. Released in var_free()/func_free(). */
 	var_t*              closure_func_ref;
+	/* Owned reference pinning func->owner (the method's [[HomeObject]]), or NULL.
+	 * owner is a RAW pointer read at every super-binding guard in func_call;
+	 * gc_mark's is_func walk keeps it alive across a sweep, but nothing stopped
+	 * a synchronous REFCOUNT release (throw unwind, transient literal) from
+	 * recycling the owner under a still-live method/getter - func_call then
+	 * read owner->type/children.buckets from a system-freed block (ASan:
+	 * heap-use-after-free), and a garbage read that slipped past the guard sent
+	 * var_get_prototype into a fake hash map. Pinning mirrors closure_func_ref;
+	 * the object<->method cycle this creates is collected by the reachability
+	 * gc (unreachable over-retained vars are swept). Released in func_free(). */
+	var_t*              owner_ref;
+	/* JIT cache (see jit/mario_jit.h): func_call counts calls in jit_calls;
+	 * once past the hotspot threshold vm_run compiles the body ONCE and enters
+	 * jit_code (a jit_code_t*, owned here, released in func_free) on later
+	 * calls. jit_failed latches a failed/unsupported compile so it is never
+	 * retried. All zeroed by func_new's memset; MARIO_JIT=0 disables, and on
+	 * targets with no JIT backend the compile always fails into the latch.
+	 * jit_loops is the OSR sibling counter: loop back edges (JMPB / taken
+	 * NJMPB) count towards a MID-BODY compile+entry, catching single-call
+	 * long-loop bodies the call-count path never sees. */
+	uint32_t            jit_calls;
+	uint32_t            jit_loops;
+	uint8_t             jit_failed;
+	/* Set by func_def when the header carries INSTR_FUNCARGU (the compiler saw
+	 * an `arguments` reference, a rest parameter, or an arguments-reading
+	 * default initialiser in this body). func_call materializes the arguments
+	 * array only when this is set (JS functions; natives keep the arg_num>0
+	 * rule). Zeroed by func_new's memset. */
+	uint8_t             uses_arguments;
+	void*               jit_code;
 } func_t;
 
 /* func_t.regular distinguishes a normal function/method from an ES6 accessor.
@@ -643,9 +768,33 @@ typedef struct st_node {
 	 * own `const`/`let` declaration has run; the declaration handler adopts such
 	 * a placeholder node instead of throwing "has already existed". */
 	uint32_t            be_import : 8;
+	/* name points to a C string LITERAL, not a heap copy (stack sentinel nodes:
+	 * WANCHOR/WSLOT/ARRLEN_SLOT/PROXY_SLOT). node_free skips the name free and
+	 * the shape-epoch bump: a sentinel never lives in a children map, so its
+	 * death changes no object's shape. */
+	uint32_t            name_static : 1;
 	uint32_t            ncache_instr;
 	char*               name;
+#define NODE_NAME_INLINE 24
+	/* Inline short-name storage: identifiers shorter than this live inside
+	 * the node body (name points here), saving a malloc/free pair per
+	 * node_new - hot on every call's this/parameter binding nodes. Longer
+	 * names fall back to a heap copy; node_free tells the two apart by
+	 * pointer identity with this buffer. */
+	char                name_inline[NODE_NAME_INLINE];
 	var_t*              var;
+	/* Owning VM, captured at node_new from the OWNER var's vm. node_free bumps
+	 * this VM's shape_epoch unconditionally: the node->var route used before
+	 * silently skipped the bump when the value var had already been torn down
+	 * (vm==NULL / dead status), leaving an inline-cache entry pointing at the
+	 * recycled node block - a use-after-free on the next hit. */
+	struct st_vm*       vm;
+	/* Incarnation counter for the mic hit path: stamped from ++vm->node_serial
+	 * at node_new/sentinel_new (after their memset), so a pool-recycled node
+	 * body can never alias a cached mic entry pointing at its previous
+	 * incarnation. Lets mic_lookup prove node identity with one integer
+	 * compare instead of a strcmp PLT call on every hit. */
+	uint64_t            serial;
 } node_t;
 
 typedef struct st_ic_entry {
@@ -696,9 +845,19 @@ typedef bool (*compiler_func_t)(bytecode_t *bc, const char* input);
 
 
 //scope of vm runing
+/* INSTR_LOADP/LOADPV slot cache width: a function's positional parameters
+ * plus its hoisted `var` locals share one slot space (params first); names
+ * beyond this index fall back to plain name loads. */
+#define MARIO_PSLOT_MAX 16
+
 typedef struct st_scope {
 	var_t* var;
 	var_t* class_var; // for a class-definition scope: the constructor var (pushed by CLASS_END so class expressions evaluate to the class)
+	/* For a NAMED class EXPRESSION scope: the source-level self-name (points into
+	 * the bytecode string table, valid for the whole run), which handle_func copies
+	 * onto each method's func_t.cls_self_name so the body can self-reference the
+	 * class. NULL for a class declaration or an anonymous class expression. */
+	const char* class_self_name;
 	PC pc_start; // continue anchor for loop
 	PC pc; // try cache anchor , or break anchor for loop
 	/* Start PC of this try's `finally` block (ILLEGAL_PC when it has none). A
@@ -729,12 +888,33 @@ typedef struct st_scope {
 	 * dangles, and the next vm_find_in_scopes() dereferences freed memory. */
 	var_t*   func_var;
 	struct st_scope* prev;
+	/* Nearest enclosing FUNCTION scope (self when is_func, inherited from
+	 * prev otherwise), filled by vm_push_scope: turns vm_pslot_node's
+	 * walk-past-block-scopes into a single dereference. */
+	struct st_scope* func_scope;
+	/* Slot cache for INSTR_LOADP/LOADPV: pslots[k] aliases the env binding
+	 * node of (func->args ++ func->locals)[k], filled once at function-scope
+	 * entry so a parameter/local read is a pointer index instead of a hash
+	 * lookup. The env nodes stay the single source of truth (closures,
+	 * reflection, writes through ASIGN all observe the same node->var), and a
+	 * local binding is never deletable (`delete x` on one yields false), so
+	 * the pointers outlive the scope.
+	 * pslot_num == 0 (also the scope_new memset default) disables the cache. */
+	node_t* pslots[MARIO_PSLOT_MAX];
+	int32_t pslot_num;
 	//continue and break anchor for loop(while/for)
 } scope_t;
 
 /* One scope per nested call/block frame; must outlive VM_STACK_MAX's slot-per-
- * level budget by the same factor so neither guard trips first on deep chains. */
-#define VM_SCOPE_STACK_MAX    1024
+ * level budget by the same factor so neither guard trips first on deep chains.
+ * Bundled React opens ~2.5-3 scopes per JS call frame (func frame + its block /
+ * loop scopes), so 1024 slots tripped the RangeError guard at only ~400 call
+ * frames - far below MARIO_MAX_CALL_DEPTH's 1024 and well short of what React's
+ * recursive commit traversal (recursivelyTraverseLayoutEffects <->
+ * commitLayoutEffectOnFiber, one level per Fiber) reaches on a large page like
+ * pinterest.com. Size it to hold a full MARIO_MAX_CALL_DEPTH chain at ~3 scopes
+ * per frame so call_depth - not the scope array - stays the binding limit. */
+#define VM_SCOPE_STACK_MAX    4096
 
 /* Hard bound on walking a function's captured lexical chain (closure.var /
  * closure.func, climbed via "@@lex"). That chain is meant to be strictly
@@ -761,6 +941,25 @@ typedef struct st_pending_save {
 	int                 op;
 	struct st_pending_save* prev;
 } pending_save_t;
+
+/* Monomorphic inline cache (mic) for member/scope resolution (do_get /
+ * vm_load_node), direct-mapped by a hash of the instruction site pc. A hit
+ * requires site + name pointer + base var pointer + base incarnation serial +
+ * base func-disposition + the current shape epoch, then strcmp against the
+ * node's own name as a final alias guard (see mic_lookup in mario.c). Entries
+ * are zeroed by vm_new's memset; a zeroed entry can never match because a real
+ * lookup name is never NULL. MARIO_MEMO=0 disables. */
+#define MIC_SIZE 512
+typedef struct st_mic_entry {
+	PC                  pc;          /* instruction site: vm->pc - 1 at dispatch */
+	uint32_t            base_func;   /* (base->is_func || base->is_class) at fill time */
+	const char*         name;        /* lookup name pointer (bc strings are interned) */
+	var_t*              base;        /* receiver / scope var the lookup started on */
+	node_t*             node;        /* resolved member node (borrowed; epoch-guarded) */
+	uint64_t            base_serial; /* base->serial at fill time (recycled-address guard) */
+	uint64_t            epoch;       /* vm->shape_epoch at fill time */
+	uint64_t            node_serial; /* node->serial at fill time (recycled-node guard) */
+} mic_entry_t;
 
 typedef struct st_vm {
 	bytecode_t          bc;
@@ -793,6 +992,14 @@ typedef struct st_vm {
 	 * up). The tick may run JS callbacks but must not compile or load bytecode
 	 * (same restriction as on_step). NULL = await never waits. */
 	int                 (*on_await_pending)(struct st_vm* vm, var_t* promise);
+	/* Async-throw conversion hook (ECMA-262): an async function NEVER throws
+	 * synchronously - a throw that escapes its body becomes a rejected promise
+	 * returned to the caller. The Promise builtin binds this to
+	 * promise_new_rejected(); func_call invokes it when a func_t.is_async body
+	 * aborts with propagating_err and no inner catch. It takes a ref on `reason`
+	 * and returns an already-rejected promise at baseline refs (the caller pushes
+	 * it). NULL = no Promise support -> fall back to synchronous propagation. */
+	var_t*              (*async_reject)(struct st_vm* vm, var_t* reason);
 	/* ES6 generator suspension: handle_yield sets yielded + yield_value and the
 	 * running vm_run() returns; gen_resume() (the generator's next()) consumes
 	 * them. yield_delegate carries the iterator of an in-progress `yield*`.
@@ -801,6 +1008,20 @@ typedef struct st_vm {
 	bool                yielded;
 	var_t*              yield_value;
 	var_t*              yield_delegate;
+	/* ES2017 async/await coroutine suspension. async_enabled turns the whole
+	 * mechanism on. await_susp is set by __await when it
+	 * suspends on a PENDING promise instead of returning a value: the vm_run
+	 * dispatch then drops the placeholder result func_call pushed for the
+	 * __await call and returns, handing control to the async driver, which
+	 * detaches the frame (gen_suspend) and returns a pending promise to the
+	 * caller. yielded/yield_value are reused to carry the awaited promise. */
+	bool                async_enabled;
+	bool                await_susp;
+	/* >0 while a vm_run() frame belongs to an async function body, i.e. a
+	 * driver exists that can catch the suspension. A top-level await (a
+	 * module body) has no driver, so __await keeps the legacy synchronous
+	 * spin there instead of stranding the run. */
+	int32_t             async_depth;
 	/* Deferred `finally` completion. A return/break/continue that leaves a try
 	 * body must run that try's finally block BEFORE the transfer completes, so the
 	 * transfer is parked here, vm->pc is set to the scope's pc_finally, and the
@@ -933,6 +1154,72 @@ typedef struct st_vm {
 
 	var_t*              free_var_buffer;
 	uint32_t            free_var_buffer_num;
+	/* Numeric value-box pool: var_new_int/bool/float/int64/float64 take their
+	 * <=8-byte value box from this single-size-class free list, and var_clean /
+	 * var_set_* return numeric boxes here (bounded) instead of mario_free. One
+	 * 8-byte class fits every numeric payload, so a numeric temporary costs no
+	 * malloc/free pair at all in steady state. Per-VM, lock-free by the same
+	 * single-threaded contract as free_var_buffer. Pure C, platform-neutral. */
+	void*               nbox_free;
+	uint32_t            nbox_free_num;
+	/* Member-node pools: node_t (fixed size) and hash_entry_t (fixed size)
+	 * bodies recycle through these per-VM free lists instead of malloc/free.
+	 * Only maps whose owner is this VM draw from hentry_free (generic maps keep
+	 * the plain allocator). Drained in vm_close after the final forced gc, so
+	 * no live node/entry can ever push into a dead pool. */
+	void*               node_pool;
+	uint32_t            node_pool_num;
+	void*               hentry_pool;
+	uint32_t            hentry_pool_num;
+	/* Bucket-array pool for VM-owned children maps: the 16-slot initial
+	 * bucket array (128B) is malloc'd+freed once per function env / memberful
+	 * var birth-death. Entries are already pooled via hentry_pool; this pools
+	 * the array itself. Only HASH_MAP_INITIAL_CAPACITY arrays are pooled
+	 * (resized arrays go straight to mario_free). Pure raw-memory blocks: no
+	 * var references, so no GC rooting needed. Drained in vm_close. */
+	void*               buckets_pool;
+	uint32_t            buckets_pool_num;
+	/* Scope-frame pool (one scope_t per function call / block entry): fixed
+	 * size, recycled per-VM, drained in vm_close with the sibling pools. */
+	void*               scope_pool;
+	uint32_t            scope_pool_num;
+	/* Member-shape epoch: bumped by node_free, by var_add when it creates a NEW
+	 * node, and by prototype-link writes (var_set_prototype /
+	 * var_set_callable_proto). Inline-cache entries are tagged with this epoch
+	 * and never survive a bump, which is what makes site-level caching safe
+	 * across delete/add/re-prototype (the stale-binding failure mode that
+	 * killed the old NCACHE rewrite). */
+	uint64_t            shape_epoch;
+	/* Incarnation counter: var_new stamps each (possibly recycled) var with
+	 * ++var_serial, so a var address reused after a free can never alias a
+	 * mic entry keyed by the old incarnation's (base, base_serial). */
+	uint64_t            var_serial;
+	/* Same incarnation discipline for node_t bodies (they round-trip through
+	 * node_pool): stamps node->serial; see mic_entry_t.node_serial. */
+	uint64_t            node_serial;
+	/* Bit 0 (value 1) set whenever fin_ret_done / yielded / await_susp becomes
+	 * true. Lets the vm_run dispatch tail test ONE word instead of three fields
+	 * (plus opcode guards) per instruction; the sub-checks re-verify the
+	 * original flags, which remain the single source of truth (the JIT
+	 * reads them directly by offset). Cleared at the top of the block.
+	 * Bit 1 (VM_FE_OSR, mario.c) requests a JIT on-stack replacement at the
+	 * loop head a back edge just landed on; purely a request, so a missed or
+	 * stale bit only costs one skipped block entry. */
+	uint32_t            frame_events;
+	/* Direct-mapped monomorphic inline cache (see mic_entry_t above). */
+	mic_entry_t         mic[MIC_SIZE];
+	/* WANCHOR sentinel trio pool (mario.c handle_wanchor/handle_wtarget):
+	 * freelist of reusable (sentinel node + placeholder var + @@wanchorobj
+	 * member node) trios for the deferred member-write protocol. While a trio
+	 * is idle in the pool, the freelist link runs through
+	 * sn->name_inline[0..8) and the cached member-node pointer lives at
+	 * sn->name_inline[8..16) (name_static sentinels never store their name
+	 * inline, and node_free's `name != name_inline` test is unaffected).
+	 * wanchor_nil is the shared undefined placeholder parked in the member
+	 * node's var while the trio is idle; wanchor_pool_num caps the pool. */
+	void*               wanchor_pool;
+	uint32_t            wanchor_pool_num;
+	var_t*              wanchor_nil;
 } vm_t;
 
 typedef mstr_t* (*load_m_func_t)(struct st_vm *, const char* jsname);
@@ -1110,6 +1397,7 @@ var_t*      mario_apply_var(vm_t* vm, var_t* func, var_t* thisArg, var_t* argsNa
 var_t*      mario_construct_var(vm_t* vm, var_t* ctor, var_t* argsNatural, var_t* newTarget); // owned
 
 var_t*      vm_get_iterator(vm_t* vm, var_t* iterable);
+var_t*      vm_iter_next(vm_t* vm, var_t* iter);
 var_t*      vm_new_array_iterator(vm_t* vm, var_t* arr);
 var_t*      vm_new_string_iterator(vm_t* vm, var_t* str);
 
@@ -1137,11 +1425,40 @@ bool        vm_load_run_native(vm_t* vm, const char* s);
  * per-chunk runtime registries in module scope; a second eval would see an
  * empty registry). Returns vm_load_run's success flag. */
 bool        vm_load_run_module(vm_t* vm, const char* s, const char* spec);
+/* Re-entrant-evaluation isolation for embedder await-pumps: vm_pump_suspend
+ * detaches the ENTIRE live scope/value stack into a gc-rooted keep state so a
+ * nested (pumped) top-level run starts on a clean stack and its free names can
+ * only reach the global object - never the suspended caller frames' locals;
+ * vm_pump_resume re-attaches the suspended state verbatim. Nesting counted. */
+void        vm_pump_suspend(vm_t* vm);
+void        vm_pump_resume(vm_t* vm);
+
+/* Promise primitives implemented by the builtin Promise module
+ * (lang/js/native/builtin/Promise/native_Promise.c) and used by the VM's
+ * async/await coroutine driver: promise_new_deferred builds a pending promise
+ * plus its C-callable __resolve/__reject handles (each var_ref'd once for the
+ * caller to own); promise_await_reaction registers one .then()-style reaction
+ * whose handlers may be native functions, scheduling the drain when the promise
+ * has already settled. */
+var_t*      promise_new_deferred(vm_t* vm, var_t** out_resolve, var_t** out_reject);
+void        promise_await_reaction(vm_t* vm, var_t* promise, var_t* onF, var_t* onRej);
+/* Promise state probe for the async driver: 0 = not a promise, 1 = PENDING,
+ * 2 = FULFILLED, 3 = REJECTED; for 2/3 *out is the BORROWED settled value. */
+int         promise_peek(vm_t* vm, var_t* v, var_t** out);
 bool        vm_run(vm_t* vm);
 void        vm_close(vm_t* vm);
 void        vm_terminate(vm_t* vm);
+/* Clear the deferred-`finally` transfer state (pending_value/label/pc/op and the
+ * STACK-allocated pending_saves chain) after a NON-LOCAL unwind such as an
+ * embedder's siglongjmp SEGV recovery, which abandons vm_run frames before they
+ * restore vm->pending_saves - leaving it dangling at a dead stack frame that the
+ * next gc_vars dereferences. Call only once those frames are gone. See mario.c. */
+void        vm_reset_pending(vm_t* vm);
 
 var_t*      vm_new_class(vm_t* vm, const char* cls);
+/* Non-callable namespace object (Math/JSON/Reflect/Atomics/Intl): like
+ * vm_new_class but leaves is_class clear so `typeof X === "object"`. */
+var_t*      vm_new_namespace(vm_t* vm, const char* name);
 var_t*      new_obj(vm_t* vm, const char* cls_name, int arg_num);
 void        vm_throw(vm_t* vm, const char *format, ...);
 /* Report (console-style) and clear an exception that propagated out of every

@@ -185,6 +185,15 @@ var_t* native_StringToString(vm_t* vm, var_t* env, void* data) {
 	return var_new_str(vm, s);
 }
 
+/* String.prototype.toLocaleString(): spec-wise identical to toString for the
+ * default locale; without it the lookup lands on Object.prototype's alias and
+ * yields "[object String]". */
+var_t* native_String_toLocaleString(vm_t* vm, var_t* env, void* data) {
+	(void)vm; (void)data;
+	const char* s = get_str(env, THIS);
+	return var_new_str(vm, s);
+}
+
 var_t* native_StringSubstr(vm_t* vm, var_t* env, void* data) {
 	(void)vm; (void)data;
 
@@ -353,30 +362,46 @@ var_t* native_StringSplit(vm_t* vm, var_t* env, void* data) {
 	}
 
 	const char* s = get_str(env, THIS);
-	const char* separator = get_str(env, "separator");
 	int len = (int)strlen(s);
-	int sepLen = (int)strlen(separator);
 
-	// Get limit parameter (optional)
-	int limit = -1; // -1 means no limit
+	/* ES2023 22.1.3.20 String.prototype.split(separator, limit):
+	 *  - an undefined separator yields [S] (the whole string);
+	 *  - limit goes through ToUint32, so 0 yields [] and a negative value
+	 *    becomes huge (i.e. no limit);
+	 *  - EVERY separator occurrence produces a piece, empty pieces included,
+	 *    and a final (possibly empty) trailing piece is always appended. The
+	 *    old loop bailed out on `start < len`, so a string ending with the
+	 *    separator silently lost its last empty piece: "/".split("/") returned
+	 *    [""] instead of ["",""], which made react-router's decodePath("/")
+	 *    collapse to "" and every route match fail (404 on pinterest.com). */
+	var_t* sepv = get_obj(env, "separator");
+	int has_sep = (sepv != NULL && sepv->type != V_UNDEF);
+
+	int limit = -1; /* -1 means no limit */
 	var_t* limitVar = get_obj(env, "limit");
 	if (limitVar != NULL && limitVar->type != V_UNDEF && limitVar->type != V_NULL) {
 		limit = var_get_int(limitVar);
-		if (limit <= 0) {
-			limit = -1;
-		}
+		if (limit < 0)
+			limit = -1;   /* ToUint32(negative) is huge -> effectively no limit */
 	}
 
 	// Create result array
 	var_t* result = var_new_array(vm);
 
-	// Handle empty string case
-	if (len == 0) {
-		var_array_add(result, var_new_str(vm, ""));
+	/* limit === 0 always produces an empty array */
+	if (limit == 0)
+		return result;
+
+	/* undefined separator -> the whole string as a single piece */
+	if (!has_sep) {
+		var_array_add(result, var_new_str2(vm, s, len));
 		return result;
 	}
 
-	// Handle empty separator case
+	const char* separator = get_str(env, "separator");
+	int sepLen = (int)strlen(separator);
+
+	// Handle empty separator case: split into individual characters.
 	if (sepLen == 0) {
 		int i;
 		for (i = 0; i < len && (limit == -1 || i < limit); i++) {
@@ -386,13 +411,14 @@ var_t* native_StringSplit(vm_t* vm, var_t* env, void* data) {
 		return result;
 	}
 
-	// Split the string
+	// General case: scan for separators, then always append the trailing
+	// (possibly empty) remainder so trailing/consecutive separators keep
+	// their empty pieces.
 	int start = 0;
-	int i, j;
 	int count = 0;
-
-	while (start < len && (limit == -1 || count < limit)) {
-		// Find the next separator
+	for (;;) {
+		int found = -1;
+		int i, j;
 		for (i = start; i <= len - sepLen; i++) {
 			for (j = 0; j < sepLen; j++) {
 				if (s[i + j] != separator[j]) {
@@ -400,19 +426,19 @@ var_t* native_StringSplit(vm_t* vm, var_t* env, void* data) {
 				}
 			}
 			if (j == sepLen) {
-				// Found separator, add substring to result
-				var_t* substr = var_new_str2(vm, s + start, i - start);
-				var_array_add(result, substr);
-				start = i + sepLen;
-				count++;
+				found = i;
 				break;
 			}
 		}
-
-		// If no more separators, add the remaining string
-		if (i > len - sepLen) {
-			var_t* substr = var_new_str2(vm, s + start, len - start);
-			var_array_add(result, substr);
+		if (found >= 0) {
+			var_array_add(result, var_new_str2(vm, s + start, found - start));
+			count++;
+			start = found + sepLen;
+			if (limit != -1 && count >= limit)
+				break;
+		} else {
+			/* no separator left: append the remainder, even when empty */
+			var_array_add(result, var_new_str2(vm, s + start, len - start));
 			break;
 		}
 	}
@@ -645,6 +671,41 @@ var_t* native_StringMatch(vm_t* vm, var_t* env, void* data) {
 	if(hits == 0)
 		return var_new_null(vm);   /* arr is unrooted; the next gc sweeps it */
 	return arr;
+}
+
+/* String.prototype.matchAll(regexp): every global match, each entry the same
+ * result array RegExp.exec yields (full match, capture groups, index, input).
+ * Returned as a plain array - Array.from / for-of / spread (the only shapes
+ * pages use, e.g. `Array.from(s.matchAll(re)).map(m=>m[1])`) accept it, which
+ * avoids standing up a RegExpStringIterator prototype. */
+var_t* native_StringMatchAll(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	const char* s = get_str(env, THIS);
+	int slen = (int)strlen(s);
+	var_t* rv = get_obj(env, "regexp");
+	const char* src;
+	const char* flg;
+	if(js_regexp_is(rv)) {
+		src = get_str(rv, "source");
+		flg = get_str(rv, "flags");
+	}
+	else {
+		src = get_str(env, "regexp");
+		flg = "g";
+	}
+	char err[64];
+	re_prog_t* p = re_compile(src, flg, err, sizeof(err));
+	if(p == NULL)
+		return var_new_array(vm);
+	var_t* out = var_new_array(vm);
+	int caps[RE_CAPS_MAX];
+	int pos = 0;
+	while(pos <= slen && re_match(p, s, slen, pos, caps)) {
+		var_array_add(out, js_regexp_result_array2(vm, s, caps, p));
+		pos = caps[1] > caps[0] ? caps[1] : caps[1] + 1;
+	}
+	re_free(p);
+	return out;
 }
 
 /* String.prototype.search(regexp): byte index of the first match or -1. */
@@ -1768,6 +1829,7 @@ void reg_native_String(vm_t* vm) {
 	vm_reg_native(vm, cls, "constructor(str)", native_StringConstructor, NULL); 
 	vm_reg_native(vm, cls, "length()", native_StringLength, NULL); 
 	vm_reg_native(vm, cls, "toString()", native_StringToString, NULL); 
+	vm_reg_native(vm, cls, "toLocaleString(locale, options)", native_String_toLocaleString, NULL); 
 	vm_reg_native(vm, cls, "substr(start, length)", native_StringSubstr, NULL); 
 	vm_reg_native(vm, cls, "trim()", native_StringTrim, NULL); 
 	vm_reg_native(vm, cls, "slice(beginIndex, endIndex)", native_StringSlice, NULL); 
@@ -1775,8 +1837,18 @@ void reg_native_String(vm_t* vm) {
 	vm_reg_native(vm, cls, "split(separator, limit)", native_StringSplit, NULL); 
 	vm_reg_native(vm, cls, "toLowerCase()", native_StringToLowerCase, NULL); 
 	vm_reg_native(vm, cls, "toUpperCase()", native_StringToUpperCase, NULL); 
+	/* ECMA-262 locale-aware aliases: github's code-view row render calls
+	 * message.toLocaleLowerCase(); without them the fused call misses and the
+	 * throw lands in React's error boundary ("Unable to load page"). The
+	 * locale argument is ignored (ASCII case mapping), matching toLowercase. */
+	vm_reg_native(vm, cls, "toLocaleLowerCase()", native_StringToLowerCase, NULL); 
+	vm_reg_native(vm, cls, "toLocaleUpperCase()", native_StringToUpperCase, NULL); 
+	/* Date-style locale formatter used on strings by github's commit date
+	 * cells; same ASCII mapping keeps the fused call from missing. */
+	vm_reg_native(vm, cls, "toLocaleDateString()", native_StringToString, NULL); 
 	vm_reg_native(vm, cls, "replace(searchValue, replacement)", native_StringReplace, NULL); 
 	vm_reg_native(vm, cls, "match(regexp)", native_StringMatch, NULL); 
+	vm_reg_native(vm, cls, "matchAll(regexp)", native_StringMatchAll, NULL); 
 	vm_reg_native(vm, cls, "search(regexp)", native_StringSearch, NULL); 
 	vm_reg_native(vm, cls, "startsWith(searchString, position)", native_StringStartsWith, NULL); 
 	vm_reg_native(vm, cls, "endsWith(searchString, endPosition)", native_StringEndsWith, NULL); 

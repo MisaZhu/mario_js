@@ -3,6 +3,7 @@ extern "C" {
 #endif
 
 #include "native_Array.h"
+#include "natives_builtin.h"
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
@@ -148,6 +149,57 @@ var_t* native_Array_join(vm_t* vm, var_t* env, void* data) {
 	}
 	mstr_free(str);
 
+	var_t* v = var_new_str(vm, ret->cstr);
+	mstr_free(ret);
+	return v;
+}
+
+/* Array.prototype.toLocaleString(): elements joined by ",", each rendered via
+ * its own toLocaleString (null/undefined become ""). Without it the lookup
+ * falls through to Object.prototype's alias and yields "[object Array]". */
+var_t* native_Array_toLocaleString(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* arr = array_recv(vm, env);
+	mstr_t* ret = mstr_new("");
+	uint32_t sz = var_array_size(arr);
+	uint32_t i;
+	for(i = 0; i < sz; ++i) {
+		node_t* n = var_array_get(arr, i);
+		var_t* el = (n != NULL) ? n->var : NULL;
+		if(i > 0)
+			mstr_append(ret, ",");
+		if(el == NULL || el->type == V_UNDEF || el->type == V_NULL)
+			continue;
+		/* numeric primitives: reuse Number's locale core so [1234] joins as
+		 * "1,234" like the browser (var_to_str would drop the grouping). */
+		if(el->type == V_INT || el->type == V_INT64 ||
+		   el->type == V_FLOAT || el->type == V_FLOAT64) {
+			var_t* ls = number_to_locale_var(vm, el, NULL); /* owned */
+			if(ls != NULL) {
+				mstr_append(ret, var_get_str(ls));
+				var_unref(ls);
+				continue;
+			}
+		}
+		if(el->type == V_OBJECT) {
+			var_t* mf = var_find_member_var(el, "toLocaleString");
+			if(mf != NULL && mf->is_func) {
+				var_t* r = call_m_func_by_name(vm, el, "toLocaleString", 0); /* owned */
+				if(r != NULL) {
+					mstr_t* rs = mstr_new("");
+					var_to_str(r, rs);
+					mstr_append(ret, rs->cstr);
+					mstr_free(rs);
+					var_unref(r);
+					continue;
+				}
+			}
+		}
+		mstr_t* es = mstr_new("");
+		var_to_str(el, es);
+		mstr_append(ret, es->cstr);
+		mstr_free(es);
+	}
 	var_t* v = var_new_str(vm, ret->cstr);
 	mstr_free(ret);
 	return v;
@@ -366,27 +418,45 @@ var_t* native_Array_reverse(vm_t* vm, var_t* env, void* data) {
 }
 
 var_t* native_Array_concat(vm_t* vm, var_t* env, void* data) {
-	(void)vm; (void)data;
+	(void)data;
 	var_t* arr = array_recv(vm, env);
-	uint32_t args_num = get_func_args_num(env);
+	/* ECMA-262 23.1.3.5 Array.prototype.concat: build and return a NEW array; the
+	 * receiver must NEVER be mutated. The previous implementation appended into
+	 * the receiver and returned it, so `a.concat(x)` aliased `a`: any later push
+	 * on the result corrupted `a` too. This broke react-router flattenRoutes,
+	 * where `p = r.concat(f)` must yield an independent per-branch routesMeta
+	 * chain; aliasing made every branch share one ever-growing meta list, so
+	 * matchRouteBranch walked a polluted chain and no route matched -> the
+	 * Pinterest client router 404'd ("No route matches URL /"). */
+	var_t* out = var_new_array(vm);
+	if(out == NULL)
+		return arr; /* allocation failure: fall back to receiver, never NULL */
+	vm->gc.gc_defer++; /* `out` is not yet reachable from a root while building */
 	uint32_t i;
+	if(arr != NULL && arr->is_array) {
+		uint32_t sz = var_array_size(arr);
+		for(i=0; i<sz; ++i) {
+			node_t* n = var_array_get(arr, i);
+			var_array_add(out, (n != NULL && n->var != NULL) ? n->var : var_new(vm));
+		}
+	}
+	uint32_t args_num = get_func_args_num(env);
 	for(i=0; i<args_num; ++i) {
 		var_t* arg = get_func_arg(env, i);
-		if(!arg->is_array) { //not array type, just added to target array.
-			var_array_add(arr, arg);
-		}
-		else { // array type , add members to target array.
+		if(arg != NULL && arg->is_array) { // array arg: spread its elements
 			uint32_t sz = var_array_size(arg);
 			uint32_t j;
 			for(j=0; j<sz; ++j) {
 				node_t* n = var_array_get(arg, j);
-				if(n != NULL) {
-					var_array_add(arr, n->var);
-				}
+				var_array_add(out, (n != NULL && n->var != NULL) ? n->var : var_new(vm));
 			}
 		}
+		else { // non-array arg: appended as a single element
+			var_array_add(out, (arg != NULL) ? arg : var_new(vm));
+		}
 	}
-	return arr;
+	vm->gc.gc_defer--;
+	return out;
 }
 
 var_t* native_Array_push(vm_t* vm, var_t* env, void* data) {
@@ -1270,6 +1340,7 @@ void reg_native_Array(vm_t* vm) {
 	vm_reg_native(vm, cls, "reverse()", native_Array_reverse, NULL); 
 	vm_reg_native(vm, cls, "concat()", native_Array_concat, NULL); 
 	vm_reg_native(vm, cls, "join(c)", native_Array_join, NULL); 
+	vm_reg_native(vm, cls, "toLocaleString(locale, options)", native_Array_toLocaleString, NULL); 
 	vm_reg_native(vm, cls, "push()", native_Array_push, NULL); 
 	vm_reg_native(vm, cls, "pop()", native_Array_pop, NULL); 
 	vm_reg_native(vm, cls, "shift()", native_Array_shift, NULL); 

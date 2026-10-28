@@ -25,7 +25,14 @@ extern "C" {
  *    test/exec compiles from source on the spot and frees the program before
  *    returning, so no engine state is ever owned by a GC-managed var. */
 
-#define RE_MAXGROUPS   32       /* capture groups incl. group 0 */
+/* Capture-group ceiling incl. group 0. github.com's issues chunk (2026-10
+ * generation) compiles an alternation-heavy pattern with >32 groups, which the
+ * old ceiling rejected with "too many groups" and dropped the page into its
+ * error boundary. 128 keeps the scratch-slot invariant exact: the highest group
+ * slot is gidx*2+1 = 255 < RE_SCRATCH_BASE(256), so capture slots never collide
+ * with the zero-width-guard scratch band. Callers size caps[] via RE_CAPS_MAX
+ * (= RE_MAXGROUPS*2 = 256, kept in sync in native_RegExp.h). */
+#define RE_MAXGROUPS   128      /* capture groups incl. group 0 */
 /* Highest allowed {n,m} bound. Real-world bundles use bounds well above the old
  * 64 (Pinterest ships {1,256}/{0,256} hostname/label quantifiers), which made
  * those patterns fail with "repetition too large". Bounded repetition is
@@ -35,12 +42,24 @@ extern "C" {
 #define RE_MAXSTEPS    500000   /* VM step budget per re_match() call */
 #define RE_MAXBT       65536    /* backtrack stack entries per run */
 #define RE_MAXDEPTH    16       /* lookahead nesting */
+/* Zero-width-iteration guard for nullable repeat bodies (ECMA-262 RepeatMatcher:
+ * once the minimum is satisfied, an iteration that consumes nothing must FAIL,
+ * otherwise `(.*)+` lets a trailing empty repetition clobber the capture to ""
+ * - which broke Pinterest's po.j9 `"www/index.js".split(/\/(.*)+/)` yielding
+ * filepath "" instead of "index.js"). The guard records the body-entry sp in a
+ * scratch slot (RI_SAVE at RE_SCRATCH_BASE+depth) and fails via RI_EMPCHK when
+ * the body did not advance. Scratch slots live in rexec_t.lsp, NOT in the
+ * caller's caps array, so no caller resize is needed; they ride the same
+ * capture journal, so backtracking restores them correctly. */
+#define RE_SCRATCH_BASE   256   /* RI_SAVE/RI_EMPCHK slot base (group slots are < 2*RE_MAXGROUPS) */
+#define RE_MAXLOOPDEPTH   16    /* nested nullable-repeat guard slots */
 
 /**====== instruction program ======*/
 
 enum {
 	RI_CHAR = 0, RI_ANY, RI_CLASS, RI_MATCH, RI_JMP, RI_SPLIT, RI_SAVE,
-	RI_BOL, RI_EOL, RI_WB, RI_NWB, RI_BREF, RI_LA, RI_LAEND
+	RI_BOL, RI_EOL, RI_WB, RI_NWB, RI_BREF, RI_LA, RI_LAEND, RI_EMPCHK,
+	RI_LB, RI_LBEND
 };
 
 typedef struct {
@@ -58,13 +77,14 @@ struct re_prog {
 	int       ngroups;   /* capture groups excluding group 0 */
 	char*     names[RE_MAXGROUPS]; /* (?<name>...) per group index, NULL if unnamed */
 	bool      icase, mline, dotall, global, sticky;
+	bool      cached;    /* owned by the shared memo cache; re_free must not free */
 };
 
 /**====== pattern AST ======*/
 
 enum {
 	N_EMPTY = 0, N_CHAR, N_ANY, N_CLASS, N_CAT, N_ALT, N_REP, N_GROUP,
-	N_BOL, N_EOL, N_WB, N_NWB, N_BREF, N_LA
+	N_BOL, N_EOL, N_WB, N_NWB, N_BREF, N_LA, N_LB
 };
 
 typedef struct renode {
@@ -161,14 +181,19 @@ static bool cls_shorthand(uint8_t* cls, int ch) {
 	return false;
 }
 
+static int rp_hexval(int c) {
+	if(c >= '0' && c <= '9') return c - '0';
+	if(c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if(c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+
 static int rp_hex(reparse_t* r, int digits) {
 	int v = 0, i;
 	for(i = 0; i < digits; i++) {
-		int c = rp_next(r);
-		if(c >= '0' && c <= '9') v = v * 16 + (c - '0');
-		else if(c >= 'a' && c <= 'f') v = v * 16 + (c - 'a' + 10);
-		else if(c >= 'A' && c <= 'F') v = v * 16 + (c - 'A' + 10);
-		else { r->err = "bad hex escape"; return -1; }
+		int d = rp_hexval(rp_next(r));
+		if(d < 0) { r->err = "bad hex escape"; return -1; }
+		v = v * 16 + d;
 	}
 	return v;
 }
@@ -205,6 +230,23 @@ static int rp_escape(reparse_t* r, int* shorthand) {
 	}
 	case 'x': return rp_hex(r, 2);
 	case 'u': {
+		/* ES6 braced form \u{HHHHH} (any code point up to 0x10FFFF); github's
+		 * bidi-control scanner ships /...\u{E0001}.../u and a parser that only
+		 * knew \uHHHH died on the '{' with "bad hex escape", killing the whole
+		 * bundle. Astral values are re-encoded by rn_utf8_chain. */
+		if(rp_peek(r) == '{') {
+			rp_next(r);
+			uint32_t v = 0;
+			int got = 0;
+			while(rp_peek(r) != '}' && rp_peek(r) >= 0) {
+				int d = rp_hexval(rp_next(r));
+				if(d < 0) { r->err = "bad hex escape"; return -1; }
+				v = v * 16 + (uint32_t)d;
+				if(++got > 6 || v > 0x10FFFF) { r->err = "bad hex escape"; return -1; }
+			}
+			if(rp_next(r) != '}' || got == 0) { r->err = "bad hex escape"; return -1; }
+			return (int)v;
+		}
 		/* \uHHHH: BMP code points only; encode > 0x7F as its first UTF-8
 		 * byte is wrong, so callers building atoms re-encode. Here we just
 		 * return the code point; atom builder handles UTF-8 expansion. */
@@ -227,8 +269,15 @@ static renode_t* rn_utf8_chain(reparse_t* r, uint32_t cp) {
 		buf[n++] = (uint8_t)(0xC0 | (cp >> 6));
 		buf[n++] = (uint8_t)(0x80 | (cp & 0x3F));
 	}
-	else {
+	else if(cp < 0x10000) {
 		buf[n++] = (uint8_t)(0xE0 | (cp >> 12));
+		buf[n++] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+		buf[n++] = (uint8_t)(0x80 | (cp & 0x3F));
+	}
+	else {
+		/* astral plane (\u{10000}..\u{10FFFF}): 4-byte UTF-8 */
+		buf[n++] = (uint8_t)(0xF0 | (cp >> 18));
+		buf[n++] = (uint8_t)(0x80 | ((cp >> 12) & 0x3F));
 		buf[n++] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
 		buf[n++] = (uint8_t)(0x80 | (cp & 0x3F));
 	}
@@ -249,6 +298,16 @@ static renode_t* rn_utf8_chain(reparse_t* r, uint32_t cp) {
 	return head;
 }
 
+/* A class member above U+00FF cannot live in the 256-bit byte bitmap (the
+ * matcher consumes UTF-8 bytes), so positive classes collect them here and
+ * rp_class folds them in as an alternation of UTF-8 chains: (bitmap|c1|c2).
+ * Wrapping single-char atoms in an alternation keeps class semantics under
+ * quantifiers and concatenation ((a|b)+ == [ab]+). Ranges wider than the cap
+ * stay unrepresentable, exactly as before this change. */
+#define RP_NA_MAX 512
+
+typedef struct { uint32_t lo, hi; } rp_na_t;
+
 static renode_t* rp_class(reparse_t* r) {
 	renode_t* n = rn_new(N_CLASS);
 	if(n == NULL) { r->err = "oom"; return NULL; }
@@ -258,6 +317,8 @@ static renode_t* rp_class(reparse_t* r) {
 	 * and `[^]` its negation (matches every character). Treating a leading
 	 * ']' as a literal member (a PCRE-ism) made `/[^]/` fail with
 	 * "unterminated class", which aborted Pinterest's client bundle. */
+	rp_na_t na[RP_NA_MAX];
+	int na_n = 0, i;
 	while(true) {
 		int c = rp_next(r);
 		if(c < 0) { r->err = "unterminated class"; rn_free(n); return NULL; }
@@ -285,20 +346,47 @@ static renode_t* rp_class(reparse_t* r) {
 			else
 				hi = c2;
 			if(hi < lo) { r->err = "bad class range"; rn_free(n); return NULL; }
-			cls_range(n->cls, lo, hi, r->icase);
+			if(hi < 256)
+				cls_range(n->cls, lo, hi, r->icase);
+			else {
+				uint32_t nlo = (lo < 256) ? 256 : (uint32_t)lo;
+				if(lo < 256)
+					cls_range(n->cls, lo, 255, r->icase);
+				if(!negate && (hi - (int)nlo + 1) <= RP_NA_MAX && na_n < RP_NA_MAX) {
+					na[na_n].lo = nlo; na[na_n].hi = (uint32_t)hi; na_n++;
+				}
+			}
 		}
 		else if(lo < 256)
 			cls_set(n->cls, lo, r->icase);
+		else if(!negate && na_n < RP_NA_MAX) {
+			na[na_n].lo = na[na_n].hi = (uint32_t)lo; na_n++;
+		}
 	}
 	if(negate) {
-		int i;
+		/* A negated class keeps the byte-bitmap model: excluding named
+		 * non-ASCII chars is unrepresentable, same limitation as before. */
 		for(i = 0; i < 32; i++)
 			n->cls[i] = (uint8_t)~n->cls[i];
 		/* a negated class never matches nothing; it still must not match
 		 * beyond the buffer, which the matcher guards. Keep '\n' excluded?
 		 * JS [^...] does match '\n' unless listed, so leave it in. */
+		return n;
 	}
-	return n;
+	if(na_n == 0)
+		return n;
+	renode_t* head = n;
+	for(i = 0; i < na_n; i++) {
+		uint32_t cp;
+		for(cp = na[i].lo; cp <= na[i].hi; cp++) {
+			renode_t* chn = rn_utf8_chain(r, cp);
+			renode_t* alt = (chn != NULL) ? rn_new(N_ALT) : NULL;
+			if(alt == NULL) { rn_free(chn); rn_free(head); r->err = "oom"; return NULL; }
+			alt->a = head; alt->b = chn;
+			head = alt;
+		}
+	}
+	return head;
 }
 
 static renode_t* rp_alt(reparse_t* r);
@@ -309,7 +397,7 @@ static renode_t* rp_atom(reparse_t* r) {
 	switch(c) {
 	case '(': {
 		uint8_t la_neg = 0;
-		bool capture = true, lookahead = false;
+		bool capture = true, lookahead = false, lookbehind = false;
 		char* gname = NULL;
 		if(rp_peek(r) == '?') {
 			rp_next(r);
@@ -318,7 +406,14 @@ static renode_t* rp_atom(reparse_t* r) {
 			else if(k == '=') { lookahead = true; }
 			else if(k == '!') { lookahead = true; la_neg = 1; }
 			else if(k == '<') {
-				if(rp_peek(r) == '=' || rp_peek(r) == '!') { r->err = "lookbehind not supported"; return NULL; }
+				int k2 = rp_peek(r);
+				if(k2 == '=' || k2 == '!') {
+					/* (?<= / (?<! : lookbehind assertion */
+					rp_next(r);
+					lookbehind = true;
+					la_neg = (k2 == '!');
+				}
+				else {
 				/* named capture group (?<name>...) */
 				int ns = r->pos;
 				while(rp_peek(r) >= 0 && rp_peek(r) != '>') rp_next(r);
@@ -328,6 +423,7 @@ static renode_t* rp_atom(reparse_t* r) {
 				memcpy(gname, r->p + ns, (size_t)(r->pos - ns));
 				gname[r->pos - ns] = 0;
 				rp_next(r); /* '>' */
+				}
 			}
 			else { r->err = "bad group"; return NULL; }
 		}
@@ -343,7 +439,7 @@ static renode_t* rp_atom(reparse_t* r) {
 		if(body == NULL)
 			return NULL;
 		if(rp_next(r) != ')') { r->err = "missing )"; rn_free(body); return NULL; }
-		renode_t* n = rn_new(lookahead ? N_LA : N_GROUP);
+		renode_t* n = rn_new(lookahead ? N_LA : (lookbehind ? N_LB : N_GROUP));
 		if(n == NULL) { rn_free(body); r->err = "oom"; return NULL; }
 		n->a = body;
 		n->neg = la_neg;
@@ -517,7 +613,71 @@ typedef struct {
 	reinst_t* code;
 	int n, cap;
 	bool oom;
+	int loopdepth;   /* nesting of nullable-repeat bodies being emitted (scratch slot idx) */
 } reemit_t;
+
+/* Can this node match the empty string? Used to decide whether a repeat body
+ * needs the zero-width-iteration guard: a non-nullable body (e.g. `.`, `x`,
+ * `[ab]`) always advances, so the common `.*`/`.+` loops pay nothing. */
+static bool node_nullable(renode_t* n) {
+	if(n == NULL)
+		return true;
+	switch(n->type) {
+	case N_EMPTY: return true;
+	case N_CAT:   return node_nullable(n->a) && node_nullable(n->b);
+	case N_ALT:   return node_nullable(n->a) || node_nullable(n->b);
+	case N_REP:   return (n->min == 0) || node_nullable(n->a);
+	case N_GROUP: return node_nullable(n->a);
+	case N_LA:    return true;   /* lookahead is zero-width by definition */
+	case N_LB:    return true;   /* lookbehind is zero-width by definition */
+	default:      return false;  /* CHAR/ANY/CLASS/BOL/EOL/WB/NWB/BREF consume or assert */
+	}
+}
+
+/* Match-length bounds of a sub-AST (*mx == -1 means unbounded). Lookbehind
+ * uses them to bound how far back the matcher retries start offsets, so a
+ * fixed-width assertion like (?<=\s) costs one sub-run, not sp of them. */
+#define RE_LB_SCAN 256   /* fallback backward scan cap for unbounded bodies */
+
+static void rn_len(renode_t* n, int* mn, int* mx) {
+	if(n == NULL) { *mn = 0; *mx = 0; return; }
+	switch(n->type) {
+	case N_EMPTY: case N_BOL: case N_EOL: case N_WB: case N_NWB:
+	case N_LA: case N_LB:
+		*mn = 0; *mx = 0; return;
+	case N_CHAR: case N_ANY: case N_CLASS:
+		*mn = 1; *mx = 1; return;
+	case N_BREF:
+		*mn = 0; *mx = -1; return;
+	case N_CAT: {
+		int a1, a2, b1, b2;
+		rn_len(n->a, &a1, &a2); rn_len(n->b, &b1, &b2);
+		*mn = a1 + b1;
+		*mx = (a2 < 0 || b2 < 0) ? -1 : a2 + b2;
+		return;
+	}
+	case N_ALT: {
+		int a1, a2, b1, b2;
+		rn_len(n->a, &a1, &a2); rn_len(n->b, &b1, &b2);
+		*mn = (a1 < b1) ? a1 : b1;
+		*mx = (a2 < 0 || b2 < 0) ? -1 : ((a2 > b2) ? a2 : b2);
+		return;
+	}
+	case N_GROUP: rn_len(n->a, mn, mx); return;
+	case N_REP: {
+		int a1, a2;
+		rn_len(n->a, &a1, &a2);
+		*mn = a1 * n->min;
+		if(*mn > RE_LB_SCAN) *mn = RE_LB_SCAN;
+		if(n->max < 0)
+			*mx = (a2 > 0) ? -1 : 0;
+		else
+			*mx = (a2 < 0) ? -1 : a2 * n->max;
+		return;
+	}
+	}
+	*mn = 0; *mx = -1;
+}
 
 static int emit(reemit_t* e, uint8_t op) {
 	if(e->oom)
@@ -543,11 +703,26 @@ static bool emit_rep(reemit_t* e, renode_t* n, bool* err) {
 		if(!emit_node(e, n->a, err))
 			return false;
 	}
+	/* A nullable body needs the zero-width guard on every OPTIONAL iteration
+	 * (those beyond the mandatory min copies emitted above): mark the entry
+	 * sp, run the atom, then fail if it did not advance. See RE_SCRATCH_BASE. */
+	bool guard = node_nullable(n->a) && e->loopdepth < RE_MAXLOOPDEPTH;
+	int gslot = guard ? (RE_SCRATCH_BASE + e->loopdepth) : -1;
 	if(n->max == -1) {
 		int l1 = e->n;
 		int sp = emit(e, RI_SPLIT);
+		if(gslot >= 0) {
+			int mk = emit(e, RI_SAVE);
+			if(!e->oom) e->code[mk].n = (uint16_t)gslot;
+		}
+		e->loopdepth++;
 		if(!emit_node(e, n->a, err))
 			return false;
+		e->loopdepth--;
+		if(gslot >= 0) {
+			int ck = emit(e, RI_EMPCHK);
+			if(!e->oom) e->code[ck].n = (uint16_t)gslot;
+		}
 		int j = emit(e, RI_JMP);
 		if(e->oom) return false;
 		e->code[j].x = l1;
@@ -560,8 +735,18 @@ static bool emit_rep(reemit_t* e, renode_t* n, bool* err) {
 		int cnt = 0;
 		for(i = n->min; i < n->max; i++) {
 			splits[cnt++] = emit(e, RI_SPLIT);
+			if(gslot >= 0) {
+				int mk = emit(e, RI_SAVE);
+				if(!e->oom) e->code[mk].n = (uint16_t)gslot;
+			}
+			e->loopdepth++;
 			if(!emit_node(e, n->a, err))
 				return false;
+			e->loopdepth--;
+			if(gslot >= 0) {
+				int ck = emit(e, RI_EMPCHK);
+				if(!e->oom) e->code[ck].n = (uint16_t)gslot;
+			}
 		}
 		if(e->oom) return false;
 		int end = e->n;
@@ -639,6 +824,25 @@ static bool emit_node(reemit_t* e, renode_t* n, bool* err) {
 		e->code[la].x = e->n;   /* continue point after the sub-program */
 		break;
 	}
+	case N_LB: {
+		/* Lookbehind: RI_LB carries the match-length bounds of its body in
+		 * n (min) / y (max, -1 = unbounded) so the matcher only retries the
+		 * plausible start offsets instead of scanning the whole prefix. */
+		int lb = emit(e, RI_LB);
+		if(e->oom) return false;
+		e->code[lb].neg = n->neg;
+		int mn = 0, mx = 0;
+		rn_len(n->a, &mn, &mx);
+		if(mn > RE_LB_SCAN) mn = RE_LB_SCAN;
+		if(mx > RE_LB_SCAN) mx = RE_LB_SCAN;
+		e->code[lb].n = (uint16_t)mn;
+		e->code[lb].y = mx;
+		if(!emit_node(e, n->a, err)) return false;
+		emit(e, RI_LBEND);
+		if(e->oom) return false;
+		e->code[lb].x = e->n;   /* continue point after the sub-program */
+		break;
+	}
 	case N_BOL: emit(e, RI_BOL); break;
 	case N_EOL: emit(e, RI_EOL); break;
 	case N_WB:  emit(e, RI_WB);  break;
@@ -654,7 +858,7 @@ static bool emit_node(reemit_t* e, renode_t* n, bool* err) {
 
 /**====== public compile / free ======*/
 
-re_prog_t* re_compile(const char* pattern, const char* flags, char* err, int errlen) {
+static re_prog_t* re_compile_uncached(const char* pattern, const char* flags, char* err, int errlen) {
 	if(pattern == NULL)
 		pattern = "";
 	if(flags == NULL)
@@ -723,9 +927,97 @@ re_prog_t* re_compile(const char* pattern, const char* flags, char* err, int err
 	return p;
 }
 
+/* ---- transparent compiled-regex memo cache --------------------------------
+ * re_match()/regexp_run() treat re_prog_t as read-only (lastIndex lives on the
+ * JS RegExp object, not the prog), so a single compiled program for a given
+ * (pattern,flags) is safe to share across every RegExp instance and every
+ * test/exec/replace/match/split call. github's React hydration evaluates the
+ * same handful of regex literals tens of thousands of times; without this cache
+ * each one re-parses + re-emits the pattern (native_RegExpConstructor alone ran
+ * re_compile then re_free purely to validate). Keyed by "pattern\x01flags",
+ * owned by the cache, freed once at process exit. Single-threaded VM => no lock.
+ */
+typedef struct re_cache_ent {
+	char* key;
+	re_prog_t* prog;
+	struct re_cache_ent* next;
+} re_cache_ent_t;
+#define RE_CACHE_BUCKETS 512
+static re_cache_ent_t* g_re_cache[RE_CACHE_BUCKETS];
+static int g_re_cache_inited = 0;
+static unsigned long g_re_hit = 0, g_re_miss = 0;
+static unsigned re_cache_hash(const char* s) {
+	unsigned h = 2166136261u;
+	for(; *s != 0; s++) { h ^= (unsigned char)*s; h *= 16777619u; }
+	return h;
+}
+static void re_cache_free_all(void) {
+	int i;
+	if(getenv("MARIO_RECACHE") != NULL) {
+		unsigned long tot = g_re_hit + g_re_miss;
+		fprintf(stderr, "[recache] re_compile calls=%lu hits=%lu misses(distinct)=%lu hit_ratio=%.1f%% compiles_avoided=%lu\n",
+		        tot, g_re_hit, g_re_miss, tot > 0 ? (100.0 * (double)g_re_hit / (double)tot) : 0.0, g_re_hit);
+	}
+	for(i = 0; i < RE_CACHE_BUCKETS; i++) {
+		re_cache_ent_t* e = g_re_cache[i];
+		while(e != NULL) {
+			re_cache_ent_t* n = e->next;
+			if(e->prog != NULL) { e->prog->cached = false; re_free(e->prog); }
+			free(e->key);
+			free(e);
+			e = n;
+		}
+		g_re_cache[i] = NULL;
+	}
+}
+re_prog_t* re_compile(const char* pattern, const char* flags, char* err, int errlen) {
+	const char* pat = (pattern != NULL) ? pattern : "";
+	const char* flg = (flags != NULL) ? flags : "";
+	size_t pl = strlen(pat), fl = strlen(flg);
+	char* key = (char*)malloc(pl + fl + 2);
+	if(key == NULL)
+		return re_compile_uncached(pat, flg, err, errlen);
+	memcpy(key, pat, pl);
+	key[pl] = '\x01';
+	memcpy(key + pl + 1, flg, fl);
+	key[pl + fl + 1] = 0;
+	unsigned h = re_cache_hash(key);
+	int b = (int)(h & (RE_CACHE_BUCKETS - 1));
+	re_cache_ent_t* e;
+	for(e = g_re_cache[b]; e != NULL; e = e->next) {
+		if(strcmp(e->key, key) == 0) {
+			free(key);
+			g_re_hit++;
+			return e->prog;
+		}
+	}
+	re_prog_t* p = re_compile_uncached(pat, flg, err, errlen);
+	if(p == NULL) {
+		free(key);
+		return NULL;
+	}
+	g_re_miss++;
+	p->cached = true;
+	if(!g_re_cache_inited) { g_re_cache_inited = 1; atexit(re_cache_free_all); }
+	e = (re_cache_ent_t*)calloc(1, sizeof(*e));
+	if(e == NULL) {
+		/* cache insert failed: hand back an uncached prog the caller may free */
+		p->cached = false;
+		free(key);
+		return p;
+	}
+	e->key = key;
+	e->prog = p;
+	e->next = g_re_cache[b];
+	g_re_cache[b] = e;
+	return p;
+}
+
 void re_free(re_prog_t* p) {
 	if(p == NULL)
 		return;
+	if(p->cached)
+		return;   /* owned by the memo cache; freed at re_cache_free_all() */
 	int i;
 	for(i = 0; i < p->ncode; i++) {
 		if(p->code[i].cls != NULL)
@@ -763,8 +1055,10 @@ typedef struct {
 	int slen;
 	re_prog_t*  p;
 	int* caps;   /* 2*(ngroups+1) */
+	int  lsp[RE_MAXLOOPDEPTH]; /* zero-width guard scratch (body-entry sp per loop depth) */
 	int  steps;
 	int  ladepth;
+	int  lb_end;    /* RI_LBEND target offset; -1 outside a lookbehind sub-run */
 } rexec_t;
 
 static inline bool re_isword(int c) {
@@ -822,19 +1116,41 @@ static bool re_run(rexec_t* x, int startpc, int sp_in) {
 			nbt++;
 			pc = i->x;
 			break;
-		case RI_SAVE:
+		case RI_SAVE: {
 			if(njr >= cjr) {
 				int nc = cjr == 0 ? 128 : cjr * 2;
 				re_jent_t* nj = (re_jent_t*)realloc(jr, nc * sizeof(re_jent_t));
 				if(nj == NULL) { fail = true; break; }
 				jr = nj; cjr = nc;
 			}
-			jr[njr].slot = i->n;
-			jr[njr].old = x->caps[i->n];
-			njr++;
-			x->caps[i->n] = sp;
+			int slot = i->n;
+			jr[njr].slot = (uint16_t)slot;
+			if(slot >= RE_SCRATCH_BASE) {
+				int idx = slot - RE_SCRATCH_BASE;
+				if(idx >= RE_MAXLOOPDEPTH) { fail = true; break; }
+				jr[njr].old = x->lsp[idx];
+				njr++;
+				x->lsp[idx] = sp;
+			}
+			else {
+				jr[njr].old = x->caps[slot];
+				njr++;
+				x->caps[slot] = sp;
+			}
 			pc++;
 			break;
+		}
+		case RI_EMPCHK: {
+			/* Zero-width-iteration guard: the body just ran; if it did not
+			 * advance past the entry sp recorded by the paired RI_SAVE, this
+			 * optional iteration matched empty and must fail (ECMA-262
+			 * RepeatMatcher), backtracking to the loop's exit alternative. */
+			int idx = (int)i->n - RE_SCRATCH_BASE;
+			if(idx < 0 || idx >= RE_MAXLOOPDEPTH) { pc++; break; }
+			if(x->lsp[idx] == sp) { fail = true; break; }
+			pc++;
+			break;
+		}
 		case RI_BOL:
 			if(sp == 0 || (x->p->mline && x->s[sp - 1] == '\n')) pc++;
 			else fail = true;
@@ -881,6 +1197,34 @@ static bool re_run(rexec_t* x, int startpc, int sp_in) {
 		case RI_LAEND:
 			matched = true;
 			goto done;
+		case RI_LB: {
+			/* Retry the body at every plausible start offset behind sp and
+			 * accept the first sub-run that ends exactly at sp (RI_LBEND). */
+			if(x->ladepth >= RE_MAXDEPTH) { fail = true; break; }
+			int mn = (int)i->n;
+			int mx = (i->y < 0) ? RE_LB_SCAN : (int)i->y;
+			int lo = sp - mx;
+			if(lo < 0) lo = 0;
+			int hi = sp - mn;
+			int save_lb = x->lb_end;
+			x->lb_end = sp;
+			x->ladepth++;
+			bool ok = false;
+			int s2;
+			for(s2 = hi; s2 >= lo; s2--) {
+				if(re_run(x, pc + 1, s2)) { ok = true; break; }
+				if(x->steps > RE_MAXSTEPS) break;
+			}
+			x->ladepth--;
+			x->lb_end = save_lb;
+			if(ok != (i->neg != 0)) pc = i->x;
+			else fail = true;
+			break;
+		}
+		case RI_LBEND:
+			if(x->lb_end >= 0 && sp == x->lb_end) { matched = true; goto done; }
+			fail = true;   /* ended at the wrong offset: backtrack inside */
+			break;
 		case RI_MATCH:
 			matched = true;
 			goto done;
@@ -897,7 +1241,11 @@ static bool re_run(rexec_t* x, int startpc, int sp_in) {
 			sp = bt[nbt].sp;
 			while(njr > bt[nbt].jlen) {
 				njr--;
-				x->caps[jr[njr].slot] = jr[njr].old;
+				int slot = jr[njr].slot;
+				if(slot >= RE_SCRATCH_BASE)
+					x->lsp[slot - RE_SCRATCH_BASE] = jr[njr].old;
+				else
+					x->caps[slot] = jr[njr].old;
 			}
 		}
 	}
@@ -914,6 +1262,7 @@ bool re_match(re_prog_t* p, const char* s, int slen, int startpos, int* caps) {
 		startpos = 0;
 	rexec_t x;
 	memset(&x, 0, sizeof(x));
+	x.lb_end = -1;
 	x.s = s;
 	x.slen = slen;
 	x.p = p;

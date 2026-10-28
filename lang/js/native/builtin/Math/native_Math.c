@@ -404,7 +404,7 @@ var_t* native_math_fround(vm_t* vm, var_t* env, void *data) {
 #define CLS_MATH "Math"
 
 void reg_native_Math(vm_t* vm) {
-	var_t* cls = vm_new_class(vm, CLS_MATH);
+	var_t* cls = vm_new_namespace(vm, CLS_MATH);
 	vm_reg_static(vm, cls, "abs(a)", native_math_abs, NULL);
 	vm_reg_static(vm, cls, "round(a)", native_math_round, NULL);
 	vm_reg_static(vm, cls, "min(a,b)", native_math_min, NULL);

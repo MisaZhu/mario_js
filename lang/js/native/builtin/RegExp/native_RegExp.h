@@ -13,8 +13,8 @@ extern "C" {
 typedef struct re_prog re_prog_t;
 
 /* Capacity for the caps[] array callers pass to re_match(): 2 slots per
- * group, RE_MAXGROUPS(32) groups incl. group 0 (kept in sync with the .c). */
-#define RE_CAPS_MAX 64
+ * group, RE_MAXGROUPS(128) groups incl. group 0 (kept in sync with the .c). */
+#define RE_CAPS_MAX 256
 
 /* Compile pattern with flags "gimsy" (u accepted, ignored). NULL on syntax
  * error; err (if non-NULL, errlen bytes) receives the reason. */

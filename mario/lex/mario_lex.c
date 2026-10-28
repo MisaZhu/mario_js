@@ -48,6 +48,26 @@ bool is_alpha(unsigned char ch) {
 	return false;
 }
 
+/** Character class table: one indexed lookup replaces the per-char
+ * is_alpha/is_numeric/'$'/is_id_utf8 call chain in the identifier loops
+ * (lex_get_basic_token was the top lexer leaf on real bundles). */
+#define CT_IDSTART 0x01 /* is_alpha | '$' | byte>=0x80 */
+#define CT_IDCONT  0x02 /* CT_IDSTART | 0-9 */
+static unsigned char g_lex_ct[256];
+static int g_lex_ct_inited = 0;
+static void lex_ct_init(void) {
+	int i;
+	if(g_lex_ct_inited)
+		return;
+	g_lex_ct_inited = 1;
+	for(i = 0; i < 256; i++) {
+		unsigned char c = (unsigned char)i;
+		bool start = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '$' || c >= 0x80;
+		bool cont = start || (c >= '0' && c <= '9');
+		g_lex_ct[i] = (start ? CT_IDSTART : 0) | (cont ? CT_IDCONT : 0);
+	}
+}
+
 /* Any byte >= 0x80 is part of a multi-byte UTF-8 sequence. Outside string /
  * comment / regex literals the only legal place for those in JS source is an
  * identifier (bundles ship unquoted non-ASCII property names and keys such as
@@ -76,16 +96,6 @@ bool is_alpha_num(const char* cstr) {
 	return true;
 }
 
-void lex_get_nextch(lex_t* lex) {
-	lex->curr_ch = lex->next_ch;
-	if (lex->data_pos < lex->data_end){
-		lex->next_ch = lex->data[lex->data_pos];
-	}else{
-		lex->next_ch = 0;
-	}
-	lex->data_pos++;
-}
-
 /* Peek the byte right after next_ch (the third byte of lookahead; the read
  * head invariant is curr_ch == data[data_pos-2], next_ch == data[data_pos-1]).
  * data is NUL-terminated, so one byte past data_end is still a safe read. */
@@ -106,6 +116,11 @@ static bool lex_skip_unicode_space(lex_t* lex) {
 	unsigned char c2;
 	int n = 0;
 
+	/* Every Unicode whitespace sequence starts with a byte >= 0xC2; bail
+	 * immediately on ASCII so plain code never pays for peek3 + the
+	 * multi-byte table below (this runs once per token boundary). */
+	if(c0 < 0xC2)
+		return false;
 	if (c0 == 0xC2 && c1 == 0xA0)                    /* U+00A0 NO-BREAK SPACE */
 		n = 2;
 	else {
@@ -132,10 +147,24 @@ static bool lex_skip_unicode_space(lex_t* lex) {
 
 void lex_skip_whitespace(lex_t* lex) {
 	while (lex->curr_ch){
-		if (is_whitespace(lex->curr_ch)) {
-			lex_get_nextch(lex);
-			continue;
+		/* Fast lane: raw-pointer skip over the ASCII whitespace run (invariant:
+		 * curr_ch == data[data_pos-2]; the NUL is not whitespace and stops the
+		 * scan), committing the read head once per run instead of one call per
+		 * char. Bytes >= 0xC2 may start a Unicode space: commit, then take the
+		 * multi-byte lane. */
+		int32_t base = lex->data_pos - 2;
+		int32_t i = base;
+		const char* d = lex->data;
+		char c = lex->curr_ch;
+		while (c == ' ' || c == '\t' || c == '\n' || c == '\r')
+			c = d[++i];
+		if (i > base) {
+			lex->data_pos += i - base;
+			lex->curr_ch = c;
+			lex->next_ch = (i + 1 < lex->data_end) ? d[i + 1] : 0;
 		}
+		if ((unsigned char)c < 0xC2)
+			break; /* non-whitespace ASCII or NUL: cannot start a Unicode space */
 		if (!lex_skip_unicode_space(lex))
 			break;
 	}
@@ -158,8 +187,19 @@ bool lex_skip_comments_line(lex_t* lex, const char* start) {
 		return false;
 
 	if ((lex->curr_ch==start[0] && (start[1] == 0 || lex->next_ch==start[1]))) {
-		while (lex->curr_ch && lex->curr_ch!='\n'){
-			lex_get_nextch(lex);
+		/* Bulk skip: memchr to the next newline instead of per-char stepping
+		 * (read-head invariant: curr_ch == data[data_pos-2]). */
+		int32_t li = lex->data_pos - 2;
+		const char* nl = (const char*)memchr(lex->data + li, '\n', (size_t)(lex->data_end - li));
+		if (nl != NULL) {
+			li = (int32_t)(nl - lex->data);
+			lex->curr_ch = '\n';
+			lex->next_ch = (li + 1 < lex->data_end) ? lex->data[li + 1] : 0;
+			lex->data_pos = li + 2;
+		} else {
+			lex->curr_ch = 0;
+			lex->next_ch = 0;
+			lex->data_pos = lex->data_end + 2;
 		}
 		if(start[1] != 0)
 			lex_get_nextch(lex);
@@ -174,8 +214,34 @@ bool lex_skip_comments_block(lex_t* lex, const char* start, const char* end) {
 		return false;
 
 	if (lex->curr_ch==start[0] && lex->next_ch==start[1]) {
-		while (lex->curr_ch && (lex->curr_ch!=end[0] || lex->next_ch!=end[1])) {
-			lex_get_nextch(lex);
+		/* Bulk skip: memchr for end[1], then confirm end[0] right before it.
+		 * This matches the exact same close index as scanning for end[0] first
+		 * (both select the first end[0]+end[1] pair), but decorative '*'
+		 * borders in license headers cost one memchr total instead of one call
+		 * per star. The search starts past the opener so it cannot match it. */
+		const char* d = lex->data;
+		int32_t bi = lex->data_pos; /* data_pos-2 indexes start[0]; +2 skips the opener */
+		bool closed = false;
+		while (bi < lex->data_end) {
+			const char* hit = (const char*)memchr(d + bi, end[1], (size_t)(lex->data_end - bi));
+			if (hit == NULL)
+				break;
+			bi = (int32_t)(hit - d);
+			if (d[bi - 1] == end[0]) {
+				closed = true;
+				bi--; /* bi now indexes end[0], matching the close state below */
+				break;
+			}
+			bi++;
+		}
+		if (closed) {
+			lex->curr_ch = d[bi];
+			lex->next_ch = d[bi + 1];
+			lex->data_pos = bi + 2;
+		} else {
+			lex->curr_ch = 0;
+			lex->next_ch = 0;
+			lex->data_pos = lex->data_end + 2;
 		}
 		lex_get_nextch(lex);
 		lex_get_nextch(lex);
@@ -196,6 +262,7 @@ void lex_reset(lex_t* lex) {
 }
 
 void lex_init(lex_t * lex, const char* input) {
+	lex_ct_init();
 	lex->data = input;
 	lex->data_start = 0;
 	lex->data_end = (int)strlen(lex->data);
@@ -206,22 +273,6 @@ void lex_init(lex_t * lex, const char* input) {
 void lex_release(lex_t* lex) {
 	mstr_free(lex->tk_str);
 	lex->tk_str = NULL;
-}
-
-void lex_token_start(lex_t* lex) {
-	// record beginning of this token(pre-read 2 chars );
-	lex->tk_start = lex->data_pos-2;
-}
-
-void lex_token_end(lex_t* lex) {
-	lex->tk_last_end = lex->tk_end;
-	lex->tk_end = lex->data_pos-3;
-}
-
-void lex_get_char_token(lex_t* lex) {
-	lex->tk = lex->curr_ch;
-	if (lex->curr_ch) 
-		lex_get_nextch(lex);
 }
 
 /* Value of a single hex digit, or -1 if not a hex digit. */
@@ -334,7 +385,10 @@ void lex_read_escape(lex_t* lex) {
 				n++;
 				if (n < 2) lex_get_nextch(lex);
 			}
-			mstr_add(lex->tk_str, (char)v);
+			/* \xHH yields code point U+00HH; mario strings are UTF-8, so encode
+			 * it (a raw 0xA0 byte would be invalid UTF-8 and break text-node
+			 * equality against SSR-parsed DOM, e.g. github Skeleton nbsp). */
+			lex_add_codepoint(lex->tk_str, (uint32_t)v);
 		}
 		break;
 		case '0': case '1': case '2': case '3':
@@ -352,7 +406,8 @@ void lex_read_escape(lex_t* lex) {
 				else
 					break;
 			}
-			mstr_add(lex->tk_str, (char)v);
+			/* Legacy octal yields code point U+0000-U+00FF; UTF-8 encode it. */
+			lex_add_codepoint(lex->tk_str, (uint32_t)v);
 		}
 		break;
 		case '\n': /* \<LF> line continuation: add nothing. */
@@ -369,7 +424,7 @@ void lex_read_escape(lex_t* lex) {
 
 void lex_get_basic_token(lex_t* lex) {
 	// tokens
-	if (is_alpha(lex->curr_ch) || lex->curr_ch == '$' || is_id_utf8((unsigned char)lex->curr_ch) ||
+	if ((g_lex_ct[(unsigned char)lex->curr_ch] & CT_IDSTART) ||
 	    (lex->curr_ch == '\\' && lex->next_ch == 'u')) { //  IDs (JS allows '$' in identifiers, e.g. jQuery's $)
 		/* Identifiers may embed unicode escapes: bundlers emit CJK property
 		 * names as `\u4E0A\u62A5...` and mixed forms like `SDK\u7248\u672C`.
@@ -377,17 +432,30 @@ void lex_get_basic_token(lex_t* lex) {
 		 * (lex_read_u_escape leaves curr_ch on the last consumed char, hence
 		 * the trailing step). Raw UTF-8 bytes pass through untouched so the
 		 * reconstructed name matches the bytes used at every other use site. */
-		while (is_alpha(lex->curr_ch) || is_numeric(lex->curr_ch) || lex->curr_ch == '$' ||
-		       is_id_utf8((unsigned char)lex->curr_ch) ||
-		       (lex->curr_ch == '\\' && lex->next_ch == 'u')) {
-			if (lex->curr_ch == '\\') {
+		for (;;) {
+			/* Fast lane: run-scan the plain identifier span and bulk-append
+			 * it (read-head invariant: curr_ch == data[data_pos-2]); only
+			 * \\u escapes drop to the char-wise path. */
+			const char* seg = &lex->data[lex->data_pos - 2];
+			/* Raw-pointer run-scan: no per-char call. The NUL stops the scan
+			 * (ct[0] has no CT_IDCONT), so the furthest read is data[data_end]. */
+			const char* p = seg;
+			while (g_lex_ct[(unsigned char)*p] & CT_IDCONT)
+				p++;
+			uint32_t span = (uint32_t)(p - seg);
+			if (span > 0) {
+				mstr_append_span(lex->tk_str, seg, span);
+				lex->data_pos += (int32_t)span;
+				lex->curr_ch = lex->data[lex->data_pos - 2];
+				lex->next_ch = (lex->data_pos - 1 < lex->data_end) ? lex->data[lex->data_pos - 1] : 0;
+			}
+			if (lex->curr_ch == '\\' && lex->next_ch == 'u') {
 				lex_get_nextch(lex); /* onto 'u' */
 				lex_read_u_escape(lex);
 				lex_get_nextch(lex);
 				continue;
 			}
-			mstr_add(lex->tk_str, lex->curr_ch);
-			lex_get_nextch(lex);
+			break;
 		}
 		lex->tk = LEX_ID;
 	} else if (lex->curr_ch == '#' &&
@@ -403,17 +471,30 @@ void lex_get_basic_token(lex_t* lex) {
 		 * whole bundles (github's environment-*.js live-region class). */
 		mstr_add(lex->tk_str, '#');
 		lex_get_nextch(lex);
-		while (is_alpha(lex->curr_ch) || is_numeric(lex->curr_ch) || lex->curr_ch == '$' ||
-		       is_id_utf8((unsigned char)lex->curr_ch) ||
-		       (lex->curr_ch == '\\' && lex->next_ch == 'u')) {
-			if (lex->curr_ch == '\\') {
+		for (;;) {
+			/* Fast lane: run-scan the plain identifier span and bulk-append
+			 * it (read-head invariant: curr_ch == data[data_pos-2]); only
+			 * \\u escapes drop to the char-wise path. */
+			const char* seg = &lex->data[lex->data_pos - 2];
+			/* Raw-pointer run-scan: no per-char call. The NUL stops the scan
+			 * (ct[0] has no CT_IDCONT), so the furthest read is data[data_end]. */
+			const char* p = seg;
+			while (g_lex_ct[(unsigned char)*p] & CT_IDCONT)
+				p++;
+			uint32_t span = (uint32_t)(p - seg);
+			if (span > 0) {
+				mstr_append_span(lex->tk_str, seg, span);
+				lex->data_pos += (int32_t)span;
+				lex->curr_ch = lex->data[lex->data_pos - 2];
+				lex->next_ch = (lex->data_pos - 1 < lex->data_end) ? lex->data[lex->data_pos - 1] : 0;
+			}
+			if (lex->curr_ch == '\\' && lex->next_ch == 'u') {
 				lex_get_nextch(lex); /* onto 'u' */
 				lex_read_u_escape(lex);
 				lex_get_nextch(lex);
 				continue;
 			}
-			mstr_add(lex->tk_str, lex->curr_ch);
-			lex_get_nextch(lex);
+			break;
 		}
 		lex->tk = LEX_ID;
 	} else if (is_numeric(lex->curr_ch) || (lex->curr_ch=='.' && is_numeric(lex->next_ch))) { // _numbers (incl. leading-dot floats like `.5`, common in minified JS)
@@ -429,17 +510,31 @@ void lex_get_basic_token(lex_t* lex) {
 		}
 		lex->tk = LEX_INT;
 
-		while (is_numeric(lex->curr_ch) || (isHex && is_hexadecimal(lex->curr_ch)) || lex->curr_ch=='_') {
-			// ES2021 numeric separator: '_' between digits is skipped.
-			if (lex->curr_ch=='_') {
-				if (is_numeric(lex->next_ch) || (isHex && is_hexadecimal(lex->next_ch))) {
-					lex_get_nextch(lex);
-					continue;
-				}
-				break;
+		/* Digit-run bulk scan (read-head invariant: curr_ch == data[data_pos-2];
+		 * NUL is not a digit and stops the scan); only the '_' separator still
+		 * takes the one-char step. */
+		for (;;) {
+			const char* seg = &lex->data[lex->data_pos - 2];
+			const char* p = seg;
+			if (isHex) {
+				while (is_hexadecimal((unsigned char)*p)) p++;
+			} else {
+				while (is_numeric((unsigned char)*p)) p++;
 			}
-			mstr_add(lex->tk_str, lex->curr_ch);
-			lex_get_nextch(lex);
+			uint32_t span = (uint32_t)(p - seg);
+			if (span > 0) {
+				mstr_append_span(lex->tk_str, seg, span);
+				lex->data_pos += (int32_t)span;
+				lex->curr_ch = lex->data[lex->data_pos - 2];
+				lex->next_ch = (lex->data_pos - 1 < lex->data_end) ? lex->data[lex->data_pos - 1] : 0;
+			}
+			// ES2021 numeric separator: '_' between digits is skipped.
+			if (lex->curr_ch=='_' &&
+			    (is_numeric(lex->next_ch) || (isHex && is_hexadecimal(lex->next_ch)))) {
+				lex_get_nextch(lex);
+				continue;
+			}
+			break;
 		}
 		// JS greedily folds a '.' into a decimal literal even when no digit
 		// follows, so `1.` is the float 1.0. This makes `1..toString` lex as
@@ -451,16 +546,22 @@ void lex_get_basic_token(lex_t* lex) {
 			lex->tk = LEX_FLOAT;
 			mstr_add(lex->tk_str, '.');
 			lex_get_nextch(lex);
-			while (is_numeric(lex->curr_ch) || lex->curr_ch=='_') {
-				if (lex->curr_ch=='_') {
-					if (is_numeric(lex->next_ch)) {
-						lex_get_nextch(lex);
-						continue;
-					}
-					break;
+			for (;;) {
+				const char* seg = &lex->data[lex->data_pos - 2];
+				const char* p = seg;
+				while (is_numeric((unsigned char)*p)) p++;
+				uint32_t span = (uint32_t)(p - seg);
+				if (span > 0) {
+					mstr_append_span(lex->tk_str, seg, span);
+					lex->data_pos += (int32_t)span;
+					lex->curr_ch = lex->data[lex->data_pos - 2];
+					lex->next_ch = (lex->data_pos - 1 < lex->data_end) ? lex->data[lex->data_pos - 1] : 0;
 				}
-				mstr_add(lex->tk_str, lex->curr_ch);
-				lex_get_nextch(lex);
+				if (lex->curr_ch=='_' && is_numeric(lex->next_ch)) {
+					lex_get_nextch(lex);
+					continue;
+				}
+				break;
 			}
 		}
 		// do fancy e-style floating point
@@ -472,9 +573,15 @@ void lex_get_basic_token(lex_t* lex) {
 				mstr_add(lex->tk_str, lex->curr_ch);
 				lex_get_nextch(lex);
 			}
-			while (is_numeric(lex->curr_ch)) {
-				mstr_add(lex->tk_str, lex->curr_ch);
-				lex_get_nextch(lex);
+			const char* seg = &lex->data[lex->data_pos - 2];
+			const char* p = seg;
+			while (is_numeric((unsigned char)*p)) p++;
+			uint32_t span = (uint32_t)(p - seg);
+			if (span > 0) {
+				mstr_append_span(lex->tk_str, seg, span);
+				lex->data_pos += (int32_t)span;
+				lex->curr_ch = lex->data[lex->data_pos - 2];
+				lex->next_ch = (lex->data_pos - 1 < lex->data_end) ? lex->data[lex->data_pos - 1] : 0;
 			}
 		}
 		// BigInt literal: a trailing 'n' on an integer literal (decimal or hex).
@@ -492,10 +599,21 @@ void lex_get_basic_token(lex_t* lex) {
 			if (lex->curr_ch == '\\') {
 				lex_get_nextch(lex);
 				lex_read_escape(lex);
-			} else {
-				mstr_add(lex->tk_str, lex->curr_ch);
+				lex_get_nextch(lex);
+				continue;
 			}
-			lex_get_nextch(lex);
+			/* Fast lane: bulk-scan the plain span up to the next quote, escape
+			 * or NUL (invariant: curr_ch == data[data_pos-2]); curr is plain
+			 * here, so the span advances at least one char. */
+			const char* seg = &lex->data[lex->data_pos - 2];
+			const char* p = seg;
+			while (*p != 0 && *p != '"' && *p != '\\')
+				p++;
+			uint32_t span = (uint32_t)(p - seg);
+			mstr_append_span(lex->tk_str, seg, span);
+			lex->data_pos += (int32_t)span;
+			lex->curr_ch = lex->data[lex->data_pos - 2];
+			lex->next_ch = (lex->data_pos - 1 < lex->data_end) ? lex->data[lex->data_pos - 1] : 0;
 		}
 		lex_get_nextch(lex);
 		lex->tk = LEX_STR;

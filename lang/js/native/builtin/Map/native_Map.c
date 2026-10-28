@@ -140,15 +140,35 @@ var_t* native_Map_constructor(vm_t* vm, var_t* env, void* data) {
 
     /* optional iterable of [key, value] pairs */
     var_t* iter = get_obj(env, "iterable");
-    if (iter != NULL && iter->type == V_OBJECT && iter->is_array) {
-        uint32_t n = var_array_size(iter);
-        for (uint32_t i = 0; i < n; ++i) {
-            var_t* pair = var_array_get_var(iter, i);
-            if (pair != NULL && pair->is_array && var_array_size(pair) >= 2) {
-                var_t* k = var_array_get_var(pair, 0);
-                var_t* v = var_array_get_var(pair, 1);
-                map_set_impl(this_v, md, k, v);
+    if (iter != NULL && iter->type != V_UNDEF && iter->type != V_NULL) {
+        if (iter->type == V_OBJECT && iter->is_array) {
+            uint32_t n = var_array_size(iter);
+            for (uint32_t i = 0; i < n; ++i) {
+                var_t* pair = var_array_get_var(iter, i);
+                if (pair != NULL && pair->is_array && var_array_size(pair) >= 2) {
+                    var_t* k = var_array_get_var(pair, 0);
+                    var_t* v = var_array_get_var(pair, 1);
+                    map_set_impl(this_v, md, k, v);
+                }
             }
+        } else {
+            /* ES: accept ANY iterable of pairs (Map instance, generator, entries
+             * iterator); array-only handling silently produced an empty Map. */
+            var_t* it = vm_get_iterator(vm, iter);
+            while (it != NULL) {
+                var_t* step = vm_iter_next(vm, it);
+                if (step == NULL) break;
+                var_t* donev = var_find_member_var(step, "done");
+                bool dn = (donev != NULL) && (donev->type == V_BOOL ? var_get_bool(donev)
+                        : (donev->type != V_UNDEF && donev->type != V_NULL));
+                if (dn) { var_unref(step); break; }
+                var_t* pair = var_find_member_var(step, "value");
+                if (pair != NULL && pair->is_array && var_array_size(pair) >= 2) {
+                    map_set_impl(this_v, md, var_array_get_var(pair, 0), var_array_get_var(pair, 1));
+                }
+                var_unref(step);
+            }
+            if (it != NULL) var_unref(it);
         }
     }
     return this_v;
@@ -328,6 +348,48 @@ var_t* native_WeakMap_set(vm_t* vm, var_t* env, void* data) {
     return this_v;
 }
 
+/* Map.groupBy(items, callbackFn) (ES2024): like Object.groupBy but returns a
+ * real Map whose values are arrays of items grouped by
+ * callbackFn(item, index). apple.com.cn's page module calls Map.groupBy(...).keys()
+ * during init; falling through to Object.groupBy returned a plain object, so
+ * .keys was missing ("can not find function 'keys' on object{}"), the require
+ * threw, the @loadable import rejected, <main> never rendered and React
+ * hydration failed fatally (#418). Build an actual Map instance instead. */
+var_t* native_Map_groupBy(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* items = get_func_arg(env, 0);
+    var_t* f = get_func_arg(env, 1);
+    var_t* ret = new_obj(vm, CLS_MAP, 0);
+    if (ret == NULL) return var_new(vm);
+    map_data* md = get_map(ret);
+    if (items == NULL || f == NULL || !f->is_func)
+        return ret;
+    uint32_t sz = var_array_size(items), i;
+    vm->gc.gc_defer++;
+    for (i = 0; i < sz; i++) {
+        var_t* el = var_array_get_var(items, (int32_t)i);
+        var_t* args = var_new_array(vm);
+        var_array_add(args, el != NULL ? el : var_new(vm));
+        var_array_add(args, var_new_int(vm, (int)i));
+        var_array_reverse(args);
+        var_t* kv = call_m_func(vm, env, f, args);
+        var_unref(args);
+        if (kv == NULL) kv = var_new(vm);
+        int32_t idx = map_find(md, kv);
+        if (idx >= 0) {
+            var_array_add(md->vals[idx], el != NULL ? el : var_new(vm));
+        } else {
+            var_t* bucket = var_new_array(vm);
+            var_array_add(bucket, el != NULL ? el : var_new(vm));
+            map_set_impl(ret, md, kv, bucket); /* refs kv & bucket */
+            var_unref(bucket);                 /* map now owns the bucket */
+        }
+        var_unref(kv); /* map holds its own ref when the key was new */
+    }
+    vm->gc.gc_defer--;
+    return ret;
+}
+
 void reg_native_Map(vm_t* vm) {
     var_t* cls = vm_new_class(vm, CLS_MAP);
     vm_reg_native(vm, cls, "constructor(iterable)", native_Map_constructor, NULL);
@@ -342,6 +404,7 @@ void reg_native_Map(vm_t* vm) {
     vm_reg_native(vm, cls, "entries()", native_Map_entries, NULL);
     vm_reg_native(vm, cls, SYMKEY_ITERATOR "()", native_Map_iterator, NULL);
     vm_reg_native(vm, cls, "get size()", native_Map_get_size, NULL);
+    vm_reg_static(vm, cls, "groupBy(items, cb)", native_Map_groupBy, NULL);
 
     /* ES6 WeakMap: same storage/identity semantics as Map but keys must be
      * objects. True weakness is not observable from scripts here, so entries

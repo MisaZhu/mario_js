@@ -1249,6 +1249,18 @@ section("15. async / await");
         eq(JSON.stringify(null), 'null', "stringify null");
         eq(JSON.stringify(true), 'true', "stringify true");
 
+        // ES: undefined / function / symbol OBJECT properties are omitted; in an
+        // ARRAY they serialise as null; a top-level undefined yields undefined.
+        // (Emitting `"k":undefined` produced invalid JSON that broke servers.)
+        eq(JSON.stringify({ a: 1, b: undefined, c: 3 }), '{"a":1,"c":3}', "stringify omits an undefined property");
+        eq(JSON.stringify({ a: 1, f: function () {}, b: 2 }), '{"a":1,"b":2}', "stringify omits a function property");
+        eq(JSON.stringify({ only: undefined }), '{}', "stringify of an all-undefined object is {}");
+        eq(JSON.stringify([1, undefined, 3]), '[1,null,3]', "stringify renders an undefined array element as null");
+        eq(JSON.stringify([1, function () {}, 3]), '[1,null,3]', "stringify renders a function array element as null");
+        eq(JSON.stringify(undefined), undefined, "stringify(undefined) is undefined");
+        eq(JSON.stringify(function () {}), undefined, "stringify(function) is undefined");
+        eq(JSON.stringify({ a: { b: undefined, c: [undefined, 2] } }), '{"a":{"c":[null,2]}}', "stringify omits undefined recursively");
+
         // parse handles negatives and floats (a stray '-' used to hang the parser).
         eq(JSON.parse('{"a":1}').a, 1, "parse an object member");
         eq(JSON.parse('[1,2,3]').length, 3, "parse an array");

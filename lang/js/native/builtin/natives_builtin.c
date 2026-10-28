@@ -23,6 +23,7 @@
 #include "Math/native_Math.h"
 #include "Date/native_Date.h"
 #include "JSON/native_JSON.h"
+#include "Intl/native_Intl.h"
 
 #ifdef __cplusplus /* __cplusplus */
 extern "C" {
@@ -53,6 +54,7 @@ void reg_builtin_natives(vm_t* vm) {
 	reg_native_Math(vm);
 	reg_native_Date(vm);
 	reg_native_JSON(vm);
+	reg_native_Intl(vm);
 }
 
 #ifdef __cplusplus /* __cplusplus */

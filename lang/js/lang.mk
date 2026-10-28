@@ -34,6 +34,7 @@ NATIVE_OBJS= \
 	$(NATIVES_PATH_BUILTIN)/Date/native_Date.o \
 	$(NATIVES_PATH_BUILTIN)/JSON/JSON.o \
 	$(NATIVES_PATH_BUILTIN)/JSON/native_JSON.o \
+	$(NATIVES_PATH_BUILTIN)/Intl/native_Intl.o \
 	\
 	$(NATIVES_PATH)/natives.o  \
 	$(NATIVES_PATH)/Console/native_Console.o \

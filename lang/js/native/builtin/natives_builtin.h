@@ -9,6 +9,10 @@ extern "C" {
 
 void reg_builtin_natives(vm_t* vm);
 
+/* Number locale formatting core (en-US thousands grouping), shared with
+ * Array.prototype.toLocaleString's per-element rendering. */
+var_t* number_to_locale_var(vm_t* vm, var_t* v, var_t* opts);
+
 #ifdef __cplusplus /* __cplusplus */
 }
 #endif

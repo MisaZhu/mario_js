@@ -29,6 +29,10 @@ static const char* inmstr_str(opr_code_t ins) {
 		case INSTR_LOADV        : return "LOADV";
 		case INSTR_LOADW        : return "LOADW";
 		case INSTR_LOAD_SAFE    : return "LOADS";
+		case INSTR_LOADP        : return "LOADP";
+		case INSTR_LOADPV       : return "LOADPV";
+		case INSTR_FUNCLOC      : return "FUNCLOC";
+		case INSTR_FUNCARGU     : return "FUNCARGU";
 		case INSTR_STORE        : return "STORE";
 		case INSTR_JMP          : return "JMP";
 		case INSTR_NJMP         : return "NJMP";
@@ -39,6 +43,7 @@ static const char* inmstr_str(opr_code_t ins) {
 		case INSTR_FUNC_GET     : return "FUNCGET";
 		case INSTR_FUNC_SET     : return "FUNCSET";
 		case INSTR_CLASS        : return "CLASS";
+		case INSTR_CLASS_EXPR   : return "CLASSEXPR";
 		case INSTR_CLASS_END    : return "CLASSE";
 		case INSTR_EXTENDS      : return "EXTENDS";
 		case INSTR_EXTENDS_V    : return "EXTENDSV";
@@ -128,6 +133,7 @@ static const char* inmstr_str(opr_code_t ins) {
 		case INSTR_MODULE_V     : return "MODULEV";
 		case INSTR_IMPORT_META  : return "IMPMETA";
 		case INSTR_STATIC_BLK   : return "STATICBLK";
+		case INSTR_GETLA        : return "GETLA";
 		case INSTR_FIELDN       : return "FIELDN";
 		case INSTR_STATICN      : return "STATICN";
 		default                 : return "";
@@ -147,10 +153,12 @@ static PC bc_get_inmstr_str(bytecode_t* bc, PC i, mstr_t* ret) {
 		mstr_append(ret, s);
 	}
 	else {
-		if(instr == INSTR_JMP || 
-				instr == INSTR_NJMP || 
+		if(instr == INSTR_JMP ||
+				instr == INSTR_NJMP ||
 				instr == INSTR_NJMPB ||
 				instr == INSTR_JMPB ||
+				instr == INSTR_LOADP ||
+				instr == INSTR_LOADPV ||
 				instr == INSTR_INT_S) {
 			snprintf(s, 128, "%08d | 0x%08X ; %s\t%d", i, ins, inmstr_str(instr), offset);	
 			mstr_append(ret, s);

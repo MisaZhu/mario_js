@@ -83,7 +83,14 @@ var_t* native_Object_getPrototypeOf(vm_t* vm, var_t* env, void* data) {
 		fprintf(stderr, "[gpodbg] getPrototypeOf(obj=%p t%u) -> %p  (OP=%p res==OP?%d)\n",
 			(void*)obj, (obj!=NULL)?(unsigned)obj->type:0u, (void*)res, (void*)op, (res==op)?1:0);
 	}
-	return res;
+	/* The top of a prototype chain ([[Prototype]] == null) must surface as JS
+	 * `null`, NOT `undefined`: returning the bare C NULL made the native yield
+	 * undefined, so `Object.getPrototypeOf(Object.prototype) === null` was false
+	 * and every chain-walking guard spun forever - e.g. redux's isPlainObject
+	 * `while (Object.getPrototypeOf(proto) !== null) proto = ...`, which hung
+	 * Pinterest's bootstrap until the run watchdog killed it. Mirrors
+	 * native_Reflect_getPrototypeOf, which already maps a null link to JS null. */
+	return (res != NULL) ? res : var_new_null(vm);
 }
 
 var_t* native_Object_hasOwnProperty(vm_t* vm, var_t* env, void* data) {
@@ -507,6 +514,43 @@ var_t* native_Object_fromEntries(vm_t* vm, var_t* env, void* data) {
 		if(kv != NULL)
 			var_add(ret, var_get_str(kv), vv != NULL ? vv : var_new(vm));
 	}
+	return ret;
+}
+
+/* Object.groupBy(items, callbackFn) (ES2024): groups items into an object of
+ * arrays keyed by ToPropertyKey(callbackFn(item, index)). Modern bundles
+ * (apple.com.cn) call it during module init; without it the module aborts. */
+var_t* native_Object_groupBy(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* items = get_func_arg(env, 0);
+	var_t* f = get_func_arg(env, 1);
+	var_t* ret = new_plain_obj(vm);
+	if(items == NULL || f == NULL || !f->is_func)
+		return ret;
+	uint32_t sz = var_array_size(items), i;
+	vm->gc.gc_defer++;
+	for(i = 0; i < sz; i++) {
+		var_t* el = var_array_get_var(items, (int32_t)i);
+		var_t* args = var_new_array(vm);
+		var_array_add(args, el != NULL ? el : var_new(vm));
+		var_array_add(args, var_new_int(vm, (int)i));
+		var_array_reverse(args);
+		var_t* kv = call_m_func(vm, env, f, args);
+		var_unref(args);
+		mstr_t* ks = mstr_new("");
+		if(kv != NULL)
+			var_to_str(kv, ks);
+		var_t* bucket = var_find_own_member_var(ret, ks->cstr);
+		if(bucket == NULL) {
+			bucket = var_new_array(vm);
+			var_add(ret, ks->cstr, bucket);
+		}
+		var_array_add(bucket, el != NULL ? el : var_new(vm));
+		mstr_free(ks);
+		if(kv != NULL)
+			var_unref(kv);
+	}
+	vm->gc.gc_defer--;
 	return ret;
 }
 
@@ -971,6 +1015,7 @@ void reg_native_Object(vm_t* vm) {
 	vm_reg_static(vm, cls, "values(obj)", native_Object_values, NULL);
 	vm_reg_static(vm, cls, "entries(obj)", native_Object_entries, NULL);
 	vm_reg_static(vm, cls, "fromEntries(arr)", native_Object_fromEntries, NULL);
+	vm_reg_static(vm, cls, "groupBy(items, cb)", native_Object_groupBy, NULL);
 	vm_reg_static(vm, cls, "freeze(obj)", native_Object_freeze, NULL);
 	vm_reg_static(vm, cls, "isFrozen(obj)", native_Object_isFrozen, NULL);
 	vm_reg_static(vm, cls, "getOwnPropertyNames(obj)", native_Object_getOwnPropertyNames, NULL);

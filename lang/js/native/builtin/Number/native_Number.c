@@ -3,6 +3,7 @@ extern "C" {
 #endif
 
 #include "native_Number.h"
+#include "natives_builtin.h"   /* number_to_locale_var (shared with Array) */
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +11,25 @@ extern "C" {
 #include <float.h>   /* DBL_MAX/DBL_MIN/DBL_EPSILON for MAX_VALUE/MIN_VALUE/EPSILON */
 
 /** Number */
+
+/* Boxed Number instances: `new Number(5)` must yield an OBJECT whose methods and
+ * coercions see 5. mario's construction path keeps the fresh object (the ctor's
+ * primitive return is discarded by ret_wins), so stamp the numeric value into the
+ * passed `this` as a hidden @@v slot (same trick as Date's @@t) and have every
+ * prototype method fall back to it when `this` is not itself a primitive. */
+static var_t* number_this_value(var_t* env) {
+	var_t* v = get_obj(env, THIS);
+	if(v == NULL)
+		return NULL;
+	if(v->type == V_INT || v->type == V_INT64 || v->type == V_FLOAT || v->type == V_FLOAT64)
+		return v;
+	if(v->type == V_OBJECT && !v->is_func) {
+		node_t* n = var_find_own_member(v, "@@v");
+		if(n != NULL && n->var != NULL)
+			return n->var;
+	}
+	return NULL;
+}
 
 var_t* native_Number_constructor(vm_t* vm, var_t* env, void* data) {
 	(void)data;
@@ -42,13 +62,59 @@ var_t* native_Number_constructor(vm_t* vm, var_t* env, void* data) {
 			        break;
 			}
 			case V_BOOL:    this_v = var_new_int(vm, var_get_int(v)); break;
-			default: break;
+			default: {
+				/* V_OBJECT / V_UNDEF / V_NULL: full ToNumber = ToPrimitive
+				 * (valueOf/toString) then numeric coercion, per spec. Without
+				 * this, Number(dateObj) collapsed to 0 (Date's valueOf never
+				 * ran) and Number(undefined) to 0 instead of NaN - which made
+				 * github relative-time's roundToSingleUnit compute
+				 * Number(newDate)-Number(relativeTo) === 0 for every row. */
+				double d;
+				if(v->type == V_UNDEF && var_find_own_member(env, "arguments") == NULL)
+					break;   /* `new Number()` with NO argument: mario still binds the
+					          * "value" slot to undefined; leave this_v NULL so the
+					          * +0 default below runs (spec: no-arg -> +0). */
+				d = vm_to_number(vm, v);
+				this_v = var_new_float64(vm, d);
+				break;
+			}
 		}
 	}
 
 	if(this_v == NULL)
 		this_v = var_new_int(vm, 0);
 	var_instance_from(this_v, get_obj(env, THIS));
+	/* Stamp the boxed value onto the passed `this` so `new Number(x)` instances
+	 * carry it (see number_this_value). Guard: a real object, not the scope root
+	 * (plain `Number(x)` calls) and not a function. */
+	{
+		var_t* thisV = get_obj(env, THIS);
+		if(thisV != NULL && thisV != this_v && thisV->type == V_OBJECT &&
+		   thisV != vm->root && !thisV->is_func) {
+			node_t* sn = var_find_own_member(thisV, "@@v");
+			if(sn != NULL && sn->var != NULL) {
+				/* overwrite the existing slot's numeric payload in place */
+				switch(this_v->type) {
+					case V_INT:     var_set_int(sn->var, var_get_int(this_v)); break;
+					case V_INT64:   var_set_int64(sn->var, var_get_int64(this_v)); break;
+					case V_FLOAT:   var_set_float(sn->var, var_get_float(this_v)); break;
+					case V_FLOAT64: var_set_float64(sn->var, var_get_float64(this_v)); break;
+					default: break;
+				}
+			} else {
+				/* fresh hidden slot holding an independent copy of the value */
+				var_t* slot = NULL;
+				switch(this_v->type) {
+					case V_INT:     slot = var_new_int(vm, var_get_int(this_v)); break;
+					case V_INT64:   slot = var_new_int64(vm, var_get_int64(this_v)); break;
+					case V_FLOAT:   slot = var_new_float(vm, var_get_float(this_v)); break;
+					default:        slot = var_new_float64(vm, var_get_float64(this_v)); break;
+				}
+				sn = var_add(thisV, "@@v", slot);
+				if(sn != NULL) { sn->be_unenumerable = 1; sn->invisable = 1; }
+			}
+		}
+	}
 	return this_v;
 }
 
@@ -100,7 +166,8 @@ var_t* native_Number_toString(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	const char *s;
 
-	var_t* v = get_obj(env, THIS);
+	var_t* v = number_this_value(env);
+	if(v == NULL) v = get_obj(env, THIS);
 	int radix = get_int(env, "radix");
 	if(radix < 2 || radix > 36)
 		radix = 10;
@@ -117,13 +184,86 @@ var_t* native_Number_toString(vm_t* vm, var_t* env, void* data) {
 	return ret;
 }
 
+/* Number.prototype.toLocaleString(locale, options): decimal form with en-US
+ * style thousands grouping ("7152" -> "7,152"). Without this method the lookup
+ * falls through to Object.prototype.toLocaleString and yields the useless
+ * "[object Number]" tag string (seen on the GitHub contributors counter
+ * badge). Non-finite / exponent / radix forms pass through ungrouped, and
+ * options.useGrouping === false disables grouping, matching ICU defaults. */
+var_t* native_Number_toLocaleString(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* v = number_this_value(env);
+	if(v == NULL) v = get_obj(env, THIS);
+	return number_to_locale_var(vm, v, get_obj(env, "options"));
+}
+
+/* Shared core for Number.prototype.toLocaleString and Array's per-element
+ * locale rendering: decimal form with en-US style thousands grouping
+ * ("7152" -> "7,152"). Without this method the lookup falls through to
+ * Object.prototype.toLocaleString and yields the useless "[object Number]"
+ * tag string (seen on the GitHub contributors counter badge). Non-finite /
+ * exponent / radix forms pass through ungrouped, and options.useGrouping
+ * === false disables grouping, matching ICU defaults. */
+var_t* number_to_locale_var(vm_t* vm, var_t* v, var_t* opts) {
+	const char* s;
+	if(v == NULL)
+		return var_new_str(vm, "0");
+	switch(v->type) {
+		case V_INT:     s = mstr_from_int(var_get_int(v), 10); break;
+		case V_INT64:   s = mstr_from_int64(var_get_int64(v), 10); break;
+		case V_FLOAT:   s = mstr_from_float(var_get_float(v)); break;
+		case V_FLOAT64: s = mstr_from_float64(var_get_float64(v)); break;
+		default:        s = mstr_from_int(var_get_int(v), 10); break;
+	}
+	if(s == NULL)
+		return var_new_str(vm, "0");
+	bool group = true;
+	if(opts != NULL && opts->type == V_OBJECT) {
+		var_t* ug = var_find_member_var(opts, "useGrouping");
+		if(ug != NULL && ((ug->type == V_BOOL && var_get_int(ug) == 0) ||
+		   (ug->type == V_STRING && strcmp(var_get_str(ug), "false") == 0)))
+			group = false;
+	}
+	if(!group || strchr(s, 'e') != NULL || strchr(s, 'E') != NULL ||
+	   strchr(s, 'x') != NULL || strchr(s, 'I') != NULL || strchr(s, 'N') != NULL)
+		return var_new_str(vm, s);
+	const char* p = s;
+	char sign = 0;
+	if(*p == '-' || *p == '+') { sign = *p; p++; }
+	const char* dot = strchr(p, '.');
+	size_t ilen = (dot != NULL) ? (size_t)(dot - p) : strlen(p);
+	if(ilen <= 3)
+		return var_new_str(vm, s);
+	/* group from the right: emit reversed with a comma every 3 digits */
+	char tmp[192];
+	size_t to = 0;
+	size_t i = ilen;
+	int cnt = 0;
+	while(i > 0 && to < sizeof(tmp) - 1) {
+		if(cnt == 3) { tmp[to++] = ','; cnt = 0; }
+		tmp[to++] = p[--i];
+		cnt++;
+	}
+	char out[224];
+	size_t o = 0;
+	if(sign) out[o++] = sign;
+	while(to > 0 && o < sizeof(out) - 48)
+		out[o++] = tmp[--to];
+	if(dot != NULL)
+		while(*dot != '\0' && o < sizeof(out) - 1)
+			out[o++] = *dot++;
+	out[o] = '\0';
+	return var_new_str(vm, out);
+}
+
 /* Number.prototype.toFixed(digits): fixed-point decimal string with `digits`
  * places after the point. digits is clamped to [0,100] (JS throws RangeError
  * outside that range; we clamp instead). NaN/Infinity render as their JS strings.
  * The underlying value is read at full double width. */
 var_t* native_Number_toFixed(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* v = get_obj(env, THIS);
+	var_t* v = number_this_value(env);
+	if(v == NULL) v = get_obj(env, THIS);
 	double d = var_get_float64(v);
 	int digits = get_int(env, "digits");
 	if(digits < 0) digits = 0;
@@ -246,7 +386,8 @@ static void js_dec_fmt_exp(const js_dec_t* v, int keep, char* out, size_t outsz)
  * strings; out-of-range digits are clamped like toFixed() does. */
 var_t* native_Number_toExponential(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* v = get_obj(env, THIS);
+	var_t* v = number_this_value(env);
+	if(v == NULL) v = get_obj(env, THIS);
 	double d = var_get_float64(v);
 	if(isnan(d))
 		return var_new_str(vm, "NaN");
@@ -277,7 +418,8 @@ var_t* native_Number_toExponential(vm_t* vm, var_t* env, void* data) {
  * to [1,100]. */
 var_t* native_Number_toPrecision(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* v = get_obj(env, THIS);
+	var_t* v = number_this_value(env);
+	if(v == NULL) v = get_obj(env, THIS);
 	var_t* p = get_obj(env, "precision");
 	if(p == NULL || p->type == V_UNDEF) {
 		mstr_t* s = mstr_new("");
@@ -335,7 +477,8 @@ var_t* native_Number_toPrecision(vm_t* vm, var_t* env, void* data) {
 /* Number.prototype.valueOf(): the primitive numeric value of this Number. */
 var_t* native_Number_valueOf(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* v = get_obj(env, THIS);
+	var_t* v = number_this_value(env);
+	if(v == NULL) v = get_obj(env, THIS);
 	if(v == NULL)
 		return var_new_int(vm, 0);
 	switch(v->type) {
@@ -586,6 +729,7 @@ void reg_native_Number(vm_t* vm) {
 	 * otherwise Number.MIN_SAFE_INTEGER.toString() has no method chain. */
 	vm->builtin_vars.var_Number = cls;
 	vm_reg_native(vm, cls, "toString(radix)", native_Number_toString, NULL); 
+	vm_reg_native(vm, cls, "toLocaleString(locale, options)", native_Number_toLocaleString, NULL); 
 	vm_reg_native(vm, cls, "toFixed(digits)", native_Number_toFixed, NULL);
 	vm_reg_native(vm, cls, "toExponential(fractionDigits)", native_Number_toExponential, NULL);
 	vm_reg_native(vm, cls, "toPrecision(precision)", native_Number_toPrecision, NULL);

@@ -44,7 +44,17 @@ bool        is_hexadecimal(unsigned char ch);
 bool        is_alpha(unsigned char ch);
 bool        is_alpha_num(const char* cstr);
 
-void        lex_get_nextch(lex_t* lex);
+/* Inlined: called per char/token on the compile hot path; bodies are pure
+ * field updates (read-head invariant: curr_ch == data[data_pos-2]). */
+static inline void lex_get_nextch(lex_t* lex) {
+	lex->curr_ch = lex->next_ch;
+	if (lex->data_pos < lex->data_end){
+		lex->next_ch = lex->data[lex->data_pos];
+	}else{
+		lex->next_ch = 0;
+	}
+	lex->data_pos++;
+}
 void        lex_reset(lex_t* lex);
 /* Read a `\u`/`\u{...}` escape inside a string literal (entry: curr_ch=='u');
  * emits UTF-8, combining UTF-16 surrogate pairs. Shared by the single- and
@@ -62,9 +72,19 @@ void        lex_skip_whitespace(lex_t* lex);
 void        lex_skip_space(lex_t* lex);
 bool        lex_skip_comments_line(lex_t* lex, const char* start);
 bool        lex_skip_comments_block(lex_t* lex, const char* start, const char* end);
-void        lex_token_start(lex_t* lex); 
-void        lex_token_end(lex_t* lex); 
-void        lex_get_char_token(lex_t* lex); 
+/* record beginning of this token(pre-read 2 chars ) */
+static inline void lex_token_start(lex_t* lex) {
+	lex->tk_start = lex->data_pos-2;
+}
+static inline void lex_token_end(lex_t* lex) {
+	lex->tk_last_end = lex->tk_end;
+	lex->tk_end = lex->data_pos-3;
+}
+static inline void lex_get_char_token(lex_t* lex) {
+	lex->tk = lex->curr_ch;
+	if (lex->curr_ch)
+		lex_get_nextch(lex);
+}
 void        lex_get_basic_token(lex_t* lex); 
 void        lex_get_pos(lex_t* lex, int* line, int *col, int pos);
 

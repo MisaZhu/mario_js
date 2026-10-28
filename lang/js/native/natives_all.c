@@ -74,6 +74,10 @@ static inline void load_basic_classes(vm_t* vm) {
 	var_t* boolfn = vm_load_var(vm, "Boolean", false);
 	if(boolfn != NULL) {
 		vm_reg_native(vm, boolfn, "toString()", native_Boolean_toString, NULL);
+		/* spec: Boolean.prototype.toLocaleString is toString-equivalent for the
+		 * default locale; without it the lookup falls to Object.prototype's alias
+		 * and yields "[object Boolean]". */
+		vm_reg_native(vm, boolfn, "toLocaleString(locale, options)", native_Boolean_toString, NULL);
 		vm_reg_native(vm, boolfn, "valueOf()", native_Boolean_valueOf, NULL);
 		vm->builtin_vars.var_Boolean = boolfn;
 		var_t* bproto = var_get_prototype(boolfn);
