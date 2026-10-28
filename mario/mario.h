@@ -69,6 +69,7 @@ typedef struct st_hash_map {
 	hash_entry_t**      buckets;
 	uint32_t            size;
 	uint32_t            capacity;
+<<<<<<< HEAD
 	uint32_t            load_factor_num;   // 负载因子分子
 	uint32_t            load_factor_den;   // 负载因子分母
 	/* Entry-pool owner: when non-NULL (a var_t children map) entries are
@@ -80,6 +81,10 @@ typedef struct st_hash_map {
 	 * skip the key free. Only var children maps set this; the key pointer
 	 * passed to hash_map_add must then be node->name (outlives entry). */
 	uint32_t            keys_borrowed;
+=======
+	uint32_t            load_factor_num;   // load factor numerator
+	uint32_t            load_factor_den;   // load factor denominator
+>>>>>>> b39f893835c582eeda8b2dd07929d70945840b64
 } hash_map_t;
 
 // Hash map functions

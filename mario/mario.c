@@ -178,10 +178,15 @@ hash_map_t* hash_map_new(void) {
 void hash_map_init(hash_map_t* map) {
     map->capacity = HASH_MAP_INITIAL_CAPACITY;
     map->size = 0;
+<<<<<<< HEAD
     map->load_factor_num = 3;   // 分子：3
     map->load_factor_den = 4;   // 分母：4（3/4 = 0.75）
     map->owner = NULL;
     map->keys_borrowed = 0;
+=======
+    map->load_factor_num = 3;   // numerator: 3
+    map->load_factor_den = 4;   // denominator: 4 (3/4 = 0.75)
+>>>>>>> b39f893835c582eeda8b2dd07929d70945840b64
     map->buckets = (hash_entry_t**)mario_malloc(sizeof(hash_entry_t*) * map->capacity);
     uint32_t i;
     for (i = 0; i < map->capacity; i++) {
@@ -5020,7 +5025,7 @@ void var_to_json_str(var_t* var, mstr_t* ret, int level, bool compact) {
 		else
 			mstr_append(ret, "{\n");
 
-		// 直接遍历 hash map，不使用回调函数
+		// iterate the hash map directly, without a callback function
 		bool first = true;
 		uint32_t i;
 		for (i = 0; i < var->children.capacity; i++) {
@@ -5029,14 +5034,15 @@ void var_to_json_str(var_t* var, mstr_t* ret, int level, bool compact) {
 				const char* key = entry->key;
 				node_t* node = (node_t*)entry->value;
 
-				// 跳过不可枚举的属性
+				// skip non-enumerable properties
 				if (node->be_unenumerable)
 					goto next_entry;
 
-				// 跳过内部属性（如原型链）
+				// skip internal properties (such as the prototype chain)
 				if (strcmp(key, PROTOTYPE) == 0 || strcmp(key, "_ARRAY_") == 0)
 					goto next_entry;
 
+<<<<<<< HEAD
 				/* ES SerializeJSONObject: an own property whose value is
 				 * undefined, a function or a symbol is OMITTED entirely (the
 				 * key never appears). Emitting `"k":undefined` produced invalid
@@ -5052,23 +5058,26 @@ void var_to_json_str(var_t* var, mstr_t* ret, int level, bool compact) {
 					goto next_entry;
 
 				// 添加逗号分隔符
+=======
+				// add the comma separator
+>>>>>>> b39f893835c582eeda8b2dd07929d70945840b64
 				if (!first) {
 					mstr_append(ret, compact ? "," : ",\n");
 				} else {
 					first = false;
 				}
 
-				// 缩进
+				// indentation
 				if(!compact)
 					append_json_spaces(ret, level);
 
-				// 添加属性名
+				// add the property name
 				mstr_add(ret, '"');
 				mstr_append(ret, key);
 				mstr_add(ret, '"');
 				mstr_append(ret, compact ? ":" : ": ");
 
-				// 序列化属性值
+				// serialize the property value
 				mstr_t* value_str = mstr_new("");
 				var_to_json_str(node->var, value_str, level + 1, compact);
 				mstr_append(ret, value_str->cstr);
@@ -5079,7 +5088,7 @@ void var_to_json_str(var_t* var, mstr_t* ret, int level, bool compact) {
 			}
 		}
 
-		// 如果没有属性，确保格式正确
+		// if there are no properties, make sure the format is still correct
 		if (!compact) {
 			if (first) {
 				append_json_spaces(ret, level);
@@ -9258,7 +9267,7 @@ var_t* call_m_func_by_name(vm_t* vm, var_t* obj, const char* func_name, uint32_t
 	var_t* func_args = var_new_array(vm);
 
     for (int i = 0; i < arg_num; i++) {
-        var_t* arg = va_arg(args, var_t*);  // 取出void*类型的可变参数
+        var_t* arg = va_arg(args, var_t*);  // take the variadic argument as a void*
 		var_array_add(func_args, arg);
     }
     va_end(args);

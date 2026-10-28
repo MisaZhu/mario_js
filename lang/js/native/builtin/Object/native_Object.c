@@ -130,7 +130,7 @@ typedef struct {
 	var_t* keys_var;
 	bool enumerable;
 	uint32_t num;
-	hash_map_t* seen_properties; // 用于快速检查属性是否已经存在的哈希表
+	hash_map_t* seen_properties; // hash map for quickly checking whether a property already exists
 } properties_callback_data;
 
 static void properties_callback(const char* key, void* value, void* user_data) {
@@ -142,11 +142,11 @@ static void properties_callback(const char* key, void* value, void* user_data) {
 		node->invisable == 0 &&
 		node->var != data->keys_var) {
 		if(!node->be_unenumerable || !data->enumerable) {
-			// 使用哈希表快速检查属性是否已经存在
+			// use the hash map to quickly check whether the property already exists
 			if(hash_map_get(data->seen_properties, node->name) == NULL) {
-				// 将属性添加到哈希表中，标记为已存在
+				// add the property to the hash map, marking it as seen
 				hash_map_add(data->seen_properties, node->name, (void*)"");
-				// 将属性名称添加到结果数组中
+				// add the property name to the result array
 				var_array_add(data->keys_var, var_new_str(data->vm, node->name));
 				data->num++;
 			}
@@ -164,7 +164,7 @@ static inline uint32_t var_properties_num(vm_t* vm, var_t* var, var_t* keys_var,
 	 * until the result array is fully built and handed back to the caller. */
 	vm->gc.gc_defer++;
 
-	// 创建并初始化哈希表，用于快速检查属性是否已经存在
+	// create and initialize the hash map used to quickly check whether a property already exists
 	hash_map_t* seen_properties = hash_map_new();
 	
 	// Use hash_map_iterate to traverse the properties
@@ -179,10 +179,10 @@ static inline uint32_t var_properties_num(vm_t* vm, var_t* var, var_t* keys_var,
 	hash_map_iterate(&var->children, properties_callback, &data);
 	num += data.num;
 
-	// 处理原型链上的属性
+	// handle properties along the prototype chain
 	var_t* proto = var_get_prototype(var);
 	while(proto != NULL) {
-		// 递归调用时传递同一个哈希表，确保整个原型链上的属性都不重复
+		// pass the same hash map on the recursive call so no property across the whole prototype chain is duplicated
 		properties_callback_data proto_data;
 		proto_data.vm = vm;
 		proto_data.var = proto;
@@ -197,7 +197,7 @@ static inline uint32_t var_properties_num(vm_t* vm, var_t* var, var_t* keys_var,
 		proto = var_get_prototype(proto);
 	}
 	
-	// 释放哈希表
+	// free the hash map
 	hash_map_free(seen_properties, mario_free, NULL);
 
 	vm->gc.gc_defer--;
