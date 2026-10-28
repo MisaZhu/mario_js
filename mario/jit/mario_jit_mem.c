@@ -24,6 +24,13 @@
 #endif
 #include <sys/mman.h>
 
+/* Whole body is JIT-only: with MARIO_JIT_SUPPORTED == 0 (e.g. EwokOS, which has
+ * no dynamic code loading and no __clear_cache in its -nostdlib runtime) this
+ * translation unit compiles to nothing, matching mario_jit_arm64.c. Nothing
+ * references these symbols when the JIT is off - mario_jit.c's #else branch
+ * supplies the mario_jit_compile/mario_jit_free_code stubs the VM links to. */
+#if MARIO_JIT_SUPPORTED
+
 /* ---- code buffer --------------------------------------------------------*/
 void jit_buf_init(jit_buf_t* b) {
 	b->cap = 4096;
@@ -113,3 +120,5 @@ void* jit_buf_finalize_exec(jit_buf_t* b, size_t* out_size) {
 		*out_size = b->size;
 	return exec;
 }
+
+#endif /* MARIO_JIT_SUPPORTED */

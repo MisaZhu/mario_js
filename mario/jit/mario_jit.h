@@ -31,7 +31,14 @@ extern "C" {
 #endif
 
 /* ---- target capability detection (compile-time) ------------------------ */
-#if defined(__aarch64__) || defined(__arm64__)
+/* EwokOS has no dynamic code loading (no dlopen, no user-space W^X executable
+ * mmap + I-cache flush path): the copy-and-patch JIT cannot run there, and its
+ * __builtin___clear_cache lowers to an external __clear_cache the -nostdlib
+ * runtime does not provide (EL0 dc civac/ic ivau would trap anyway, since the
+ * kernel leaves SCTLR_EL1.UCI clear). Force the interpreter fallback. */
+#if defined(__ewokos__)
+#  define MARIO_JIT_SUPPORTED  0
+#elif defined(__aarch64__) || defined(__arm64__)
 #  define MARIO_JIT_ARCH_ARM64 1
 #  define MARIO_JIT_SUPPORTED  1
 #else

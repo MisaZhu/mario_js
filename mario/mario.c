@@ -6667,6 +6667,8 @@ static var_t* async_park_frame(vm_t* vm, var_t* func_var, func_t* func,
  * are resolved to symbol names via dladdr so we can see which builtins/natives
  * dominate VM time during e.g. github React hydration. Off => one predictable
  * branch per native call. */
+#if !defined(__ewokos__) /* dlfcn.h/dladdr absent on the EwokOS bare toolchain */
+#define MARIO_NATPROF_ENABLED 1
 #include <dlfcn.h>
 typedef struct { void* fn; unsigned long n; } np_ent_t;
 static np_ent_t g_np[2048];
@@ -6702,6 +6704,7 @@ static void mario_natprof_hit(void* fn) {
 		}
 	}
 }
+#endif /* MARIO_NATPROF_ENABLED */
 
 #if MARIO_JIT_SUPPORTED
 /* JIT knobs (see jit/mario_jit.h): MARIO_JIT=0 disables the JIT outright
@@ -6983,7 +6986,9 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num, bool i
 	vm_push(vm, env); //avoid for gc
 	vm->gc.gc_defer--; //env is now rooted on the stack; gc is safe again.
 	if(func->native != NULL) { //native function
+#if MARIO_NATPROF_ENABLED
 		{ static int np_on = -1; if(np_on < 0) np_on = (getenv("MARIO_NATPROF") != NULL); if(np_on) mario_natprof_hit((void*)func->native); }
+#endif
 		ret = func->native(vm, env, func->data);
 		if(vm->propagating_err != NULL)
 			ret = NULL; // a callee of this native aborted: placeholder result, keep propagating
