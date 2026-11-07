@@ -4,6 +4,7 @@ extern "C" {
 
 #include "native_Error.h"
 #include <stdlib.h>  /* free */
+#include <stdio.h>   /* snprintf (CallSite.toString) */
 
 #define CLS_ERROR "Error"
 
@@ -17,6 +18,166 @@ static void error_set_str_member(var_t* thisV, const char* key, const char* val)
 		var_set_str(n->var, val);
 	else
 		var_add(thisV, key, var_new_str(thisV->vm, val));
+}
+
+/* ---- V8 structured stack traces (Error.prepareStackTrace / captureStackTrace) ----
+ * Baxia's et_f.js VMP installs Error.prepareStackTrace and reads the CallSite
+ * objects it is handed to recover real frame names; without this hook the VMP's
+ * name resolution yields "" and it aborts with ReferenceError(" is not defined").
+ * A CallSite is a plain object carrying the frame's name/file/line/col in hidden
+ * @@cs_* slots, with the accessor methods on a shared prototype. */
+#define CS_NAME "@@cs_name"
+#define CS_FILE "@@cs_file"
+#define CS_LINE "@@cs_line"
+#define CS_COL  "@@cs_col"
+
+static var_t* cs_this(vm_t* vm, var_t* env) { (void)vm; return get_obj(env, THIS); }
+
+static var_t* cs_str_field(vm_t* vm, var_t* env, const char* key) {
+	var_t* t = cs_this(vm, env);
+	var_t* v = (t != NULL) ? var_find_own_member_var(t, key) : NULL;
+	if(v != NULL && v->type == V_STRING)
+		return var_new_str(vm, var_get_str(v));
+	return var_new_null(vm);
+}
+static var_t* cs_int_field(vm_t* vm, var_t* env, const char* key) {
+	var_t* t = cs_this(vm, env);
+	var_t* v = (t != NULL) ? var_find_own_member_var(t, key) : NULL;
+	if(v != NULL)
+		return var_new_int(vm, var_get_int(v));
+	return var_new_null(vm);
+}
+static var_t* cs_getFunctionName(vm_t* vm, var_t* env, void* d) { (void)d; return cs_str_field(vm, env, CS_NAME); }
+static var_t* cs_getFileName(vm_t* vm, var_t* env, void* d)     { (void)d; return cs_str_field(vm, env, CS_FILE); }
+static var_t* cs_getLineNumber(vm_t* vm, var_t* env, void* d)   { (void)d; return cs_int_field(vm, env, CS_LINE); }
+static var_t* cs_getColumnNumber(vm_t* vm, var_t* env, void* d) { (void)d; return cs_int_field(vm, env, CS_COL); }
+static var_t* cs_null(vm_t* vm, var_t* env, void* d)            { (void)env; (void)d; return var_new_null(vm); }
+static var_t* cs_bool(vm_t* vm, var_t* env, void* d)            { (void)env; return var_new_bool(vm, d != NULL); }
+static var_t* cs_toString(vm_t* vm, var_t* env, void* d) {
+	(void)d;
+	var_t* t = cs_this(vm, env);
+	const char* nm = NULL; const char* fl = NULL; int ln = 0, cl = 0;
+	if(t != NULL) {
+		var_t* v;
+		if((v = var_find_own_member_var(t, CS_NAME)) != NULL && v->type == V_STRING) nm = var_get_str(v);
+		if((v = var_find_own_member_var(t, CS_FILE)) != NULL && v->type == V_STRING) fl = var_get_str(v);
+		if((v = var_find_own_member_var(t, CS_LINE)) != NULL) ln = var_get_int(v);
+		if((v = var_find_own_member_var(t, CS_COL))  != NULL) cl = var_get_int(v);
+	}
+	char buf[512];
+	if(nm != NULL && nm[0] != 0)
+		snprintf(buf, sizeof buf, "%s (%s:%d:%d)", nm, fl != NULL ? fl : "<anonymous>", ln, cl);
+	else
+		snprintf(buf, sizeof buf, "%s:%d:%d", fl != NULL ? fl : "<anonymous>", ln, cl);
+	return var_new_str(vm, buf);
+}
+
+/* Shared CallSite method table, built once and kept alive by a permanent ref. */
+static var_t* g_cs_proto = NULL;
+static var_t* callsite_proto(vm_t* vm) {
+	if(g_cs_proto != NULL)
+		return g_cs_proto;
+	var_t* objcls = var_find_member_var(vm->root, "Object");
+	var_t* objproto = (objcls != NULL) ? var_get_prototype(objcls) : NULL;
+	var_t* p = var_new_obj(vm, objproto, NULL, NULL);
+	var_add(p, "getFunctionName",  var_new_native_func(vm, cs_getFunctionName, NULL));
+	var_add(p, "getMethodName",    var_new_native_func(vm, cs_null, NULL));
+	var_add(p, "getFunction",      var_new_native_func(vm, cs_null, NULL));
+	var_add(p, "getThis",          var_new_native_func(vm, cs_null, NULL));
+	var_add(p, "getTypeName",      var_new_native_func(vm, cs_null, NULL));
+	var_add(p, "getEvalOrigin",    var_new_native_func(vm, cs_null, NULL));
+	var_add(p, "getPromiseIndex",  var_new_native_func(vm, cs_null, NULL));
+	var_add(p, "getFileName",      var_new_native_func(vm, cs_getFileName, NULL));
+	var_add(p, "getLineNumber",    var_new_native_func(vm, cs_getLineNumber, NULL));
+	var_add(p, "getColumnNumber",  var_new_native_func(vm, cs_getColumnNumber, NULL));
+	var_add(p, "isToplevel",       var_new_native_func(vm, cs_bool, (void*)1));
+	var_add(p, "isEval",           var_new_native_func(vm, cs_bool, NULL));
+	var_add(p, "isNative",         var_new_native_func(vm, cs_bool, NULL));
+	var_add(p, "isConstructor",    var_new_native_func(vm, cs_bool, NULL));
+	var_add(p, "isAsync",          var_new_native_func(vm, cs_bool, NULL));
+	var_add(p, "isPromiseAll",     var_new_native_func(vm, cs_bool, NULL));
+	var_add(p, "toString",         var_new_native_func(vm, cs_toString, NULL));
+	var_ref(p);   /* permanent anchor; the GC is refcount-based */
+	g_cs_proto = p;
+	return p;
+}
+
+/* Build the CallSite array for the current VM stack. Returns a refs==0 array. */
+static var_t* build_callsites(vm_t* vm) {
+	mario_frame_t fr[32];
+	int n = mario_stack_frames(vm, fr, 32);
+	var_t* proto = callsite_proto(vm);
+	var_t* arr = var_new_array(vm);
+	for(int i = 0; i < n; i++) {
+		var_t* cs = var_new_obj(vm, proto, NULL, NULL);
+		if(fr[i].name != NULL)
+			var_add(cs, CS_NAME, var_new_str(vm, fr[i].name));
+		if(fr[i].url != NULL)
+			var_add(cs, CS_FILE, var_new_str(vm, fr[i].url));
+		var_add(cs, CS_LINE, var_new_int(vm, fr[i].line));
+		var_add(cs, CS_COL,  var_new_int(vm, fr[i].col));
+		var_array_add(arr, cs);   /* arr now holds cs */
+	}
+	return arr;
+}
+
+/* The installed Error.prepareStackTrace hook, or NULL when absent/not callable. */
+static var_t* error_prepare_fn(vm_t* vm) {
+	var_t* errcls = var_find_member_var(vm->root, "Error");
+	if(errcls == NULL)
+		return NULL;
+	var_t* pst = var_find_member_var(errcls, "prepareStackTrace");
+	if(pst == NULL || !pst->is_func)
+		return NULL;
+	return pst;
+}
+
+/* V8: when prepareStackTrace is installed, the captured stack is whatever it
+ * returns for (error, callSites); otherwise the default formatted string.
+ * Returns an OWNED var (refs==1); the caller anchors it then var_unref's. */
+static var_t* error_stack_value(vm_t* vm, var_t* errV, const char* head) {
+	var_t* pst = error_prepare_fn(vm);
+	if(pst != NULL) {
+		var_t* sites = build_callsites(vm);
+		var_ref(sites);
+		var_t* args = var_new_array(vm);
+		var_array_add(args, errV != NULL ? errV : var_new(vm));
+		var_array_add(args, sites);
+		var_array_reverse(args);
+		vm->gc.gc_defer++;
+		var_t* res = call_m_func(vm, var_new(vm), pst, args);
+		vm->gc.gc_defer--;
+		var_unref(args);
+		if(res != NULL && vm->native_thrown == NULL) {
+			var_ref(res);        /* own the hook result (it may BE `sites`) */
+			var_unref(sites);    /* drop my temporary anchor */
+			return res;
+		}
+		var_unref(sites);
+	}
+	char* stk = mario_format_stack(vm, head);
+	var_t* v = var_new_str(vm, (stk != NULL) ? stk : "");
+	free(stk);
+	var_ref(v);
+	return v;
+}
+
+/* Error.captureStackTrace(targetObject[, constructorOpt]): attach a stack trace
+ * to an arbitrary object, honouring prepareStackTrace like the constructor. */
+static var_t* native_Error_captureStackTrace(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* target = get_obj(env, "targetObject");
+	if(target == NULL || target->type == V_UNDEF || target->type == V_NULL)
+		return NULL;
+	var_t* stackv = error_stack_value(vm, target, "Error");
+	if(stackv != NULL) {
+		if(stackv->type == V_STRING)
+			error_set_str_member(target, "stack", var_get_str(stackv));
+		else
+			var_add(target, "stack", stackv);
+		var_unref(stackv);
+	}
+	return NULL;
 }
 
 /* Shared constructor for Error and every subtype. `data` carries the constructor
@@ -37,7 +198,8 @@ var_t* native_ErrorConstructor(vm_t* vm, var_t* env, void* data) {
 	/* ES Error.stack: capture the trace at construction. Without it React's
 	 * component-stack builder called .trim() on undefined and every caught
 	 * error lost its origin ("Error generating stack: can not find function
-	 * 'trim'"). */
+	 * 'trim'"). When Error.prepareStackTrace is installed (V8), the stack is
+	 * whatever that hook returns for (error, callSites). */
 	{
 		mstr_t* head = mstr_new("");
 		mstr_append(head, name);
@@ -45,10 +207,19 @@ var_t* native_ErrorConstructor(vm_t* vm, var_t* env, void* data) {
 			mstr_append(head, ": ");
 			mstr_append(head, s);
 		}
-		char* stk = mario_format_stack(vm, head->cstr);
+		var_t* stackv = error_stack_value(vm, thisV, head->cstr);
 		mstr_free(head);
-		error_set_str_member(thisV, "stack", (stk != NULL) ? stk : "");
-		free(stk);
+		if(stackv != NULL) {
+			if(stackv->type == V_STRING) {
+				error_set_str_member(thisV, "stack", var_get_str(stackv));
+				var_unref(stackv);
+			} else {
+				/* Non-string hook result (e.g. the VMP returning the CallSite array):
+				 * anchor it as the member AND keep the owned ref so the array body is
+				 * never recycled out from under readers (identity must stay stable). */
+				var_add(thisV, "stack", stackv);
+			}
+		}
 	}
 	return thisV;
 }
@@ -122,6 +293,8 @@ void reg_native_Error(vm_t* vm) {
 	 * resolves. Subtypes inherit this tag: per spec they all report the "Error"
 	 * class rather than their own name. */
 	vm_reg_var(vm, cls, SYMKEY_TOSTRINGTAG, var_new_str(vm, "Error"), true);
+	/* V8 structured-stack statics (baxia et_f.js VMP relies on prepareStackTrace). */
+	vm_reg_static(vm, cls, "captureStackTrace(targetObject, constructorOpt)", native_Error_captureStackTrace, NULL);
 
 	/* Standard error subtypes, all instanceof Error. */
 	reg_error_subtype(vm, cls, "TypeError");

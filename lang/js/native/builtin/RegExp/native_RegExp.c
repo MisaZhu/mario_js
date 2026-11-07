@@ -875,6 +875,11 @@ static re_prog_t* re_compile_uncached(const char* pattern, const char* flags, ch
 		case 's': p->dotall = true; break;
 		case 'y': p->sticky = true; break;
 		case 'u': break;   /* strings are UTF-8 bytes already */
+		case 'd': break;   /* hasIndices: flag accepted & reported; the exec()
+		                    * `indices` result is not populated (no consumer). */
+		case 'v': break;   /* unicodeSets: flag accepted & reported; set notation
+		                    * falls back to /u handling (rare, and not what the
+		                    * anti-bot engine fingerprint exercises). */
 		default:
 			if(err != NULL) snprintf(err, errlen, "invalid flag '%c'", *f);
 			free(p);
@@ -1330,6 +1335,14 @@ var_t* native_RegExpConstructor(vm_t* vm, var_t* env, void* data) {
 	var_add(this_v, "ignoreCase", var_new_bool(vm, strchr(flg, 'i') != NULL));
 	var_add(this_v, "multiline", var_new_bool(vm, strchr(flg, 'm') != NULL));
 	var_add(this_v, "sticky", var_new_bool(vm, re_flag_sticky(p)));
+	/* ES 22.2.5 flag accessors Chrome exposes on every RegExp instance. Without
+	 * these a regex read of .unicode/.dotAll/.hasIndices/.unicodeSets yields
+	 * undefined instead of false, which baxia et_f's engine fingerprint detects
+	 * (measured via MARIO_MISSGET on script_39). */
+	var_add(this_v, "dotAll",      var_new_bool(vm, p->dotall));
+	var_add(this_v, "unicode",     var_new_bool(vm, strchr(flg, 'u') != NULL));
+	var_add(this_v, "hasIndices",  var_new_bool(vm, strchr(flg, 'd') != NULL));
+	var_add(this_v, "unicodeSets", var_new_bool(vm, strchr(flg, 'v') != NULL));
 	var_add(this_v, "lastIndex", var_new_int(vm, 0));
 	re_free(p);
 	return this_v;
@@ -1459,6 +1472,38 @@ var_t* native_RegExpToString(vm_t* vm, var_t* env, void* data) {
 	return ret;
 }
 
+/* The RegExp.prototype accessor names, indexed by the `data` passed at
+ * registration (and mirrored by native_RegExp_get_acc below). */
+static const char* const re_proto_acc[10] = {
+	"source", "flags", "global", "ignoreCase", "multiline",
+	"sticky", "unicode", "dotAll", "hasIndices", "unicodeSets"
+};
+
+/* RegExp.prototype accessor (ES 22.2.5.1-10). Real instances carry own data
+ * props (set by the constructor) that shadow this, so it fires only for
+ * RegExp.prototype itself - per spec an empty-pattern regexp: source "(?:)",
+ * flags "", every flag boolean false - or a bare object inheriting the
+ * prototype. Invoked explicitly with a regexp `this`
+ * (getOwnPropertyDescriptor(RegExp.prototype,'source').get.call(re)) it returns
+ * that regexp's own value, exactly like Chrome. */
+static var_t* native_RegExp_get_acc(vm_t* vm, var_t* env, void* data) {
+	int idx = (int)(intptr_t)data;
+	var_t* this_v = get_obj(env, THIS);
+	node_t* n = (this_v != NULL) ? var_find_own_member(this_v, re_proto_acc[idx]) : NULL;
+	if(n != NULL && n->var != NULL) {
+		if(idx <= 1) {
+			if(n->var->type == V_STRING)
+				return var_new_str(vm, var_get_str(n->var));
+		}
+		else if(n->var->type == V_BOOL) {
+			return var_new_bool(vm, var_get_bool(n->var));
+		}
+	}
+	if(idx == 0) return var_new_str(vm, "(?:)");   /* RegExp.prototype source */
+	if(idx == 1) return var_new_str(vm, "");       /* RegExp.prototype flags  */
+	return var_new_bool(vm, false);                /* every flag boolean      */
+}
+
 void reg_native_RegExp(vm_t* vm) {
 	var_t* cls = vm_new_class(vm, CLS_REGEXP);
 	vm_reg_native(vm, cls, "constructor(pattern, flags)", native_RegExpConstructor, NULL);
@@ -1466,6 +1511,17 @@ void reg_native_RegExp(vm_t* vm) {
 	vm_reg_native(vm, cls, "exec(str)", native_RegExpExec, NULL);
 	vm_reg_native(vm, cls, "toString()", native_RegExpToString, NULL);
 	vm_reg_var(vm, cls, SYMKEY_TOSTRINGTAG, var_new_str(vm, "RegExp"), true);
+	/* RegExp.prototype accessors (ES 22.2.5.1-10): instances shadow them with
+	 * own data props; these serve RegExp.prototype and any bare inheritor,
+	 * matching Chrome's values AND its accessor-descriptor shape. */
+	{
+		int i;
+		for(i = 0; i < 10; i++) {
+			char decl[40];
+			snprintf(decl, sizeof(decl), "get %s()", re_proto_acc[i]);
+			vm_reg_native(vm, cls, decl, native_RegExp_get_acc, (void*)(intptr_t)i);
+		}
+	}
 }
 
 #ifdef __cplusplus

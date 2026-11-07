@@ -45,6 +45,19 @@ static var_t* native_bound_call(vm_t* vm, var_t* env, void* data) {
 	var_t* thisArg = var_find_own_member_var(bound, BIND_THIS);
 	var_t* preArgs = var_find_own_member_var(bound, BIND_ARGS);
 
+	/* `new BoundFn(...)`: per spec a bound function's [[Construct]] ignores the
+	 * captured thisArg and constructs through the target. do_new creates the
+	 * fresh instance (env's THIS) and marks the call by binding "@new.target"
+	 * into env before the native runs (mario.c func_call), so when that marker is
+	 * present run the target against the fresh instance instead of the pinned
+	 * this - a script constructor's field assignments then land on it and do_new
+	 * keeps the instance (the target returns undefined). */
+	if(var_find_own_member_var(env, "@new.target") != NULL) {
+		var_t* self = get_obj(env, THIS);
+		if(self != NULL)
+			thisArg = self;
+	}
+
 	/* Hold the captured values across the inner call: mario_apply_var runs the
 	 * target (a nested vm_run where an opportunistic gc may fire) and these are
 	 * bare C pointers until it returns. An extra ref keeps each alive regardless
@@ -121,6 +134,33 @@ var_t* native_Function_bind(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* target = get_obj(env, THIS);
 	if(!var_is_callable(target)) {
+		/* DIAG (temp): who binds a non-callable - taobao fireyejs
+		 * `t=v(s,l[20],null,3)` threw this; print the target and the
+		 * scope-chain binding of `l` (incl. its [20] slot). */
+		if(getenv("MARIO_BINDDBG") != NULL) {
+			fprintf(stderr, "[binddbg] target not callable pc=%u type=%u is_func=%u refs=%u members=%u\n",
+				(unsigned)vm->pc, (unsigned)target->type, (unsigned)target->is_func,
+				(unsigned)target->refs, (unsigned)hash_map_size(&target->children));
+			var_t* fn = var_find_own_member_var(target, "@@fname");
+			if(fn != NULL && fn->type == V_STRING)
+				fprintf(stderr, "[binddbg]   fname=[%s]\n", var_get_str(fn));
+			int si;
+			for(si = vm->scope_stack_top - 1; si >= 0 && si >= vm->scope_stack_top - 6; si--) {
+				scope_t* sc = vm->scope_stack[si];
+				if(sc == NULL || sc->var == NULL) continue;
+				node_t* nd = var_find_own_member(sc->var, "l");
+				fprintf(stderr, "[binddbg]   scope[%d] l:%s t=%u\n", si,
+					(nd != NULL && nd->var != NULL) ? "yes" : "no",
+					(unsigned)((nd != NULL && nd->var != NULL) ? nd->var->type : 999u));
+				if(nd != NULL && nd->var != NULL) {
+					node_t* e = var_find_own_member(nd->var, "20");
+					fprintf(stderr, "[binddbg]     l[20] t=%u f=%u refs=%u\n",
+						(unsigned)(e != NULL ? e->var->type : 999u),
+						(unsigned)((e != NULL && e->var != NULL) ? e->var->is_func : 0u),
+						(unsigned)((e != NULL && e->var != NULL) ? e->var->refs : 0u));
+				}
+			}
+		}
 		vm_throw_type_native(vm, "TypeError", "bind target is not callable");
 		return var_new(vm);
 	}
@@ -170,39 +210,54 @@ var_t* native_Function_bind(vm_t* vm, var_t* env, void* data) {
 	node_t* ln = var_add(bound, "length", var_new_int(vm, blen));
 	ln->invisable = 1; ln->be_unenumerable = 1;
 
+	/* Spec (ES2015+): a bound function's `name` is "bound " + the target's name
+	 * (re-binding a bound function therefore stacks the prefix, matching Chrome).
+	 * Resolve the target's name the way Function.prototype.toString does: an own
+	 * "name" member wins, else the compiler-recorded "@@fname". Pin it as a hidden
+	 * own member like "length" so `bf.name` reads correctly without leaking into
+	 * enumeration. */
+	const char* tname = "";
+	var_t* tnv = var_find_own_member_var(target, "name");
+	if(tnv != NULL && tnv->type == V_STRING) {
+		tname = var_get_str(tnv);
+	} else {
+		tnv = var_find_own_member_var(target, "@@fname");
+		if(tnv != NULL && tnv->type == V_STRING)
+			tname = var_get_str(tnv);
+	}
+	/* Script functions carry no @@fname/name member; fall back to the source name
+	 * the compiler stashed for self-binding (mirrors do_get's `.name` path). */
+	if(tname[0] == 0) {
+		func_t* tfn = var_get_func(target);
+		if(tfn != NULL && tfn->nfe_name != NULL)
+			tname = tfn->nfe_name;
+	}
+	char nbuf[256];
+	snprintf(nbuf, sizeof(nbuf), "bound %s", tname);
+	node_t* nm = var_add(bound, "name", var_new_str(vm, nbuf));
+	nm->invisable = 1; nm->be_unenumerable = 1;
+
 	return bound;   // refs==0 baseline; func_call adopts it
 }
 
 /* Function.prototype.toString(): natives render with the "[native code]"
  * marker (core-js's inspectSource keys off it to trust builtins and skip
- * polyfilling them); script functions keep their declared name with a
- * bytecode placeholder body - mario compiles to bytecode and does not retain
- * source text. The name comes from the own "name" member when a library set
- * one, else the hidden @@fname recorded at native registration. */
+ * polyfilling them); script functions return their exact source text when
+ * available (browser parity), falling back to a bytecode placeholder for
+ * functions compiled from sub-lexers or arrow shorthand. */
 var_t* native_Function_toString(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* self = get_obj(env, THIS);
 	/* Class values are callable in a real engine (is_class), so accept them:
 	 * core-js's inspectSource/stringifying paths probe classes through here. */
 	if(self == NULL || (!self->is_func && !self->is_class)) {
-		fprintf(stderr, "[Function.toString] script=%s invalid this=%p type=%u is_func=%u is_class=%u refs=%u proxy=%u name=%s fname=%s proto=%p\n",
-			vm->dbg_tag != NULL ? vm->dbg_tag : "-",
-			(void*)self, (unsigned)(self != NULL ? self->type : 999u),
-			(unsigned)(self != NULL ? self->is_func : 0u),
-			(unsigned)(self != NULL ? self->is_class : 0u),
-			(unsigned)(self != NULL ? self->refs : 0u),
-			(unsigned)(self != NULL && var_is_proxy(self)),
-			(self != NULL && var_find_own_member_var(self, "name") != NULL && var_find_own_member_var(self, "name")->type == V_STRING) ? var_get_str(var_find_own_member_var(self, "name")) : "-",
-			(self != NULL && var_find_own_member_var(self, "@@fname") != NULL && var_find_own_member_var(self, "@@fname")->type == V_STRING) ? var_get_str(var_find_own_member_var(self, "@@fname")) : "-",
-			(void*)(self != NULL ? var_get_prototype(self) : NULL));
-		{
-			void bc_dump_window(bytecode_t* bc, PC center, PC radius);
-			bc_dump_window(&vm->bc, vm->pc, 12);
-		}
 		vm_throw_type_native(vm, "TypeError", "Function.prototype.toString requires that 'this' be a Function");
 		return var_new(vm);
 	}
 	func_t* f = var_get_func(self);
+	/* Source text available: return verbatim (browser parity). */
+	if(f != NULL && f->src_text != NULL)
+		return var_new_str(vm, f->src_text);
 	const char* nm = "";
 	var_t* nv = var_find_own_member_var(self, "name");
 	if(nv != NULL && nv->type == V_STRING)
@@ -224,9 +279,48 @@ static var_t* native_Function_protoCall(vm_t* vm, var_t* env, void* data) {
 return NULL;
 }
 
+/* Function(...args, body) / new Function(...args, body): compile a fresh
+ * function in the GLOBAL scope (ES 19.2.1.1.1 - CreatedAsyncFunction/Function
+ * always use the global env, never the caller's), with the leading arguments
+ * as parameter names and the last as the body. Reuses the eval compile path
+ * (vm_load_run_native) by assigning the function expression into a hidden
+ * global, reading it back, then deleting the key so no foreign global leaks
+ * into fingerprint scans. '@' is not a legal identifier start here, so use a
+ * $_-prefixed collision-proof key. */
+#define FNCTOR_KEY "__$mario_fnctor$__"
+static var_t* native_Function_constructor(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	uint32_t n = get_func_args_num(env);
+	mstr_t* code = mstr_new(FNCTOR_KEY " = function(");
+	for(uint32_t i = 0; i + 1 < n; i++) {
+		var_t* p = get_func_arg(env, (int)i);
+		if(i > 0) mstr_add(code, ',');
+		if(p != NULL && p->type == V_STRING) mstr_append(code, var_get_str(p));
+	}
+	mstr_append(code, "){\n");
+	var_t* b = (n > 0) ? get_func_arg(env, (int)(n - 1)) : NULL;
+	if(b != NULL && b->type == V_STRING) mstr_append(code, var_get_str(b));
+	mstr_append(code, "\n};");
+	extern void js_compile_set_quiet(bool quiet);
+	js_compile_set_quiet(true);
+	bool ok = vm_load_run_native(vm, code->cstr);
+	js_compile_set_quiet(false);
+	mstr_free(code);
+	if(!ok) {
+		vm_throw_type_native(vm, "SyntaxError", "malformed Function constructor body");
+		return var_new(vm);
+	}
+	var_t* fn = var_find_own_member_var(vm->root, FNCTOR_KEY);
+	if(fn == NULL) return var_new(vm);
+	var_ref(fn);                       // root across the delete below
+	var_delete_own_member(vm->root, FNCTOR_KEY);
+	return fn;                         // one ref handed to the caller
+}
+
 void reg_native_Function(vm_t* vm) {
 	var_t* cls = vm_new_class(vm, CLS_FUNCTION);
 	vm->builtin_vars.var_Function = cls;
+	vm_reg_native(vm, cls, "constructor()#1", native_Function_constructor, NULL);
 	vm_reg_native(vm, cls, "call(thisArg)", native_Function_call, NULL);
 	vm_reg_native(vm, cls, "apply(thisArg, args)", native_Function_apply, NULL);
 	vm_reg_native(vm, cls, "bind(thisArg)", native_Function_bind, NULL);

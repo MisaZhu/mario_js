@@ -3,6 +3,8 @@
 #include "host_task.h"
 #include "bcdump/bcdump.h"
 #include "Process/native_Process.h"
+#include "Buffer/native_Buffer.h"
+#include "EventEmitter/native_EventEmitter.h"
 
 #include <unistd.h>
 #include <stdlib.h>
@@ -50,6 +52,17 @@ load extra native libs.
 void reg_all_natives(vm_t* vm);
 
 void init_args(vm_t* vm, int argc, char** argv) {
+	/* Install the Node.js-only globals (`process`, `Buffer`, `EventEmitter`) for
+	 * the CLI ONLY. They are deliberately absent from the browser embedder (see
+	 * reg_natives in natives.c): a real browser page must observe
+	 * `typeof process/Buffer/EventEmitter === "undefined"`, and leaking them
+	 * there is a non-browser fingerprint that page-side anti-bot VMPs detect.
+	 * These must run after vm_init/reg_all_natives (which caches the builtin
+	 * String/Object prototypes) and before native_Process_set_argv refreshes
+	 * process.argv from _args. */
+	reg_native_Process(vm);
+	reg_native_Buffer(vm);
+	reg_native_EventEmitter(vm);
 	var_t* args = var_new_array(vm);
 	int i;
 	for(i=0; i<argc; i++) {

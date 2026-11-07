@@ -964,6 +964,122 @@ var_t* native_Object_proto_propEnum(vm_t* vm, var_t* env, void* data) {
         return var_new_bool(vm, (n != NULL && n->be_unenumerable == 0 && n->invisable == 0));
 }
 
+/* ---- Annex B legacy accessor methods -------------------------------------
+ * Object.prototype.__defineGetter__/__defineSetter__/__lookupGetter__/
+ * __lookupSetter__. Legacy sites still call these - Baidu Maps invokes
+ * __defineSetter__ on the Event constructor during bootstrap, and mario had
+ * none of them, so the member lookup threw "can not find function
+ * '__defineSetter__'" and aborted the whole page script (the map never
+ * rendered). The define pair routes through the same descriptor primitive as
+ * Object.defineProperty; the counterpart accessor already installed at the key
+ * is merged in, so installing a setter keeps a pre-existing getter (and vice
+ * versa), matching ValidateAndApplyPropertyDescriptor. */
+
+/* Recover the existing OWN accessor wrappers for `prop` on `obj`. Either output
+ * may be NULL. The getter wrapper is the primary node var; the setter hangs off
+ * it under FUNC_SETTER_KEY (see mario_define_default's accessor layout). A data
+ * property or an absent key leaves both outputs NULL. */
+static void obj_lookup_own_accessors(var_t* obj, const char* prop,
+                                     var_t** getter_out, var_t** setter_out) {
+        if(getter_out != NULL) *getter_out = NULL;
+        if(setter_out != NULL) *setter_out = NULL;
+        if(obj == NULL || prop == NULL)
+                return;
+        node_t* n = var_find_own_member(obj, prop);
+        if(n == NULL || n->var == NULL || !n->var->is_func)
+                return;
+        func_t* nf = var_get_func(n->var);
+        if(nf == NULL || (nf->regular != FUNC_GETTER && nf->regular != FUNC_SETTER))
+                return;
+        if(nf->regular == FUNC_GETTER) {
+                if(getter_out != NULL) *getter_out = n->var;
+                if(setter_out != NULL) *setter_out = get_obj(n->var, FUNC_SETTER_KEY);
+        }
+        else {
+                if(setter_out != NULL) *setter_out = n->var;
+        }
+}
+
+static var_t* obj_legacy_define_accessor(vm_t* vm, var_t* env, bool is_setter) {
+        var_t* self = get_obj(env, THIS);
+        const char* prop = get_str(env, "prop");
+        var_t* func = get_obj(env, is_setter ? "setter" : "getter");
+        if(self == NULL || prop == NULL || func == NULL)
+                return var_new(vm); /* spec: returns undefined */
+        /* Preserve the counterpart accessor already installed at `prop`. */
+        var_t* exist_get = NULL, *exist_set = NULL;
+        obj_lookup_own_accessors(self, prop, &exist_get, &exist_set);
+        var_t* getter = is_setter ? exist_get : func;
+        var_t* setter = is_setter ? func : exist_set;
+        var_t* desc = new_plain_obj(vm);
+        /* A preserved counterpart is an accessor wrapper (func_t.regular ==
+         * FUNC_GETTER/FUNC_SETTER); report it as a plain FUNC_REGULAR forwarder
+         * so the descriptor's get/set holds a callable rather than auto-invoking
+         * on read (same trick getOwnPropertyDescriptor uses). The freshly-passed
+         * `func` is already an ordinary callable and is stored as-is. */
+        if(getter != NULL) {
+                var_t* gw = (getter == func) ? getter : vm_accessor_as_data_func(vm, getter);
+                var_add(desc, "get", (gw != NULL) ? gw : var_new(vm));
+        }
+        if(setter != NULL) {
+                var_t* sw = (setter == func) ? setter : vm_accessor_as_data_func(vm, setter);
+                var_add(desc, "set", (sw != NULL) ? sw : var_new(vm));
+        }
+        var_add(desc, "enumerable", var_new_bool(vm, true));
+        var_add(desc, "configurable", var_new_bool(vm, true));
+        var_t* keyv = var_new_str(vm, prop);
+        var_ref(keyv);                       // own the key string across the call
+        mario_define_property_var(vm, self, keyv, desc);
+        var_unref(keyv);
+        var_unref(desc);                     // temp descriptor, refs==0 baseline
+        return var_new(vm); /* spec: returns undefined */
+}
+
+static var_t* obj_legacy_lookup_accessor(vm_t* vm, var_t* env, bool want_setter) {
+        var_t* self = get_obj(env, THIS);
+        const char* prop = get_str(env, "prop");
+        if(self == NULL || prop == NULL)
+                return var_new(vm);
+        var_t* cur = self;
+        int guard = 0;
+        while(cur != NULL && guard++ < 100000) {
+                if(var_find_own_member(cur, prop) != NULL) {
+                        /* Own property found: return the requested accessor if it
+                         * is one, else undefined (spec stops at the first own hit). */
+                        var_t* g = NULL, *s = NULL;
+                        obj_lookup_own_accessors(cur, prop, &g, &s);
+                        var_t* acc = want_setter ? s : g;
+                        if(acc != NULL) {
+                                var_t* d = vm_accessor_as_data_func(vm, acc);
+                                return (d != NULL) ? d : var_new(vm);
+                        }
+                        return var_new(vm);
+                }
+                cur = obj_proto_link(vm, cur);
+        }
+        return var_new(vm);
+}
+
+var_t* native_Object_proto_defineGetter(vm_t* vm, var_t* env, void* data) {
+        (void)data;
+        return obj_legacy_define_accessor(vm, env, false);
+}
+
+var_t* native_Object_proto_defineSetter(vm_t* vm, var_t* env, void* data) {
+        (void)data;
+        return obj_legacy_define_accessor(vm, env, true);
+}
+
+var_t* native_Object_proto_lookupGetter(vm_t* vm, var_t* env, void* data) {
+        (void)data;
+        return obj_legacy_lookup_accessor(vm, env, false);
+}
+
+var_t* native_Object_proto_lookupSetter(vm_t* vm, var_t* env, void* data) {
+        (void)data;
+        return obj_legacy_lookup_accessor(vm, env, true);
+}
+
 /* Object(value) coercion (spec): `new Object()` / `Object(null|undefined)`
  * yields the fresh object; an object argument - symbols included, they are
  * V_OBJECT in mario - is returned AS IS, so `Object(sym) instanceof Symbol`
@@ -1038,6 +1154,12 @@ void reg_native_Object(vm_t* vm) {
 	vm_reg_native(vm, cls, "hasOwnProperty(name)", native_Object_hasOwnProperty, NULL);
 	vm_reg_native(vm, cls, "isPrototypeOf(v)", native_Object_proto_isPrototypeOf, NULL);
 	vm_reg_native(vm, cls, "propertyIsEnumerable(k)", native_Object_proto_propEnum, NULL);
+	/* Annex B legacy accessors, inherited by every object (Baidu Maps calls
+	 * __defineSetter__ on the Event constructor during bootstrap). */
+	vm_reg_native(vm, cls, "__defineGetter__(prop, getter)", native_Object_proto_defineGetter, NULL);
+	vm_reg_native(vm, cls, "__defineSetter__(prop, setter)", native_Object_proto_defineSetter, NULL);
+	vm_reg_native(vm, cls, "__lookupGetter__(prop)", native_Object_proto_lookupGetter, NULL);
+	vm_reg_native(vm, cls, "__lookupSetter__(prop)", native_Object_proto_lookupSetter, NULL);
 	vm_reg_native(vm, NULL, "__obj_rest(src, excluded)", native_obj_rest, NULL);
 	/* for-in lowering (stmt_for_in) calls this by INSTR_CALL "__enum_keys$1". */
 	vm_reg_native(vm, NULL, "__enum_keys(o)", native_enum_keys, NULL);

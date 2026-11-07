@@ -183,6 +183,25 @@ void reg_native_Symbol(vm_t* vm) {
      * is_func fallbacks in find_func/do_get. */
     var_set_prototype(symfn, proto);
 
+    /* Chrome parity for the Symbol prototype brand, which the taobao baxia VMP
+     * probes during its environment fingerprint:
+     *  - `Symbol.prototype.constructor === Symbol` (the internal _Symbol_ class
+     *    set proto.constructor to itself, so `sym.constructor === Symbol` was
+     *    false); repoint it at the public callable.
+     *  - `Object.prototype.toString.call(sym) === "[object Symbol]"`: the
+     *    Object.prototype.toString else-branch reads @@toStringTag off the proto
+     *    chain, so brand Symbol.prototype. Without it every symbol rendered
+     *    "[object Object]".
+     * constructor stays a normal (non-invisible) unenumerable member so
+     * `sym.constructor` resolves; the symbol-keyed @@toStringTag is hidden like
+     * the DOM brand members. */
+    {
+        node_t* cn = var_add(proto, "constructor", symfn);
+        if (cn != NULL) cn->be_unenumerable = 1;
+        node_t* tt = var_add(proto, SYMKEY_TOSTRINGTAG, var_new_str(vm, "Symbol"));
+        if (tt != NULL) { tt->be_unenumerable = 1; tt->invisable = 1; }
+    }
+
     /* registry backing Symbol.for()/keyFor(); rooted via the Symbol function. */
     var_t* registry = var_new_obj_no_proto(vm, NULL, NULL);
     node_t* rn = var_add(symfn, "@@registry", registry);

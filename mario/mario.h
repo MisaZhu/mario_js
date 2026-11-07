@@ -87,6 +87,7 @@ hash_map_t* hash_map_new(void);
 void        hash_map_free(hash_map_t* map, free_func_t free_key, free_func_t free_value);
 void        hash_map_init(hash_map_t* map);
 void        hash_map_add(hash_map_t* map, const char* key, void* value);
+void        mario_mapdbg(const char* tag, uint32_t a, uint32_t b); /* env MARIO_MAPDBG */
 void        hash_map_add_fresh(hash_map_t* map, const char* key, void* value); /* key verified absent by caller */
 void*       hash_map_get(hash_map_t* map, const char* key);
 void*       hash_map_remove(hash_map_t* map, const char* key);
@@ -203,13 +204,21 @@ typedef struct st_bytecode {
 	PC                 *code_buf;
 	uint32_t            buf_size;
 	PC                  jmptgt_marked; /* code_buf[0..jmptgt_marked) scanned for jump targets */
-	/* Opt-in (MARIO_SRCMAP=1) statement-level pc -> source-offset map used by
-	 * the uncaught-error report to point into minified bundles. */
+	/* Statement-level pc -> source-offset map. Always on: Error.stack parity
+	 * (V8 "url:line:col" frames) needs line/col at throw time, and the uncaught
+	 * error report uses it to point into minified bundles. */
 	struct st_bc_srcmap_ent { PC pc; uint32_t pos; uint32_t src; } *srcmap;
 	uint32_t            srcmap_size, srcmap_max;
 	m_array_t           srcs;          /* private copies of every compiled source (char*) */
+	m_array_t           src_urls;      /* parallel to srcs: the script URL (char*) for Error.stack */
 	uint32_t            srcmap_cur;    /* id of the source being compiled */
 	bool                srcmap_on;
+	/* Function source spans for Function.prototype.toString parity: records
+	 * (body-entry-pc, src-index, start-offset, end-offset) for every function
+	 * compiled from the main source. func_def looks up the span by func->pc and
+	 * materializes the source slice into func_t.src_text. */
+	struct st_bc_fspan_ent { PC entry_pc; uint32_t src; uint32_t start; uint32_t end; } *fspans;
+	uint32_t            fspans_size, fspans_max;
 	/* Set by the compiler when the source just compiled carries top-level
 	 * import/export syntax, i.e. the chunk is an ES module body: vm_load_run
 	 * then gives it its own module scope (and an export namespace) so two
@@ -452,16 +461,35 @@ void        bc_set_instr(bytecode_t* bc, PC anchor, opr_code_t op, PC target);
 void        bc_remove_instr(bytecode_t* bc, PC from, uint32_t num);
 uint32_t    bc_getstrindex(bytecode_t* bc, const char* str);
 uint32_t    bc_addstr(bytecode_t* bc, char* owned_str); /* append (takes ownership) + index */
-/* pc -> source map (no-ops unless MARIO_SRCMAP is set in the environment) */
+/* pc -> source map (always on; feeds Error.stack V8 frames + error report) */
 void        bc_srcmap_begin(bytecode_t* bc, const char* src);       /* new source being compiled */
 void        bc_srcmap_add(bytecode_t* bc, PC pc, uint32_t pos);     /* statement starts at pos */
+/* Function source span recording (Function.prototype.toString parity) */
+void        bc_fspan_add(bytecode_t* bc, PC entry_pc, uint32_t src, uint32_t start, uint32_t end);
 bool        bc_srcmap_locate(bytecode_t* bc, PC pc, mstr_t* out);   /* "src#n line:col | snippet" */
+/* V8-parity frame location: resolves pc to (url, line, col). url points into
+ * bc->src_urls (do not free); returns false when unmappable. */
+bool        bc_srcmap_locate_v8(bytecode_t* bc, PC pc, const char** url, int* line, int* col);
+/* Set the URL attributed to the NEXT bc_srcmap_begin (the browser passes the
+ * script's absolute URL before each vm_load_run). NULL/"" -> "<anonymous>". */
+void        mario_set_script_url(const char* url);
 const char* mario_last_throw_loc(void);   /* DIAG: source trace of the most recent throw (MARIO_SRCMAP) */
 /* Error.stack trace captured at construction: malloc'd string, caller frees.
  * (struct st_vm is vm_t, typedef'd further down; the forward tag keeps this
  * prototype valid at its position.) */
 struct st_vm;
 char* mario_format_stack(struct st_vm* vm, const char* msg);
+/* One captured JS stack frame for V8-style structured stack traces
+ * (Error.prepareStackTrace / captureStackTrace CallSite objects). name/url point
+ * into VM-owned strings valid only for the duration of the call. */
+typedef struct mario_frame {
+	const char* name;   /* function name, or NULL when anonymous */
+	const char* url;    /* source url, or NULL when unmapped */
+	int line;
+	int col;
+} mario_frame_t;
+/* Fill up to `max` frames (innermost first); returns the count written. */
+int mario_stack_frames(struct st_vm* vm, mario_frame_t* out, int max);
 PC          bc_add_instr(bytecode_t* bc, PC anchor, opr_code_t op, PC target);
 PC          bc_reserve(bytecode_t* bc);
 
@@ -686,6 +714,16 @@ typedef struct st_func {
 	 * at the module registry's own key string (stable, not owned here). */
 	const char*         module_spec;
 	m_array_t           args; //argument names
+	/* Explicit Function.prototype.length override for native functions, or -1 to
+	 * fall back to args.size (the declared parameter count). A native's spec
+	 * "length" is the number of formal parameters BEFORE the first optional one,
+	 * which is frequently smaller than the full parameter list it actually reads
+	 * positionally (Array.from.length===1 though it takes mapFn/thisArg; fill===2;
+	 * String.prototype.includes===1). Natives fetch arguments by index via
+	 * get_func_arg, so the declared names stay pure documentation and the true
+	 * arity is set from the decl's trailing "#N" marker in reg_native_to. JS
+	 * functions keep -1 and report args.size as before. */
+	int16_t             decl_length;
 	/* Hoisted `var` locals of the body, in source order (collected from the
 	 * INSTR_FUNCLOC header metadata by func_def). Slot k of the scope pslot
 	 * cache aliases (args ++ locals)[k]; scope_fill_pslots pre-creates these
@@ -744,6 +782,12 @@ typedef struct st_func {
 	 * array only when this is set (JS functions; natives keep the arg_num>0
 	 * rule). Zeroed by func_new's memset. */
 	uint8_t             uses_arguments;
+	/* Function.prototype.toString source text: the exact source slice of this
+	 * function's definition (from `function`/`async` keyword through closing `}`).
+	 * Set by func_def from the bytecode's fspan table; owned (mario_malloc'd),
+	 * freed in func_free(). NULL for native functions and for functions compiled
+	 * from captured/sub-lexer text where span tracking is unavailable. */
+	char*               src_text;
 	void*               jit_code;
 } func_t;
 
@@ -1273,6 +1317,11 @@ var_t*      var_new_obj(vm_t* vm, var_t* proto, void*p, free_func_t fr);
 var_t*      var_new_float(vm_t* vm, float i);
 var_t*      var_new_str(vm_t* vm, const char* s);
 var_t*      var_new_str2(vm_t* vm, const char* s, uint32_t len);
+/* Binary-safe string ctor: copies exactly `len` bytes INCLUDING embedded NUL
+ * (U+0000 is a valid code unit; String.fromCharCode/atob byte buffers rely on
+ * it). var_new_str/var_new_str2 stop at the first NUL and must not be used for
+ * byte buffers. Sets size=len and NUL-terminates at [len] for C compat. */
+var_t*      var_new_str_bin(vm_t* vm, const char* s, uint32_t len);
 const char* var_get_str(var_t* var);
 var_t*      var_set_str(var_t* var, const char* v);
 int         var_get_int(var_t* var);

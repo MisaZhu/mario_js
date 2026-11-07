@@ -62,6 +62,17 @@ static inline void load_basic_classes(vm_t* vm) {
 	 * vm->root, matching how a JS global value binding behaves. */
 	vm_reg_var(vm, NULL, "Infinity", var_new_float(vm, (float)INFINITY), true);
 	vm_reg_var(vm, NULL, "NaN", var_new_float(vm, (float)NAN), true);
+	/* `undefined` is also an OWN property of the global object (ES 27.1.1: the
+	 * global value properties undefined/NaN/Infinity are all non-writable,
+	 * non-enumerable, non-configurable own data properties). The keyword path only
+	 * resolves a BARE `undefined` identifier; without an own member, `"undefined"
+	 * in globalThis`, `hasOwnProperty(globalThis,"undefined")` and
+	 * `getOwnPropertyDescriptor(globalThis,"undefined")` all report absent, whereas
+	 * Chrome reports present. Anti-bot VMPs (baxia et_f/fireye) decode the name
+	 * "undefined" and dispatch `name in globalThis ? globalThis[name] : throw
+	 * ReferenceError(name+" is not defined")`, so the missing own property made the
+	 * `in` check false and threw a fatal "undefined is not defined". */
+	vm_reg_var(vm, NULL, "undefined", var_new(vm), true);
 	vm_reg_native(vm, NULL, "Boolean(value)", native_Boolean_call, NULL);
 
 	/* Boolean primitives need a prototype chain so `false.toString()` / `x.valueOf()`

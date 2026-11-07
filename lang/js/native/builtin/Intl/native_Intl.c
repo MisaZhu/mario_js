@@ -8,6 +8,7 @@ extern "C" {
 #include <string.h>  /* memset, strcmp */
 #include <stdlib.h>
 #include <math.h>    /* isnan, floor, round */
+#include <unistd.h>  /* readlink */
 
 /* ECMA-402 `Intl` for the en-US locale: enough of DateTimeFormat /
  * NumberFormat / RelativeTimeFormat / ListFormat / Collator / PluralRules to
@@ -17,6 +18,32 @@ extern "C" {
 
 #define INTL_OPTS   "@@opts"    /* hidden: the options object passed to ctor */
 #define INTL_LOCALE "@@locale"  /* hidden: requested locale string */
+
+/* The IANA zone the host C library actually formats local time in. Date's
+ * getTimezoneOffset()/local getters use localtime_r, so resolvedOptions() must
+ * report the MATCHING zone (as Chrome does); hardcoding "UTC" while the offset
+ * is e.g. -480 is exactly the inconsistency anti-bot fingerprinting reads. */
+static const char* intl_system_tz(void) {
+	static char buf[64];
+	static int  done = 0;
+	if(done) return buf[0] ? buf : "UTC";
+	done = 1;
+	buf[0] = 0;
+	const char* tz = getenv("TZ");
+	if(tz != NULL && tz[0] == ':') tz++;
+	if(tz != NULL && strchr(tz, '/') != NULL) {
+		snprintf(buf, sizeof(buf), "%s", tz);
+		return buf;
+	}
+	char link[256];
+	ssize_t n = readlink("/etc/localtime", link, sizeof(link) - 1);
+	if(n > 0) {
+		link[n] = 0;
+		char* z = strstr(link, "zoneinfo/");
+		if(z != NULL) { snprintf(buf, sizeof(buf), "%s", z + 9); return buf; }
+	}
+	return "UTC";
+}
 
 /*===== TZ-aware civil-calendar math (same algorithms as native_Date.c) =====*/
 
@@ -418,7 +445,7 @@ var_t* native_intl_dtf_resolvedOptions(vm_t* vm, var_t* env, void* data) {
 	        var_get_str(var_find_member_var(self, INTL_LOCALE)) : "en-US"));
 	var_add(o, "calendar", var_new_str(vm, "gregory"));
 	var_add(o, "numberingSystem", var_new_str(vm, "latn"));
-	var_add(o, "timeZone", var_new_str(vm, "UTC"));
+	var_add(o, "timeZone", var_new_str(vm, intl_system_tz()));
 	const char* keys[] = {"weekday","year","month","day","hour","minute","second","timeZoneName"};
 	size_t k;
 	for(k = 0; k < sizeof(keys)/sizeof(keys[0]); k++) {

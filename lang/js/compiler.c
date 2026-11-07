@@ -597,12 +597,21 @@ typedef struct defer_list_s {
 } defer_list_t;
 static defer_list_t* g_defer_cur = NULL; /* innermost active hoist frame */
 
+/* Function.toString source span: start offset of the `function`/`async` keyword
+ * for the function currently being compiled. Set by callers of factor_def_func
+ * before consuming the keyword; consumed at entry of func_params_and_body. */
+static int32_t g_func_src_start = -1;
+
 static bool skip_advance(lex_t* l, uint32_t* prev);
 static bool lex_had_newline(lex_t* l);
 bool factor_def_func(lex_t* l, bytecode_t* bc, mstr_t* name);
 bool lex_chkread(lex_t* lex, uint32_t expected_tk);
 bool lex_skip_empty(lex_t* l);
 static int g_async_pending; /* tentative; defined with the async-depth state below */
+static int g_func_selfname; /* tentative; defined near factor_def_func below. Also set
+                             * for function DECLARATIONS (not only NFEs) so the VM records
+                             * func_t.nfe_name and `.name`/Error.stack frames carry the
+                             * declared name instead of rendering every frame nameless. */
 
 /* Consume a balanced bracket run at token level: l->tk is the opener, returns
  * with l->tk past the matching closer. Regex/template safe via skip_advance. */
@@ -729,10 +738,34 @@ static bool defer_replay_one(lex_t* l, bytecode_t* bc, const defer_func_t* rec) 
     l->next_ch = l->data[rec->kw_pos + 1];
     lex_get_next_token(l);
     if (l->tk == LEX_R_FUNCTION) {
+        /* Set the span start: for async declarations, scan backwards past
+         * whitespace to include the `async` keyword in the toString span. */
+        if (rec->is_async) {
+            int32_t p = rec->kw_pos - 1;
+            while (p >= 0 && (l->data[p] == ' ' || l->data[p] == '\t' ||
+                   l->data[p] == '\n' || l->data[p] == '\r')) p--;
+            if (p >= 4 && memcmp(l->data + p - 4, "async", 5) == 0)
+                g_func_src_start = p - 4;
+            else
+                g_func_src_start = rec->kw_pos;
+        } else {
+            g_func_src_start = rec->kw_pos;
+        }
         lex_get_next_token(l); /* past `function` */
         if (rec->is_async) g_async_pending = 1; /* consumed by factor_def_func */
         mstr_t* fname = mstr_new("");
+        /* Function DECLARATION: record the declared name on the function object so
+         * `.name` and Error.stack frames are not empty. g_func_selfname makes
+         * factor_def_func emit INSTR_FUNC_NAMED, whose runtime handler stashes the
+         * operand string into func_t.nfe_name (the .name getter and
+         * mario_format_stack both fall back to it). The taobao baxia VMP (et_f.js)
+         * recovers a caller name from a caught Error's stack; a nameless frame
+         * yields "" and the VM aborts via al("") -> empty-name ReferenceError, so
+         * et_f.js never runs to completion and never emits the bx-ua token that
+         * mtop.relationrecommend requires (feed stays a grey skeleton). */
+        g_func_selfname = 1;
         ok = factor_def_func(l, bc, fname);
+        g_func_selfname = 0;
         if (ok) {
             bc_gen_str(bc, INSTR_MEMBERN, fname->cstr);
         }
@@ -755,7 +788,13 @@ static bool defer_replay_one(lex_t* l, bytecode_t* bc, const defer_func_t* rec) 
  * "can this token continue the expression"). Anything unrecognized fails the
  * skip and the caller restores the lexer and compiles via expr_seq. */
 static int g_ses_fb_dbg = -1; /* MARIO_SES_FB: log shape-fallback token kinds */
-static bool skip_expr_stmt_scan(lex_t* l) {
+/* stop_top_comma: when true, a depth-0 ',' in the after-operand position ends
+ * the skip WITHOUT being consumed. Declaration-initializer callers need this
+ * because there the comma is the declarator separator (`var a = 1, b = 2`),
+ * which the declarator loop owns. Every other caller (expression statements,
+ * `return`/`throw` operands, for-loop slots) passes false so a depth-0 comma
+ * is consumed as the comma operator (`throw y = !0, n;`, `a, b;`). */
+static bool skip_expr_stmt_scan(lex_t* l, bool stop_top_comma) {
     uint32_t prev = 0;   /* regex context for skip_advance; 0 = regex allowed */
     int depth = 0;
     bool after_op = false; /* false: expecting an operand; true: after one */
@@ -896,8 +935,18 @@ static bool skip_expr_stmt_scan(lex_t* l) {
             if (!skip_advance(l, &prev)) return false;
             continue;
         }
+        if (tk == ',') {
+            /* Depth-0 comma: a declarator separator when skipping a
+             * declaration initializer (stop, caller owns it), otherwise the
+             * comma operator (consume). Inside brackets it is always an
+             * argument-list / comma-expression separator: consume. */
+            if (stop_top_comma && depth == 0) return true; /* boundary, not consumed */
+            if (!skip_advance(l, &prev)) return false;
+            after_op = false;
+            continue;
+        }
         if (tk == '?' || tk == ':' || tk == LEX_R_AFUNCTION ||
-            tk == LEX_NULLISH || tk == ',') {
+            tk == LEX_NULLISH) {
             if (!skip_advance(l, &prev)) return false;
             after_op = false;
             continue;
@@ -1275,6 +1324,12 @@ static void pslot_emit_loadv(bytecode_t* bc, const char* name) {
 static void pslot_skip_braces(lex_t* l, uint32_t* prev) {
     int d = 1;
     while (d > 0) {
+        /* EOF guard: skip_advance returns true without advancing at EOF, so an
+         * unbalanced run (a brace swallowed as a string/regex/template, or a
+         * truncated script) would spin here forever. Same guard as
+         * skip_balanced_toks. */
+        if (l->tk == LEX_EOF)
+            return;
         if (!skip_advance(l, prev))
             return;
         if (l->tk == '{') d++;
@@ -1292,6 +1347,10 @@ static void pslot_skip_braces(lex_t* l, uint32_t* prev) {
 static void pslot_skip_braces_stay(lex_t* l, uint32_t* prev) {
     int d = 1;
     while (d > 0) {
+        /* EOF guard: see pslot_skip_braces - skip_advance never advances at
+         * EOF, so an unbalanced run would otherwise spin forever. */
+        if (l->tk == LEX_EOF)
+            return;
         if (!skip_advance(l, prev))
             return;
         if (l->tk == '{') d++;
@@ -1805,6 +1864,21 @@ static void pslot_prescan(lex_t* l, pslot_frame_t* f, pslot_frame_t* af) {
     while (l->tk != LEX_EOF) {
         uint32_t tk = l->tk;
         bool in_obj = (btop > 0 && bmode[btop - 1] == 1);
+        if (tk >= LEX_R_IF && tk <= LEX_R_EXPORT &&
+            (ptk == '.' || ptk == LEX_OPTCHAIN)) {
+            /* Property name spelled as a reserved word (`a[1].var`, `p.catch`,
+             * `o.class`, ...): the lexer keeps the keyword token even after a
+             * member-access dot. The declaration/keyword branches below would
+             * mis-scan it - pslot_scan_var on `a[1].var=a[7]` collected the
+             * RHS `a` as a phantom hoisted local (taobao fireyejs rr CPS
+             * loop: LOADP hit the phantom, `a[6]` updates were lost and the
+             * state machine spun forever), and the class/function/catch
+             * branches would swallow real structure. Walk past it as a
+             * plain identifier. */
+            if (!skip_advance(l, &prev)) break;
+            ptk = LEX_ID;
+            continue;
+        }
         if (tk == '{') {
             if (method_cand) {
                 /* `m(...) {` inside an object literal: a method definition.
@@ -2484,6 +2558,7 @@ static void hoist_begin(lex_t* l, bytecode_t* bc, bytecode_t* scratch, bool bloc
     }
     bc_init(scratch);
     scratch->skip_strtab = true;
+    scratch->srcmap_on = false; /* throwaway scan: no Error.stack/srcmap needed */
     *out_redirect = g_funcdecl_bc;
     *out_vardecl = g_vardecl_bc;
     bool saved_quiet = g_hoist_quiet;
@@ -2829,6 +2904,11 @@ static bool func_emit_prelude(bytecode_t* bc, m_array_t* defaults,
  *  Supports ES6 default parameters and a trailing rest parameter. The caller
  *  must already have emitted INSTR_FUNC (or a variant). */
 bool func_params_and_body(lex_t* l, bytecode_t* bc) {
+    /* Consume the function source span start set by our caller (before the
+     * `function`/`async` keyword was lexed). Reset immediately so nested
+     * functions inside the body get their own span from their own callers. */
+    int32_t span_start = g_func_src_start;
+    g_func_src_start = -1;
     /* Hoist scan pass: consume the parameter list and the body at token level
      * and emit nothing. Everything this function would emit lands either in
      * the discarded scratch bytecode (function expressions) or is compiled by
@@ -2931,6 +3011,17 @@ bool func_params_and_body(lex_t* l, bytecode_t* bc) {
         }
     }
     bc_set_instr(bc, pc, INSTR_JMP, ILLEGAL_PC);
+
+    /* Record the function source span for Function.prototype.toString parity.
+     * Only for the main source lexer (not sub-lexers over captured text) and
+     * only when the caller provided a valid start position. */
+    if (span_start >= 0 && l->data == g_srcmap_data && bc->srcs.size > 0) {
+        int32_t span_end = l->tk_last_end; /* position of closing '}' */
+        if (span_end > span_start) {
+            bc_fspan_add(bc, pc + 1, bc->srcmap_cur,
+                         (uint32_t)span_start, (uint32_t)span_end);
+        }
+    }
 
     // free captured parameter metadata
     array_clean(&defaults, free_param_default);
@@ -3580,6 +3671,7 @@ bool factor_new(lex_t* l, bytecode_t* bc) {
      * MemberExpression after `new`. Compile the function value, then the
      * optional argument list; NEWX constructs from the value on the stack. */
     if (l->tk == LEX_R_FUNCTION) {
+        g_func_src_start = l->tk_start;
         if (!lex_chkread(l, LEX_R_FUNCTION)) {
             return false;
         }
@@ -4766,6 +4858,7 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
             return false;
         }
     } else if (l->tk == LEX_R_ASYNC) { // ES async function / async arrow
+        g_func_src_start = l->tk_start; /* span includes 'async' keyword */
         if (!lex_chkread(l, LEX_R_ASYNC)) {
             return false;
         }
@@ -4790,6 +4883,7 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
             }
         }
     } else if (l->tk == LEX_R_FUNCTION) { //define function
+        g_func_src_start = l->tk_start;
         if (!lex_chkread(l, LEX_R_FUNCTION)) {
             return false;
         }
@@ -6287,7 +6381,9 @@ static bool stmt_var_scan(lex_t* l) {
         lex_get_next_token(l);
         if (l->tk == '=') {
             lex_get_next_token(l);
-            if (!skip_expr_stmt_scan(l)) return false;
+            if (!skip_expr_stmt_scan(l, true)) {
+                return false;
+            }
         }
         if (!is_stmt_end(l->tk)) {
             if (l->tk == ',') {
@@ -6883,7 +6979,7 @@ static bool for_scan_var_init(lex_t* l) {
         lex_get_next_token(l);
         if (l->tk == '=') {
             lex_get_next_token(l);
-            if (!skip_expr_stmt_scan(l)) return false;
+            if (!skip_expr_stmt_scan(l, true)) return false;
             /* stops at a depth-0 ','/';'/')' without consuming it */
         }
         if (l->tk == ',') {
@@ -6920,7 +7016,7 @@ static bool stmt_for_scan(lex_t* l, bytecode_t* bc) {
             if (l->tk == LEX_R_IN ||
                 (l->tk == LEX_ID && strcmp(l->tk_str->cstr, "of") == 0)) {
                 lex_get_next_token(l); /* past in/of */
-                if (!skip_expr_stmt_scan(l)) {
+                if (!skip_expr_stmt_scan(l, false)) {
                     return false; /* stops at the depth-0 ')' */
                 }
                 if (l->tk != ')') {
@@ -6936,7 +7032,7 @@ static bool stmt_for_scan(lex_t* l, bytecode_t* bc) {
         } else if (l->tk != end_tk) {
             lex_t sv2 = *l;
             mstr_t* svs2 = tmp_mstr_borrow_m(l->tk_str);
-            if (!skip_expr_stmt_scan(l)) {
+            if (!skip_expr_stmt_scan(l, false)) {
                 *l = sv2;
                 mstr_cpy(l->tk_str, svs2->cstr);
                 tmp_mstr_return(svs2);
@@ -7492,11 +7588,14 @@ bool stmt_function(lex_t* l, bytecode_t* bc) {
     if (func_decl_defer_or_skip(l, bc, false, NULL)) {
         return true;
     }
+    g_func_src_start = l->tk_start;
     if (!lex_chkread(l, LEX_R_FUNCTION)) {
         return false;
     }
     mstr_t* fname = mstr_new("");
+    g_func_selfname = 1; /* declaration: record .name for Error.stack parity (see defer_replay_one) */
     factor_def_func(l, bc, fname);
+    g_func_selfname = 0;
     bc_gen_str(bc, INSTR_MEMBERN, fname->cstr);
     mstr_free(fname);
     return true;
@@ -7856,14 +7955,18 @@ bool stmt_export(lex_t* l, bytecode_t* bc) {
             mstr_free(fname);
             return true;
         }
+        g_func_src_start = l->tk_start;
         if (!lex_chkread(l, LEX_R_FUNCTION)) {
             mstr_free(fname);
             return false;
         }
+        g_func_selfname = 1; /* exported declaration: record .name (see defer_replay_one) */
         if (!factor_def_func(l, dbc, fname)) {
+            g_func_selfname = 0;
             mstr_free(fname);
             return false;
         }
+        g_func_selfname = 0;
         bc_gen_str(dbc, INSTR_MEMBERN, fname->cstr);
         bc_gen_str(bc, INSTR_EXPORT, fname->cstr);
         mstr_free(fname);
@@ -7873,6 +7976,7 @@ bool stmt_export(lex_t* l, bytecode_t* bc) {
     /* export async function f(){} : same hoisting path as the plain form,
      * with g_async_pending marking the body async. */
     if (l->tk == LEX_R_ASYNC) {
+        int32_t async_start = l->tk_start;
         if (!lex_chkread(l, LEX_R_ASYNC)) return false;
         lex_skip_empty(l);
         if (l->tk != LEX_R_FUNCTION) {
@@ -7891,16 +7995,20 @@ bool stmt_export(lex_t* l, bytecode_t* bc) {
             mstr_free(fname);
             return true;
         }
+        g_func_src_start = async_start;
         if (!lex_chkread(l, LEX_R_FUNCTION)) {
             mstr_free(fname);
             return false;
         }
         g_async_pending = 1;
+        g_func_selfname = 1; /* exported async declaration: record .name (see defer_replay_one) */
         if (!factor_def_func(l, dbc, fname)) {
             g_async_pending = 0;
+            g_func_selfname = 0;
             mstr_free(fname);
             return false;
         }
+        g_func_selfname = 0;
         bc_gen_str(dbc, INSTR_MEMBERN, fname->cstr);
         bc_gen_str(bc, INSTR_EXPORT, fname->cstr);
         mstr_free(fname);
@@ -8063,7 +8171,7 @@ bool stmt_return(lex_t* l, bytecode_t* bc) {
         if (!is_stmt_end(l->tk)) {
             lex_t sv = *l;
             mstr_t* svstr = tmp_mstr_borrow_m(l->tk_str);
-            bool ses = skip_expr_stmt_scan(l);
+            bool ses = skip_expr_stmt_scan(l, false);
             if (ses) { GSS(expr_skip_ok); } else { GSS(expr_skip_fb); }
             if (!ses) {
                 *l = sv;
@@ -8113,7 +8221,7 @@ bool stmt_throw(lex_t* l, bytecode_t* bc) {
         GSS(throw);
         lex_t sv = *l;
         mstr_t* svstr = tmp_mstr_borrow_m(l->tk_str);
-        bool ses = skip_expr_stmt_scan(l);
+        bool ses = skip_expr_stmt_scan(l, false);
         if (ses) { GSS(expr_skip_ok); } else { GSS(expr_skip_fb); }
         if (!ses) {
             *l = sv;
@@ -8766,7 +8874,7 @@ bool statement(lex_t* l, bytecode_t* bc) {
             if (g_hoist_scan) {
                 lex_t sv = *l;
                 mstr_t* svstr = tmp_mstr_borrow_m(l->tk_str);
-                bool ses = skip_expr_stmt_scan(l);
+                bool ses = skip_expr_stmt_scan(l, false);
                 if (ses) { GSS(expr_skip_ok); } else { GSS(expr_skip_fb); }
                 if (!ses) {
                     *l = sv;
@@ -8811,7 +8919,7 @@ bool statement(lex_t* l, bytecode_t* bc) {
                  * shape restore the lexer and compile into the scratch. */
                 lex_t sv = *l;
                 mstr_t* svstr = tmp_mstr_borrow_m(l->tk_str);
-                bool ses = skip_expr_stmt_scan(l);
+                bool ses = skip_expr_stmt_scan(l, false);
                 if (ses) { GSS(expr_skip_ok); } else { GSS(expr_skip_fb); }
                 if (!ses) {
                     *l = sv;
@@ -8850,6 +8958,7 @@ bool statement(lex_t* l, bytecode_t* bc) {
     } else if (l->tk == LEX_R_ASYNC) {
         /* `async function name() {...}` declaration, or an async-arrow
          * expression statement. */
+        int32_t async_start = l->tk_start;
         if (!lex_chkread(l, LEX_R_ASYNC)) {
             return false;
         }
@@ -8859,12 +8968,15 @@ bool statement(lex_t* l, bytecode_t* bc) {
             if (func_decl_defer_or_skip(l, dbc, true, NULL)) {
                 /* deferred at scan time / already hoisted by the replay */
             } else {
+                g_func_src_start = async_start;
                 if (!lex_chkread(l, LEX_R_FUNCTION)) {
                     return false;
                 }
                 mstr_t* fname = mstr_new("");
                 g_async_pending = 1;
+                g_func_selfname = 1; /* async declaration: record .name (see defer_replay_one) */
                 factor_def_func(l, dbc, fname);
+                g_func_selfname = 0;
                 bc_gen_str(dbc, INSTR_MEMBERN, fname->cstr);
                 mstr_free(fname);
             }
@@ -8872,7 +8984,7 @@ bool statement(lex_t* l, bytecode_t* bc) {
             if (g_hoist_scan) {
                 lex_t sv = *l;
                 mstr_t* svstr = tmp_mstr_borrow_m(l->tk_str);
-                bool ses = skip_expr_stmt_scan(l);
+                bool ses = skip_expr_stmt_scan(l, false);
                 if (ses) { GSS(expr_skip_ok); } else { GSS(expr_skip_fb); }
                 if (!ses) {
                     *l = sv;
@@ -8909,7 +9021,7 @@ bool statement(lex_t* l, bytecode_t* bc) {
             if (g_hoist_scan) {
                 lex_t sv = *l;
                 mstr_t* svstr = tmp_mstr_borrow_m(l->tk_str);
-                bool ses = skip_expr_stmt_scan(l);
+                bool ses = skip_expr_stmt_scan(l, false);
                 if (ses) { GSS(expr_skip_ok); } else { GSS(expr_skip_fb); }
                 if (!ses) {
                     *l = sv;

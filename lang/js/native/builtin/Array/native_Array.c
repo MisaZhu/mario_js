@@ -6,6 +6,7 @@ extern "C" {
 #include "natives_builtin.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>  /* TEMP DIAGNOSTIC (getenv) */
 #include <math.h>
 
 /** Array */
@@ -66,6 +67,13 @@ var_t* native_Array_constructor(vm_t* vm, var_t* env, void* data) {
  * (freed with it), so every method below may treat `this` as an array. A
  * genuine array is returned as-is. Mutators applied to an array-like therefore
  * only touch the temporary copy, which the ES spec permits us to tolerate. */
+/* Materialisation ceiling: feature probes (core-js polyfill bundles) call
+ * Array methods on synthetic receivers with length = INT32_MAX / Infinity.
+ * Real browsers stay sparse and never iterate the holes, but the dense copy
+ * here would allocate ~2^31 vars and drive the children map into the uint32
+ * malloc-truncation cliff. Legit array-likes (NodeList, arguments, typed
+ * arrays via slice.call) are orders of magnitude below 1M. */
+#define ARRAY_RECV_MAX (1 << 20)
 static var_t* array_recv(vm_t* vm, var_t* env) {
 var_t* t = get_obj(env, THIS);
 if(t == NULL || t->is_array)
@@ -75,6 +83,8 @@ if(t->type == V_STRING || var_is_string_obj(t)) {
 const char* s = var_get_str(t);
 int len = (s != NULL) ? (int)strlen(s) : 0;
 int idx = 0;
+if(len > ARRAY_RECV_MAX) len = ARRAY_RECV_MAX;
+if(len > 100000) mario_mapdbg("array_recv str", (uint32_t)len, 0);
 while(idx < len) {
 unsigned char c = (unsigned char)s[idx];
 int n = (c < 0x80) ? 1 : ((c >> 5) == 0x6) ? 2 : ((c >> 4) == 0xE) ? 3 : ((c >> 3) == 0x1E) ? 4 : 1;
@@ -87,6 +97,8 @@ idx += n;
 var_t* lenv = var_find_member_var(t, "length");
 int32_t n = (lenv != NULL) ? (int32_t)var_get_float(lenv) : 0;
 int32_t i;
+if(n > ARRAY_RECV_MAX) n = ARRAY_RECV_MAX;
+if(n > 100000) mario_mapdbg("array_recv obj", (uint32_t)n, 0);
 for(i=0; i<n; ++i) {
 char key[32];
 snprintf(key, sizeof(key), "%d", i);
@@ -1310,7 +1322,14 @@ var_t* native_Array_sort(vm_t* vm, var_t* env, void* data) {
 var_t* native_Array_iterator(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* this_v = get_obj(env, THIS);
-	return vm_new_array_iterator(vm, this_v); /* refs=0 */
+	var_t* it = vm_new_array_iterator(vm, this_v); /* refs=0 */
+	/* TEMP DIAGNOSTIC (MARIO_TADB): why does the symiter call yield NULL at 909086? */
+	if(getenv("MARIO_TADB") != NULL && vm->pc >= 715843 && vm->pc < 912412)
+		fprintf(stderr, "[tadb-aiter] this=%p this.t=%u isarr=%d varr=%u -> it=%p it.status=%d pc=%u\n",
+			(void*)this_v, (unsigned)(this_v?this_v->type:99), (int)(this_v?this_v->is_array:0),
+			(unsigned)(this_v?var_array_size(this_v):0), (void*)it,
+			(int)(it?it->status:-1), (unsigned)vm->pc);
+	return it;
 }
 
 /* ES2022: Array.prototype.at(index) - supports negative (relative) indices and
@@ -1329,22 +1348,22 @@ var_t* native_Array_at(vm_t* vm, var_t* env, void* data) {
 
 void reg_native_Array(vm_t* vm) {
   var_t* cls = vm_new_class(vm, CLS_ARRAY);
-	vm_reg_native(vm, cls, "constructor()", native_Array_constructor, NULL);
+	vm_reg_native(vm, cls, "constructor()#1", native_Array_constructor, NULL);
 	vm_reg_native(vm, cls, "toString()", native_Array_toString, NULL); 
 	vm_reg_native(vm, cls, "forEach(f)", native_Array_forEach, NULL); 
 	vm_reg_native(vm, cls, "map(f)", native_Array_map, NULL);
 	vm_reg_native(vm, cls, "filter(f)", native_Array_filter, NULL);
-	vm_reg_native(vm, cls, "reduce(f, initial)", native_Array_reduce, NULL);
-	vm_reg_native(vm, cls, "reduceRight(f, initial)", native_Array_reduceRight, NULL);
+	vm_reg_native(vm, cls, "reduce(f, initial)#1", native_Array_reduce, NULL);
+	vm_reg_native(vm, cls, "reduceRight(f, initial)#1", native_Array_reduceRight, NULL);
 	vm_reg_native(vm, cls, "splice(start, deleteCount)", native_Array_splice, NULL);
 	vm_reg_native(vm, cls, "reverse()", native_Array_reverse, NULL); 
-	vm_reg_native(vm, cls, "concat()", native_Array_concat, NULL); 
+	vm_reg_native(vm, cls, "concat()#1", native_Array_concat, NULL); 
 	vm_reg_native(vm, cls, "join(c)", native_Array_join, NULL); 
-	vm_reg_native(vm, cls, "toLocaleString(locale, options)", native_Array_toLocaleString, NULL); 
-	vm_reg_native(vm, cls, "push()", native_Array_push, NULL); 
+	vm_reg_native(vm, cls, "toLocaleString(locale, options)#0", native_Array_toLocaleString, NULL); 
+	vm_reg_native(vm, cls, "push()#1", native_Array_push, NULL); 
 	vm_reg_native(vm, cls, "pop()", native_Array_pop, NULL); 
 	vm_reg_native(vm, cls, "shift()", native_Array_shift, NULL); 
-	vm_reg_native(vm, cls, "unshift()", native_Array_unshift, NULL); 
+	vm_reg_native(vm, cls, "unshift()#1", native_Array_unshift, NULL); 
 	vm_reg_native(vm, cls, "slice(start, end)", native_Array_slice, NULL); 
 	/* ES static, not an instance method: a `class Sub extends Array` resolves
 	 * inherited statics through the is_static-flagged chain in vm_find_in_class,
@@ -1354,7 +1373,7 @@ void reg_native_Array(vm_t* vm) {
 	vm_reg_native(vm, cls, SYMKEY_ITERATOR "()", native_Array_iterator, NULL); 
 
 	/* ES6 statics */
-	vm_reg_static(vm, cls, "from(arrayLike, mapFn, thisArg)", native_Array_from, NULL);
+	vm_reg_static(vm, cls, "from(arrayLike, mapFn, thisArg)#1", native_Array_from, NULL);
 	vm_reg_static(vm, cls, "of()", native_Array_of, NULL);
 
 	/* ES6 prototype methods */
@@ -1362,15 +1381,15 @@ void reg_native_Array(vm_t* vm) {
 	vm_reg_native(vm, cls, "findIndex(f)", native_Array_findIndex, NULL);
 	vm_reg_native(vm, cls, "findLast(f)", native_Array_findLast, NULL);
 	vm_reg_native(vm, cls, "findLastIndex(f)", native_Array_findLastIndex, NULL);
-	vm_reg_native(vm, cls, "includes(search, fromIndex)", native_Array_includes, NULL);
-	vm_reg_native(vm, cls, "indexOf(search, fromIndex)", native_Array_indexOf, NULL);
-	vm_reg_native(vm, cls, "lastIndexOf(search, fromIndex)", native_Array_lastIndexOf, NULL);
-	vm_reg_native(vm, cls, "fill(value, start, end)", native_Array_fill, NULL);
-	vm_reg_native(vm, cls, "copyWithin(target, start, end)", native_Array_copyWithin, NULL);
+	vm_reg_native(vm, cls, "includes(search, fromIndex)#1", native_Array_includes, NULL);
+	vm_reg_native(vm, cls, "indexOf(search, fromIndex)#1", native_Array_indexOf, NULL);
+	vm_reg_native(vm, cls, "lastIndexOf(search, fromIndex)#1", native_Array_lastIndexOf, NULL);
+	vm_reg_native(vm, cls, "fill(value, start, end)#2", native_Array_fill, NULL);
+	vm_reg_native(vm, cls, "copyWithin(target, start, end)#2", native_Array_copyWithin, NULL);
 	vm_reg_native(vm, cls, "entries()", native_Array_entries, NULL);
 	vm_reg_native(vm, cls, "keys()", native_Array_keys, NULL);
 	vm_reg_native(vm, cls, "values()", native_Array_values, NULL);
-	vm_reg_native(vm, cls, "flat(depth)", native_Array_flat, NULL);
+	vm_reg_native(vm, cls, "flat(depth)#0", native_Array_flat, NULL);
 	vm_reg_native(vm, cls, "flatMap(f)", native_Array_flatMap, NULL);
 	vm_reg_native(vm, cls, "some(f)", native_Array_some, NULL);
 	vm_reg_native(vm, cls, "every(f)", native_Array_every, NULL);

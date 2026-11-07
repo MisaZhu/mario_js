@@ -19,6 +19,21 @@ extern "C" {
 #define F_SGN(a)            ((a)>0 ? 1 : ((a)<0 ? -1 : 0 ))
 #define F_RNG(a,min,max)    ((a)<(min) ? min : ((a)>(max) ? max : a ))
 
+/* JS ToNumber for a Math operand. var_get_float64 returns 0 for a non-number
+ * (string/null/undefined/object), so e.g. Math.floor("1.7") yielded 0 instead of
+ * 1 and Math.max("1","2") yielded 0; route those through the exact ECMA ToNumber.
+ * The numeric lanes skip coercion (no alloc, no behaviour change). */
+static double math_tonum(vm_t* vm, var_t* v) {
+	if(v == NULL) return 0.0;
+	switch(v->type) {
+		case V_INT: case V_INT64: case V_FLOAT: case V_FLOAT64:
+		case V_BOOL: case V_BIGINT:
+			return var_get_float64(v);
+		default:
+			return vm_to_number(vm, v);
+	}
+}
+
 /* Box a double as a JS Number. Mario distinguishes the integer lanes (V_INT /
  * V_INT64) from the canonical double (V_FLOAT64), but JS has one Number type:
  * Math.trunc(5.9) must Object.is-match the integer literal 5. Return an integer
@@ -54,7 +69,7 @@ static var_t* math_minmax(vm_t* vm, var_t* a, var_t* b, bool want_min) {
 			return var_new_int(vm, (int)r);
 		return var_new_int64(vm, r);
 	}
-	double da = var_get_float64(a), db = var_get_float64(b);
+	double da = math_tonum(vm, a), db = math_tonum(vm, b);
 	if(da != da) return var_new_float64(vm, da);
 	if(db != db) return var_new_float64(vm, db);
 	double r = want_min ? (da < db ? da : db) : (da > db ? da : db);
@@ -74,7 +89,7 @@ var_t* native_math_abs(vm_t* vm, var_t* env, void *data) {
 	if(v->type == V_INT64)
 		return var_new_int64(vm, (int64_t)F_ABS(var_get_int64(v)));
 	/* float32/float64 (and any coercible input): canonical double magnitude. */
-	return var_new_float64(vm, fabs(var_get_float64(v)));
+	return var_new_float64(vm, fabs(math_tonum(vm, v)));
 }
 
 //Math.round(a) - nearest integer (JS semantics: floor(a + 0.5))
@@ -89,7 +104,7 @@ var_t* native_math_round(vm_t* vm, var_t* env, void *data) {
 		return var_new_int(vm, var_get_int(v));
 	if(v->type == V_INT64)
 		return var_new_int64(vm, var_get_int64(v));
-	return math_num(vm, floor(var_get_float64(v) + 0.5));
+	return math_num(vm, floor(math_tonum(vm, v) + 0.5));
 }
 
 //Math.min(a,b) - returns minimum of two given values 
@@ -140,7 +155,7 @@ var_t* native_math_range(vm_t* vm, var_t* env, void *data) {
 
 	if(varX->type == V_INT && varA->type == V_INT && varB->type == V_INT)
 		return var_new_int(vm, F_RNG(var_get_int(varX), var_get_int(varA), var_get_int(varB)));
-	return var_new_float64(vm, F_RNG(var_get_float64(varX), var_get_float64(varA), var_get_float64(varB)));
+	return var_new_float64(vm, F_RNG(math_tonum(vm, varX), math_tonum(vm, varA), math_tonum(vm, varB)));
 }
 
 //Math.sign(a) - returns sign of given value (-1==negative,0=zero,1=positive)
@@ -157,7 +172,7 @@ var_t* native_math_sign(vm_t* vm, var_t* env, void *data) {
 		int64_t x = var_get_int64(var);
 		return var_new_int(vm, x > 0 ? 1 : (x < 0 ? -1 : 0));
 	}
-	double d = var_get_float64(var);
+	double d = math_tonum(vm, var);
 	if(d != d) return var_new_float64(vm, NAN);
 	if(d > 0) return var_new_float64(vm, 1.0);
 	if(d < 0) return var_new_float64(vm, -1.0);
@@ -303,17 +318,32 @@ var_t* native_math_hypot(vm_t* vm, var_t* env, void *data) {
 	double sum = 0.0;
 	uint32_t i;
 	for(i = 0; i < n; i++) {
-		double v = var_get_float64(get_func_arg(env, i));
+		double v = math_tonum(vm, get_func_arg(env, i));
 		sum += v * v;
 	}
 	return math_num(vm, sqrt(sum));
 }
 
+/* JS ToInt32 for imul operands: truncate toward zero, wrap modulo 2^32 and
+ * reinterpret as signed (NaN/Infinity -> 0). A raw `(int32_t)double` cast is NOT
+ * this: on ARM FCVTZS saturates out-of-range values, so 0xffffffff (4294967295.0)
+ * became INT32_MAX and Math.imul(0xffffffff,5) returned 2147483643 instead of -5.
+ * Mirrors double_to_int32_bits() in mario.c (that one is file-static). */
+static inline int32_t imul_to_int32(double d) {
+	if(isnan(d) || isinf(d))
+		return 0;
+	double m = fmod(trunc(d), 4294967296.0);
+	int64_t i = (int64_t)m;
+	if(i < 0)
+		i += 4294967296LL;
+	return (int32_t)(uint32_t)i;
+}
+
 //Math.imul(a,b) - C-like 32-bit integer multiplication (wraps on overflow).
 var_t* native_math_imul(vm_t* vm, var_t* env, void *data) {
 	(void)data;
-	int32_t a = (int32_t)var_get_float64(get_func_arg(env, 0));
-	int32_t b = (int32_t)var_get_float64(get_func_arg(env, 1));
+	int32_t a = imul_to_int32(math_tonum(vm, get_func_arg(env, 0)));
+	int32_t b = imul_to_int32(math_tonum(vm, get_func_arg(env, 1)));
 	uint32_t ua = (uint32_t)a, ub = (uint32_t)b;
 	int32_t r = (int32_t)(ua * ub);
 	return var_new_int(vm, (int)r);
@@ -322,7 +352,7 @@ var_t* native_math_imul(vm_t* vm, var_t* env, void *data) {
 //Math.clz32(a) - count leading zero bits of the 32-bit integer representation.
 var_t* native_math_clz32(vm_t* vm, var_t* env, void *data) {
 	(void)data;
-	uint32_t x = (uint32_t)(int32_t)var_get_float64(get_func_arg(env, 0));
+	uint32_t x = (uint32_t)imul_to_int32(math_tonum(vm, get_func_arg(env, 0)));
 	int count = 0;
 	if(x == 0)
 		return var_new_int(vm, 32);

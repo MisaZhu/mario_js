@@ -172,11 +172,19 @@ var_t* native_StringConstructor(vm_t* vm, var_t* env, void* data) {
 	return thisV;
 }
 
+/* NUL-safe string metrics (defined after str_utf8_decode/encode below).
+ * mario strings are UTF-8 byte buffers that MAY contain embedded 0x00 (a valid
+ * code unit); strlen / *p!=0 loops truncate at the first NUL and would report a
+ * byte-buffer string as empty. These walk the stored byte length (var->size). */
+static uint32_t str_units(const char* s, uint32_t bytes);
+static uint32_t this_bytes(var_t* env, const char** out);
+
 var_t* native_StringLength(vm_t* vm, var_t* env, void* data) {
 	(void)vm; (void)data;
 
-	const char* s = get_str(env, THIS);
-	return var_new_int(vm, (int)strlen(s));
+	const char* s = NULL;
+	uint32_t bytes = this_bytes(env, &s);
+	return var_new_int(vm, (int)str_units(s, bytes));
 }
 
 var_t* native_StringToString(vm_t* vm, var_t* env, void* data) {
@@ -984,6 +992,26 @@ static uint32_t str_utf8_decode(const char** p) {
 	return cp;
 }
 
+/* Count UTF-8 code units within the first `bytes` bytes (NUL-safe). */
+static uint32_t str_units(const char* s, uint32_t bytes) {
+	const char* p = s;
+	const char* end = s + bytes;
+	uint32_t n = 0;
+	while(p < end) { str_utf8_decode(&p); n++; }
+	return n;
+}
+
+/* Byte length of the THIS string var (NUL-safe): var->size for V_STRING, else
+ * strlen of the coerced C string. Also returns the backing pointer. */
+static uint32_t this_bytes(var_t* env, const char** out) {
+	var_t* tv = get_obj(env, THIS);
+	const char* s = get_str(env, THIS);
+	if(out != NULL) *out = s;
+	if(tv != NULL && tv->type == V_STRING)
+		return tv->size;
+	return (uint32_t)strlen(s);
+}
+
 /* Append the UTF-8 encoding of code point cp to out. */
 static void str_utf8_encode(mstr_t* out, uint32_t cp) {
 	if(cp < 0x80) {
@@ -1016,6 +1044,13 @@ static void str_build_pad(mstr_t* out, const char* pad, int need) {
 
 var_t* native_StringStartsWith(vm_t* vm, var_t* env, void* data) {
 	(void)data;
+	/* V8 IsRegExp guard: String.prototype.startsWith must reject a regular
+	 * expression argument with a TypeError (core-js feature-detects exactly this
+	 * to decide whether to install its own polyfill). */
+	if(js_regexp_is(get_obj(env, "searchString"))) {
+		vm_throw_type_native(vm, "TypeError", "First argument to String.prototype.startsWith must not be a regular expression");
+		return NULL;
+	}
 	const char* s = get_str(env, THIS);
 	const char* search = get_str(env, "searchString");
 	int len = (int)strlen(s);
@@ -1032,6 +1067,10 @@ var_t* native_StringStartsWith(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_StringEndsWith(vm_t* vm, var_t* env, void* data) {
 	(void)data;
+	if(js_regexp_is(get_obj(env, "searchString"))) {
+		vm_throw_type_native(vm, "TypeError", "First argument to String.prototype.endsWith must not be a regular expression");
+		return NULL;
+	}
 	const char* s = get_str(env, THIS);
 	const char* search = get_str(env, "searchString");
 	int len = (int)strlen(s);
@@ -1048,6 +1087,10 @@ var_t* native_StringEndsWith(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_StringIncludes(vm_t* vm, var_t* env, void* data) {
 	(void)data;
+	if(js_regexp_is(get_obj(env, "searchString"))) {
+		vm_throw_type_native(vm, "TypeError", "First argument to String.prototype.includes must not be a regular expression");
+		return NULL;
+	}
 	const char* s = get_str(env, THIS);
 	const char* search = get_str(env, "searchString");
 	int len = (int)strlen(s);
@@ -1130,7 +1173,7 @@ var_t* native_String_fromCodePoint(vm_t* vm, var_t* env, void* data) {
 		if(a == NULL) continue;
 		str_utf8_encode(out, (uint32_t)var_get_int(a));
 	}
-	var_t* ret = var_new_str(vm, out->cstr);
+	var_t* ret = var_new_str_bin(vm, out->cstr, out->len);
 	mstr_free(out);
 	return ret;
 }
@@ -1393,10 +1436,12 @@ var_t* native_StringTrimEnd(vm_t* vm, var_t* env, void* data) {
  * back from the end and an out-of-range index yields undefined. */
 var_t* native_StringAt(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	const char* s = get_str(env, THIS);
+	const char* s = NULL;
+	uint32_t bytes = this_bytes(env, &s);
+	const char* end = s + bytes;
 	int count = 0;
 	const char* p = s;
-	while(*p != 0) { str_utf8_decode(&p); count++; }
+	while(p < end) { str_utf8_decode(&p); count++; }
 	int idx = get_int(env, "index");
 	if(idx < 0) idx += count;
 	if(idx < 0 || idx >= count) return NULL; /* undefined */
@@ -1405,7 +1450,7 @@ var_t* native_StringAt(vm_t* vm, var_t* env, void* data) {
 	while(i < idx) { str_utf8_decode(&p); i++; }
 	const char* start = p;
 	str_utf8_decode(&p);
-	var_t* ret = var_new_str2(vm, start, (int)(p - start));
+	var_t* ret = var_new_str_bin(vm, start, (uint32_t)(p - start));
 	var_instance_from(ret, get_obj(env, THIS));
 	return ret;
 }
@@ -1457,7 +1502,9 @@ var_t* native_StringReplaceAll(vm_t* vm, var_t* env, void* data) {
  * at() a negative index is NOT counted from the end (spec: it yields ""). */
 var_t* native_StringCharAt(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	const char* s = get_str(env, THIS);
+	const char* s = NULL;
+	uint32_t bytes = this_bytes(env, &s);
+	const char* end = s + bytes;
 	int idx = get_int(env, "index");
 	if(idx < 0) {
 		var_t* e = var_new_str(vm, "");
@@ -1466,15 +1513,15 @@ var_t* native_StringCharAt(vm_t* vm, var_t* env, void* data) {
 	}
 	const char* p = s;
 	int i = 0;
-	while(*p != 0 && i < idx) { str_utf8_decode(&p); i++; }
-	if(*p == 0) {
+	while(p < end && i < idx) { str_utf8_decode(&p); i++; }
+	if(p >= end) {
 		var_t* e = var_new_str(vm, "");
 		var_instance_from(e, get_obj(env, THIS));
 		return e;
 	}
 	const char* start = p;
 	str_utf8_decode(&p);
-	var_t* ret = var_new_str2(vm, start, (int)(p - start));
+	var_t* ret = var_new_str_bin(vm, start, (uint32_t)(p - start));
 	var_instance_from(ret, get_obj(env, THIS));
 	return ret;
 }
@@ -1485,14 +1532,16 @@ var_t* native_StringCharAt(vm_t* vm, var_t* env, void* data) {
  * UTF-16 surrogate half; identical to spec for the BMP. */
 var_t* native_StringCharCodeAt(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	const char* s = get_str(env, THIS);
+	const char* s = NULL;
+	uint32_t bytes = this_bytes(env, &s);
 	int idx = get_int(env, "index");
 	if(idx < 0)
 		return var_new_float(vm, NAN);
 	const char* p = s;
+	const char* end = s + bytes;
 	int i = 0;
-	while(*p != 0 && i < idx) { str_utf8_decode(&p); i++; }
-	if(*p == 0)
+	while(p < end && i < idx) { str_utf8_decode(&p); i++; }
+	if(p >= end)
 		return var_new_float(vm, NAN);
 	uint32_t cp = str_utf8_decode(&p);
 	return var_new_int(vm, (int)cp);
@@ -1526,7 +1575,13 @@ var_t* native_StringSubstring(vm_t* vm, var_t* env, void* data) {
  * so each argument is stringified into a scratch buffer and then appended. */
 var_t* native_StringConcat(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	mstr_t* out = mstr_new(get_str(env, THIS));
+	/* NUL-safe: seed from THIS's stored byte length (this_bytes) and append each
+	 * argument's coerced bytes via mstr_append_n, so embedded 0x00 code units
+	 * survive the join instead of being cut at the first NUL by strlen paths. */
+	const char* ts = NULL;
+	uint32_t tb = this_bytes(env, &ts);
+	mstr_t* out = mstr_new("");
+	mstr_append_n(out, ts, tb);
 	mstr_t* tmp = mstr_new("");
 	uint32_t n = get_func_args_num(env);
 	uint32_t i;
@@ -1534,9 +1589,9 @@ var_t* native_StringConcat(vm_t* vm, var_t* env, void* data) {
 		var_t* a = get_func_arg(env, i);
 		if(a == NULL) { mstr_append(out, "undefined"); continue; }
 		var_to_str(a, tmp);
-		mstr_append(out, tmp->cstr);
+		mstr_append_n(out, tmp->cstr, tmp->len);
 	}
-	var_t* ret = var_new_str(vm, out->cstr);
+	var_t* ret = var_new_str_bin(vm, out->cstr, out->len);
 	mstr_free(tmp);
 	mstr_free(out);
 	var_instance_from(ret, get_obj(env, THIS));
@@ -1782,20 +1837,41 @@ static int b64_index(char c) {
 
 static var_t* native_btoa(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	mstr_t* s = mstr_new("");
-	const char* str = uri_arg_cstr(env, s);
-	uint32_t len = (uint32_t)strlen(str);
+	/* NUL-safe + code-unit-correct: read the argument's stored byte length (not
+	 * strlen, which truncates at the first 0x00) and decode UTF-8 code units so a
+	 * byte-buffer string (String.fromCharCode over 0..255) round-trips. */
+	var_t* av = get_func_arg(env, 0);
+	mstr_t* tmp = NULL;
+	const char* str; uint32_t bytes;
+	if(av != NULL && av->type == V_STRING) { str = var_get_str(av); bytes = av->size; }
+	else { tmp = mstr_new(""); var_to_str(av, tmp); str = tmp->cstr; bytes = tmp->len; }
+	mstr_t* bin = mstr_new("");
+	const char* p = str;
+	const char* end = str + bytes;
+	while(p < end) {
+		uint32_t cp = str_utf8_decode(&p);
+		if(cp > 0xFF) {
+			mstr_free(bin);
+			if(tmp != NULL) mstr_free(tmp);
+			vm_throw_type_native(vm, "InvalidCharacterError", "The string to be encoded contains characters outside of the Latin1 range.");
+			return NULL;
+		}
+		mstr_add(bin, (char)cp);
+	}
+	if(tmp != NULL) mstr_free(tmp);
+	uint32_t len = bin->len;
+	const char* b = bin->cstr;
 	mstr_t* out = mstr_new("");
 	for(uint32_t i = 0; i < len; i += 3) {
-		unsigned b0 = (unsigned char)str[i];
-		unsigned b1 = (i + 1 < len) ? (unsigned char)str[i+1] : 0;
-		unsigned b2 = (i + 2 < len) ? (unsigned char)str[i+2] : 0;
+		unsigned b0 = (unsigned char)b[i];
+		unsigned b1 = (i + 1 < len) ? (unsigned char)b[i+1] : 0;
+		unsigned b2 = (i + 2 < len) ? (unsigned char)b[i+2] : 0;
 		mstr_add(out, kB64[(b0 >> 2) & 0x3F]);
 		mstr_add(out, kB64[((b0 << 4) | (b1 >> 4)) & 0x3F]);
 		mstr_add(out, (i + 1 < len) ? kB64[((b1 << 2) | (b2 >> 6)) & 0x3F] : '=');
 		mstr_add(out, (i + 2 < len) ? kB64[b2 & 0x3F] : '=');
 	}
-	mstr_free(s);
+	mstr_free(bin);
 	var_t* r = var_new_str(vm, out->cstr);
 	mstr_free(out);
 	return r;
@@ -1805,7 +1881,7 @@ static var_t* native_atob(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	mstr_t* s = mstr_new("");
 	const char* str = uri_arg_cstr(env, s);
-	mstr_t* out = mstr_new("");
+	mstr_t* bytes = mstr_new("");
 	int acc = 0, bits = 0;
 	for(const char* p = str; *p != 0; ++p) {
 		if(*p == '=' || *p == '\n' || *p == '\r' || *p == ' ' || *p == '\t') continue;
@@ -1815,11 +1891,17 @@ static var_t* native_atob(vm_t* vm, var_t* env, void* data) {
 		bits += 6;
 		if(bits >= 8) {
 			bits -= 8;
-			mstr_add(out, (char)((acc >> bits) & 0xFF));
+			mstr_add(bytes, (char)((acc >> bits) & 0xFF));
 		}
 	}
+	/* Each decoded byte becomes one code unit: UTF-8-encode it so charCodeAt /
+	 * length read it back, and keep embedded 0x00 via the binary ctor. */
+	mstr_t* out = mstr_new("");
+	for(uint32_t i = 0; i < bytes->len; i++)
+		str_utf8_encode(out, (unsigned char)bytes->cstr[i]);
 	mstr_free(s);
-	var_t* r = var_new_str(vm, out->cstr);
+	mstr_free(bytes);
+	var_t* r = var_new_str_bin(vm, out->cstr, out->len);
 	mstr_free(out);
 	return r;
 }
@@ -1833,7 +1915,7 @@ void reg_native_String(vm_t* vm) {
 	vm_reg_native(vm, cls, "substr(start, length)", native_StringSubstr, NULL); 
 	vm_reg_native(vm, cls, "trim()", native_StringTrim, NULL); 
 	vm_reg_native(vm, cls, "slice(beginIndex, endIndex)", native_StringSlice, NULL); 
-	vm_reg_native(vm, cls, "indexOf(searchValue, fromIndex)", native_StringIndexOf, NULL); 
+	vm_reg_native(vm, cls, "indexOf(searchValue, fromIndex)#1", native_StringIndexOf, NULL); 
 	vm_reg_native(vm, cls, "split(separator, limit)", native_StringSplit, NULL); 
 	vm_reg_native(vm, cls, "toLowerCase()", native_StringToLowerCase, NULL); 
 	vm_reg_native(vm, cls, "toUpperCase()", native_StringToUpperCase, NULL); 
@@ -1850,20 +1932,20 @@ void reg_native_String(vm_t* vm) {
 	vm_reg_native(vm, cls, "match(regexp)", native_StringMatch, NULL); 
 	vm_reg_native(vm, cls, "matchAll(regexp)", native_StringMatchAll, NULL); 
 	vm_reg_native(vm, cls, "search(regexp)", native_StringSearch, NULL); 
-	vm_reg_native(vm, cls, "startsWith(searchString, position)", native_StringStartsWith, NULL); 
-	vm_reg_native(vm, cls, "endsWith(searchString, endPosition)", native_StringEndsWith, NULL); 
-	vm_reg_native(vm, cls, "includes(searchString, position)", native_StringIncludes, NULL); 
+	vm_reg_native(vm, cls, "startsWith(searchString, position)#1", native_StringStartsWith, NULL); 
+	vm_reg_native(vm, cls, "endsWith(searchString, endPosition)#1", native_StringEndsWith, NULL); 
+	vm_reg_native(vm, cls, "includes(searchString, position)#1", native_StringIncludes, NULL); 
 	vm_reg_native(vm, cls, "repeat(count)", native_StringRepeat, NULL); 
-	vm_reg_native(vm, cls, "padStart(targetLength, padString)", native_StringPadStart, NULL); 
-	vm_reg_native(vm, cls, "padEnd(targetLength, padString)", native_StringPadEnd, NULL); 
+	vm_reg_native(vm, cls, "padStart(targetLength, padString)#1", native_StringPadStart, NULL); 
+	vm_reg_native(vm, cls, "padEnd(targetLength, padString)#1", native_StringPadEnd, NULL); 
 	vm_reg_native(vm, cls, "codePointAt(position)", native_StringCodePointAt, NULL); 
-	vm_reg_native(vm, cls, "normalize(form)", native_StringNormalize, NULL); 
-	vm_reg_static(vm, cls, "fromCodePoint()", native_String_fromCodePoint, NULL); 
+	vm_reg_native(vm, cls, "normalize(form)#0", native_StringNormalize, NULL); 
+	vm_reg_static(vm, cls, "fromCodePoint()#1", native_String_fromCodePoint, NULL); 
 	/* fromCharCode takes UTF-16 code units; identical to fromCodePoint for the
 	 * BMP, so it reuses the same implementation. */
-	vm_reg_static(vm, cls, "fromCharCode()", native_String_fromCodePoint, NULL);
+	vm_reg_static(vm, cls, "fromCharCode()#1", native_String_fromCodePoint, NULL);
 	/* String.raw - tagged template that returns the raw (unescaped) source. */
-	vm_reg_static(vm, cls, "raw()", native_String_raw, NULL); 
+	vm_reg_static(vm, cls, "raw()#1", native_String_raw, NULL); 
 	vm_reg_native(vm, cls, SYMKEY_ITERATOR "()", native_String_iterator, NULL); 
 
 	vm_reg_native(vm, cls, "at(index)", native_StringAt, NULL);
@@ -1875,8 +1957,8 @@ void reg_native_String(vm_t* vm) {
 	vm_reg_native(vm, cls, "charAt(index)", native_StringCharAt, NULL);
 	vm_reg_native(vm, cls, "charCodeAt(index)", native_StringCharCodeAt, NULL);
 	vm_reg_native(vm, cls, "substring(start, end)", native_StringSubstring, NULL);
-	vm_reg_native(vm, cls, "concat()", native_StringConcat, NULL);
-	vm_reg_native(vm, cls, "lastIndexOf(searchValue, fromIndex)", native_StringLastIndexOf, NULL);
+	vm_reg_native(vm, cls, "concat()#1", native_StringConcat, NULL);
+	vm_reg_native(vm, cls, "lastIndexOf(searchValue, fromIndex)#1", native_StringLastIndexOf, NULL);
 	vm_reg_native(vm, cls, "localeCompare(compareString)", native_StringLocaleCompare, NULL);
 
 	cls = vm_new_class(vm, CLS_UTF8);

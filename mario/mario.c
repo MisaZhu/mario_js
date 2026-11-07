@@ -240,14 +240,35 @@ static inline void hash_map_ensure_buckets(hash_map_t* map) {
 }
 
 // Add a key-value pair to the hash map
+/* Gated diagnostic for runaway container growth (env MARIO_MAPDBG): reports
+ * hash-map resizes past 1M buckets and array_recv receivers past 100k elems,
+ * the two shapes that precede the mario_malloc(uint32) truncation cliff. */
+void mario_mapdbg(const char* tag, uint32_t a, uint32_t b) {
+    static int s_on = -1;
+    if(s_on < 0) s_on = (getenv("MARIO_MAPDBG") != NULL) ? 1 : 0;
+    if(!s_on) return;
+    fprintf(stderr, "[mapdbg] %s a=%u b=%u\n", tag, (unsigned)a, (unsigned)b);
+    fflush(stderr);
+}
+
+/* Bucket-growth ceiling: mario_malloc takes a uint32 size, so
+ * sizeof(hash_entry_t*) * capacity must never reach 2^32 - the product would
+ * silently truncate (malloc(0)) while the NULLing loop still memsets the full
+ * 64-bit size: a 4GB wild write (ASan: heap-buffer-overflow WRITE of size
+ * 4294967296 in hash_map_add_fresh). Past 64M buckets (512MB) refuse the
+ * resize; chains just grow longer, correctness is preserved. */
+#define HASH_MAP_MAX_CAPACITY (1u << 26)
+
 void hash_map_add(hash_map_t* map, const char* key, void* value) {
     // A cleaned map has no bucket array; re-initialize so the insert below is
     // valid (pool-backed for VM-owned maps; see hash_map_ensure_buckets).
     hash_map_ensure_buckets(map);
     // Check if we need to resize
-    if (map->size * map->load_factor_den > map->capacity * map->load_factor_num) {
+    if (map->capacity < HASH_MAP_MAX_CAPACITY &&
+        map->size * map->load_factor_den > map->capacity * map->load_factor_num) {
         // Resize the hash map
         uint32_t new_capacity = map->capacity * 2;
+        if (new_capacity >= (1u << 20)) mario_mapdbg("map resize add", map->size, new_capacity);
         hash_entry_t** new_buckets = (hash_entry_t**)mario_malloc(sizeof(hash_entry_t*) * new_capacity);
         uint32_t i;
         for (i = 0; i < new_capacity; i++) {
@@ -307,8 +328,10 @@ void hash_map_add(hash_map_t* map, const char* key, void* value) {
  * member costs one hash + one bucket scan instead of two. */
 void hash_map_add_fresh(hash_map_t* map, const char* key, void* value) {
     hash_map_ensure_buckets(map);
-    if (map->size * map->load_factor_den > map->capacity * map->load_factor_num) {
+    if (map->capacity < HASH_MAP_MAX_CAPACITY &&
+        map->size * map->load_factor_den > map->capacity * map->load_factor_num) {
         uint32_t new_capacity = map->capacity * 2;
+        if (new_capacity >= (1u << 20)) mario_mapdbg("map resize fresh", map->size, new_capacity);
         hash_entry_t** new_buckets = (hash_entry_t**)mario_malloc(sizeof(hash_entry_t*) * new_capacity);
         uint32_t i;
         for (i = 0; i < new_capacity; i++) {
@@ -1709,7 +1732,10 @@ void bc_init(bytecode_t* bc) {
 	bc->srcmap_size = bc->srcmap_max = 0;
 	bc->srcmap_cur = 0;
 	array_init(&bc->srcs);
-	bc->srcmap_on = (getenv("MARIO_SRCMAP") != NULL);
+	array_init(&bc->src_urls);
+	bc->srcmap_on = true; /* Error.stack V8 frames need line/col at throw time */
+	bc->fspans = NULL;
+	bc->fspans_size = bc->fspans_max = 0;
 }
 
 void bc_release(bytecode_t* bc) {
@@ -1722,7 +1748,12 @@ void bc_release(bytecode_t* bc) {
 		mario_free(bc->srcmap);
 	bc->srcmap = NULL;
 	bc->srcmap_size = bc->srcmap_max = 0;
+	if(bc->fspans != NULL)
+		mario_free(bc->fspans);
+	bc->fspans = NULL;
+	bc->fspans_size = bc->fspans_max = 0;
 	array_clean(&bc->srcs, NULL);
+	array_clean(&bc->src_urls, mario_free);
 }
 
 /* ---- pc -> source map (debug aid, MARIO_SRCMAP=1) ----
@@ -1731,14 +1762,56 @@ void bc_release(bytecode_t* bc) {
  * compiled source is copied and the compiler records (pc, offset) at each
  * statement start; bc_srcmap_locate maps a pc back to "src#n line:col" plus a
  * snippet of the statement. Entries are appended in increasing pc order. */
+/* The absolute URL of the script about to be compiled. The browser sets it via
+ * mario_set_script_url before each vm_load_run so bc_srcmap_begin can record it
+ * alongside the source text and Error.stack can emit V8 "url:line:col" frames. */
+static char* g_cur_script_url = NULL;
+void mario_set_script_url(const char* url) {
+	if(g_cur_script_url != NULL) {
+		mario_free(g_cur_script_url);
+		g_cur_script_url = NULL;
+	}
+	if(url != NULL && url[0] != 0) {
+		size_t n = strlen(url);
+		g_cur_script_url = (char*)mario_malloc(n + 1);
+		memcpy(g_cur_script_url, url, n + 1);
+	}
+}
 void bc_srcmap_begin(bytecode_t* bc, const char* src) {
-	if(!bc->srcmap_on || src == NULL)
+	if(src == NULL)
 		return;
 	size_t n = strlen(src);
 	char* copy = (char*)mario_malloc(n + 1);
 	memcpy(copy, src, n + 1);
 	array_add(&bc->srcs, copy);
 	bc->srcmap_cur = bc->srcs.size - 1;
+	/* Parallel URL slot for V8 Error.stack frames; the browser sets the current
+	 * script URL via mario_set_script_url before each vm_load_run. */
+	const char* u = (g_cur_script_url != NULL) ? g_cur_script_url : "";
+	size_t un = strlen(u);
+	char* ucopy = (char*)mario_malloc(un + 1);
+	memcpy(ucopy, u, un + 1);
+	array_add(&bc->src_urls, ucopy);
+}
+
+/* Record a function source span for Function.prototype.toString parity.
+ * entry_pc = body entry (sentinel_pc + 1), matching func->pc at runtime. */
+void bc_fspan_add(bytecode_t* bc, PC entry_pc, uint32_t src, uint32_t start, uint32_t end) {
+	if(bc->fspans_size >= bc->fspans_max) {
+		uint32_t nmax = bc->fspans_max == 0 ? 256 : bc->fspans_max * 2;
+		struct st_bc_fspan_ent* ne = (struct st_bc_fspan_ent*)mario_malloc(nmax * sizeof(*ne));
+		if(bc->fspans != NULL) {
+			memcpy(ne, bc->fspans, bc->fspans_size * sizeof(*ne));
+			mario_free(bc->fspans);
+		}
+		bc->fspans = ne;
+		bc->fspans_max = nmax;
+	}
+	bc->fspans[bc->fspans_size].entry_pc = entry_pc;
+	bc->fspans[bc->fspans_size].src = src;
+	bc->fspans[bc->fspans_size].start = start;
+	bc->fspans[bc->fspans_size].end = end;
+	bc->fspans_size++;
 }
 
 void bc_srcmap_add(bytecode_t* bc, PC pc, uint32_t pos) {
@@ -1799,6 +1872,41 @@ bool bc_srcmap_locate(bytecode_t* bc, PC pc, mstr_t* out) {
 		char c = src[i];
 		mstr_add(out, (c == '\n' || c == '\r' || c == '\t') ? ' ' : c);
 	}
+	return true;
+}
+
+/* V8-parity frame location: same greatest-pc<=pc entry selection and line/col
+ * walk as bc_srcmap_locate, but returns the script URL + 1-based line/col so
+ * mario_format_stack can emit standard "url:line:col" frames. */
+bool bc_srcmap_locate_v8(bytecode_t* bc, PC pc, const char** url, int* line, int* col) {
+	if(!bc->srcmap_on || bc->srcmap_size == 0 || pc == ILLEGAL_PC)
+		return false;
+	uint32_t best = 0xFFFFFFFFu;
+	for(uint32_t i = 0; i < bc->srcmap_size; i++) {
+		if(bc->srcmap[i].pc <= pc && (best == 0xFFFFFFFFu || bc->srcmap[i].pc > bc->srcmap[best].pc))
+			best = i;
+	}
+	if(best == 0xFFFFFFFFu)
+		return false;
+	struct st_bc_srcmap_ent* e = &bc->srcmap[best];
+	if(e->src >= bc->srcs.size)
+		return false;
+	const char* src = (const char*)bc->srcs.items[e->src];
+	size_t len = strlen(src);
+	uint32_t pos = e->pos < len ? e->pos : (uint32_t)len;
+	int ln = 1, cl = 1;
+	for(uint32_t i = 0; i < pos; i++) {
+		if(src[i] == '\n') { ln++; cl = 1; }
+		else cl++;
+	}
+	if(url != NULL) {
+		const char* u = "";
+		if(e->src < bc->src_urls.size)
+			u = (const char*)bc->src_urls.items[e->src];
+		*url = (u != NULL && u[0] != 0) ? u : "<anonymous>";
+	}
+	if(line != NULL) *line = ln;
+	if(col != NULL) *col = cl;
 	return true;
 }
 
@@ -4512,6 +4620,20 @@ inline var_t* var_new_str2(vm_t* vm, const char* s, uint32_t len) {
 	return var;
 }
 
+inline var_t* var_new_str_bin(vm_t* vm, const char* s, uint32_t len) {
+	var_t* var = var_new(vm);
+	var->type = V_STRING;
+	/* Copy exactly `len` bytes WITHOUT stopping at NUL: U+0000 is a valid code
+	 * unit and byte buffers (String.fromCharCode / atob / base64 payloads) carry
+	 * embedded 0x00 that the strlen-bounded ctors would silently drop, emptying
+	 * the buffer (the taobao AWSC VMP builds its tables this way). */
+	var->size = len;
+	var->value = mario_malloc(len + 1);
+	memcpy(var->value, s, len);
+	((char*)(var->value))[len] = 0;
+	return var;
+}
+
 inline const char* var_get_str(var_t* var) {
 	if(var == NULL || var->value == NULL)
 		return "";
@@ -4529,6 +4651,10 @@ inline var_t* var_set_str(var_t* var, const char* v) {
 	uint32_t len = (uint32_t)strlen(v)+1;
 	var->value = mario_malloc(len);
 	memcpy(var->value, v, len);
+	/* Keep `size` in sync: var_to_str and the String builtins trust it as the
+	 * authoritative byte length (NUL-safe), so a stale size would truncate or
+	 * over-read the coerced string. */
+	var->size = len - 1;
 	return var;
 }
 
@@ -4845,7 +4971,10 @@ void var_to_str(var_t* var, mstr_t* ret) {
 		mstr_cpy(ret, mstr_from_float64(var_get_float64(var)));
 		break;
 	case V_STRING:
-		mstr_cpy(ret, var_get_str(var));
+		/* Copy the stored byte length, not strlen: a byte-buffer string may hold
+		 * embedded 0x00 (String.fromCharCode / atob payloads) that mstr_cpy would
+		 * drop at the first NUL, emptying the value the taobao VMP depends on. */
+		mstr_append_n(ret, var_get_str(var), var->size);
 		break;
 	case V_OBJECT:
 		/* JS ToPrimitive(string): an object is stringified by calling its
@@ -5092,11 +5221,22 @@ void var_to_json_str(var_t* var, mstr_t* ret, int level, bool compact) {
 		mstr_add(ret, '}');
 	} 
 	else {
-		// no children or a function... just write value directly
-		mstr_t* s = mstr_new("");
-		get_parsable_str(var, s);
-		mstr_append(ret, s->cstr);
-		mstr_free(s);
+		/* ES SerializeJSONProperty: a Number that is NaN or +/-Infinity serialises
+		 * as `null` (JSON has no NaN/Infinity literals), so JSON.stringify(NaN) is
+		 * "null" not "NaN". Compact mode only (JSON.stringify); the display
+		 * fallback (var_to_str for console) still shows NaN/Infinity. */
+		bool nonfinite = compact && var_is_number(var) &&
+		                 (isnan(var_get_float64(var)) || isinf(var_get_float64(var)));
+		if (nonfinite) {
+			mstr_append(ret, "null");
+		}
+		else {
+			// no children or a function... just write value directly
+			mstr_t* s = mstr_new("");
+			get_parsable_str(var, s);
+			mstr_append(ret, s->cstr);
+			mstr_free(s);
+		}
 	}
 
 	if(level == 0) {
@@ -5662,20 +5802,23 @@ node_t* vm_find_in_class(var_t* var, const char* name) {
 	node_t* ret = find_in_proto_chain_ex(var, var_get_prototype(var), name, false);
 	if(ret != NULL)
 		return ret;
-	/* A plain function's member chain climbs its `.prototype` instance template
-	 * (Object.prototype in mario), which does NOT hold the universal Function
-	 * methods. do_get() patches `.call`/`.apply`/`.bind` for the NAMED GET path;
-	 * mirror that here so the COMPUTED path (`f["apply"]`, `f["bind"]` - e.g.
-	 * minified `r[Zt(t)](n, arguments)`, `c[41].bind(...)`) resolves them instead
-	 * of undefined. Restricted to call/apply/bind: `name`/`length` are per-function
-	 * dynamic values do_get computes (@@fname / declared arity) and `toString`
-	 * already resolves through Object.prototype, so none of those may be overridden
-	 * here. Callables WITH an FPROTO link reached Function.prototype already via the
+	/* A plain function's real [[Prototype]] is Function.prototype, but mario
+	 * conflates a callable's `.prototype` own-member (its instance template) with
+	 * [[Prototype]], so the walk above climbed `.prototype` -> Object.prototype and
+	 * never consulted Function.prototype's OWN members. do_get() special-cases
+	 * call/apply/bind; generalize that here so BOTH the named and the computed
+	 * (`f[k]`) get path resolve ANY Function.prototype member - the universal
+	 * call/apply/bind/toString AND site-installed ones. Baidu Maps defines
+	 * `Function.prototype.inherits = ...` then calls `SomeCtor.inherits(...)`; the
+	 * old call/apply/bind-only tail left that lookup missing and aborted the whole
+	 * bundle ("can not find function 'inherits' on function"). `name`/`length` are
+	 * excluded: they are per-function dynamic values do_get computes (@@fname /
+	 * declared arity) and Function.prototype's own ("",0) must not shadow them.
+	 * Callables WITH an FPROTO link reached Function.prototype already via the
 	 * chain walk above, so this tail only fires for ordinary functions/classes. */
 	if((var->is_func || var->is_class) && var->vm != NULL &&
 	   var->vm->builtin_vars.var_Function != NULL &&
-	   (strcmp(name, "call") == 0 || strcmp(name, "apply") == 0 ||
-	    strcmp(name, "bind") == 0)) {
+	   strcmp(name, "name") != 0 && strcmp(name, "length") != 0) {
 		node_t* fn = var_find_own_member(var_get_prototype(var->vm->builtin_vars.var_Function), name);
 		if(fn != NULL && fn->var != NULL)
 			return fn;
@@ -5840,15 +5983,21 @@ static inline node_t* vm_find_in_scopes(vm_t* vm, const char* name) {
 		sc = sc->prev;
 	}
 
-	/* No lexical binding anywhere in the chain: fall back to the innermost frame's
-	 * ambient `this` member (kept for host/embedded patterns that rely on it), then
-	 * the global object. */
-	if(this_hit != NULL) {
-		return this_hit;
-	}
-
+	/* The global object is the final lexical environment and therefore outranks
+	 * the legacy ambient-`this` fallback. In particular, an anonymous function
+	 * stored as `obj.isNaN` has an inferred display name but no lexical self-
+	 * binding: a bare `isNaN()` in its body must reach the global builtin, not
+	 * the receiver's same-named method and recurse forever. */
 	ret = var_find_own_member(vm->root, name);
-	return ret;
+	if(ret != NULL)
+		return ret;
+
+	/* Keep the historical host/embedded fallback only when no lexical or global
+	 * binding exists. It is non-standard, but removing it outright would break
+	 * embedders whose native methods intentionally rely on ambient `this`. */
+	if(this_hit != NULL)
+		return this_hit;
+	return NULL;
 }
 
 /* A runtime throw abandons the interrupted expression, but its transient
@@ -5911,29 +6060,27 @@ static inline scope_t* vm_get_loop_scope(vm_t* vm) {
 	return NULL;
 }
 
-/* Innermost try scope belonging to the CURRENT vm_run invocation: only scopes
- * pushed since this loop entered (index >= run_scope_base) can be unwound to
- * without executing another frame's bytecode in this loop. NULL when this run
- * can not catch, i.e. the error must propagate outward. */
-static scope_t* vm_find_inrange_try(vm_t* vm) {
+/* Innermost scope belonging to the CURRENT vm_run invocation (index >=
+ * run_scope_base, so only scopes pushed since this loop entered - never another
+ * frame's) that can handle a propagating error: either a `catch` (is_try) or a
+ * `finally` (has_finally).
+ *
+ * A throw must enter the INNERMOST such scope first. When that scope owns a
+ * finally but no live catch - a `try{}finally{}` whose TRY was demoted to a
+ * BLOCK, or a `try{}catch{}finally{}` whose catch already ran and rethrew - the
+ * finally body runs (parked as FIN_THROW, resumed by handle_finally_end) BEFORE
+ * the error continues outward to any enclosing catch. The old scan looked for a
+ * catch alone, so an OUTER catch won over an INNER finally and the inner finally
+ * was popped WITHOUT running - silently skipping whatever state it restored (the
+ * baxia VMP interpreter relies on a finally to restore its registers on internal
+ * control-flow throws; skipping it corrupted the VM state and aborted it).
+ * NULL when this run can neither catch nor run a finally, i.e. the error must
+ * propagate outward (an OUTER vm_run frame - a nested JS call with its own
+ * baseline - handles it once the error reaches it). */
+static scope_t* vm_find_inrange_handler(vm_t* vm) {
 	for(int32_t i = vm->scope_stack_top - 1; i >= vm->run_scope_base; i--) {
 		scope_t* sc = vm->scope_stack[i];
-		if(sc != NULL && sc->is_try)
-			return sc;
-	}
-	return NULL;
-}
-
-/* Same scan as vm_find_inrange_try, but for the innermost in-range scope that
- * owns a `finally` (has_finally): a throw (or any propagating error) that no
- * catch handles in this frame must still run every finally it leaves on the way
- * out. Only [run_scope_base, scope_stack_top) is scanned, so a finally owned by
- * an OUTER vm_run frame is left for that frame to run once the error reaches it
- * (a nested JS call is its own vm_run frame with its own baseline). */
-static scope_t* vm_find_inrange_finally(vm_t* vm) {
-	for(int32_t i = vm->scope_stack_top - 1; i >= vm->run_scope_base; i--) {
-		scope_t* sc = vm->scope_stack[i];
-		if(sc != NULL && sc->has_finally)
+		if(sc != NULL && (sc->is_try || sc->has_finally))
 			return sc;
 	}
 	return NULL;
@@ -5988,14 +6135,12 @@ char* mario_format_stack(vm_t* vm, const char* msg) {
 	mstr_t* s = mstr_new("");
 	if(msg != NULL)
 		mstr_append(s, msg);
-	mstr_t* one = mstr_new("");
 	int shown = 0;
 	bool first = true;
 	scope_t* sc = vm_get_scope(vm);
 	while(sc != NULL && shown < 24) {
 		if(sc->is_func && sc->func != NULL) {
 			shown++;
-			mstr_append(s, "\n    at ");
 			const char* nm = NULL;
 			if(sc->func_var != NULL) {
 				var_t* nv = var_find_own_member_var(sc->func_var, "name");
@@ -6006,29 +6151,73 @@ char* mario_format_stack(vm_t* vm, const char* msg) {
 			}
 			if(nm == NULL)
 				nm = sc->func->nfe_name;
-			mstr_append(s, (nm != NULL) ? nm : "anonymous");
 			/* scope_t.pc is a try/break anchor, NOT the live pc: the innermost
 			 * frame reports vm->pc (the instruction about to run), outer frames
 			 * report their function entry pc as a frame identity. */
 			PC fpc = first ? vm->pc : sc->func->pc;
 			first = false;
-			mstr_reset(one);
-			if(bc_srcmap_locate(&vm->bc, fpc, one) && one->len > 0) {
+			/* V8 frame shape: "    at name (url:line:col)" for a named function,
+			 * "    at url:line:col" for an anonymous one. Anti-bot fingerprints
+			 * (baxia et_f.js) regex-parse this string, so the legacy "pc=NNN"
+			 * debug shape made every recovered name/URL garbage. */
+			const char* url = NULL; int ln = 0, cl = 0;
+			char loc[512];
+			if(bc_srcmap_locate_v8(&vm->bc, fpc, &url, &ln, &cl))
+				snprintf(loc, sizeof loc, "%s:%d:%d", url, ln, cl);
+			else
+				snprintf(loc, sizeof loc, "%s", "<anonymous>:0:0");
+			mstr_append(s, "\n    at ");
+			if(nm != NULL && nm[0] != 0) {
+				mstr_append(s, nm);
 				mstr_append(s, " (");
-				mstr_append(s, one->cstr);
+				mstr_append(s, loc);
 				mstr_append(s, ")");
 			} else {
-				char buf[48];
-				snprintf(buf, sizeof(buf), " (pc=%u)", (unsigned)fpc);
-				mstr_append(s, buf);
+				mstr_append(s, loc);
 			}
 		}
 		sc = sc->prev;
 	}
-	mstr_free(one);
 	char* out = strdup((s->cstr != NULL) ? s->cstr : "");
 	mstr_free(s);
 	return out;
+}
+
+/* Structured counterpart of mario_format_stack: hand the embedder one descriptor
+ * per JS frame (innermost first) so it can build V8 CallSite objects for
+ * Error.prepareStackTrace / Error.captureStackTrace. Same name + srcmap
+ * resolution as the string formatter. */
+int mario_stack_frames(vm_t* vm, mario_frame_t* out, int max) {
+	if(out == NULL || max <= 0)
+		return 0;
+	int count = 0;
+	bool first = true;
+	scope_t* sc = vm_get_scope(vm);
+	while(sc != NULL && count < max) {
+		if(sc->is_func && sc->func != NULL) {
+			const char* nm = NULL;
+			if(sc->func_var != NULL) {
+				var_t* nv = var_find_own_member_var(sc->func_var, "name");
+				if(nv == NULL || nv->type != V_STRING)
+					nv = var_find_own_member_var(sc->func_var, "@@fname");
+				if(nv != NULL && nv->type == V_STRING)
+					nm = var_get_str(nv);
+			}
+			if(nm == NULL)
+				nm = sc->func->nfe_name;
+			PC fpc = first ? vm->pc : sc->func->pc;
+			first = false;
+			const char* url = NULL; int ln = 0, cl = 0;
+			bool has_loc = bc_srcmap_locate_v8(&vm->bc, fpc, &url, &ln, &cl);
+			out[count].name = (nm != NULL && nm[0] != 0) ? nm : NULL;
+			out[count].url  = has_loc ? url : NULL;
+			out[count].line = has_loc ? ln : 0;
+			out[count].col  = has_loc ? cl : 0;
+			count++;
+		}
+		sc = sc->prev;
+	}
+	return count;
 }
 
 
@@ -6117,12 +6306,34 @@ void vm_report_uncaught(vm_t* vm) {
 
 static var_t* vm_make_type_error(vm_t* vm, const char* type_name, const char* message);
 
+/* TEMP DIAGNOSTIC (taobao CSR bootstrap): print EVERY throw - caught or not -
+ * so a bootstrap aborted inside a try/catch (invisible to vm_report_uncaught
+ * and to the MARIO_THROWMSG propagate gate) becomes observable. Gated by
+ * MARIO_THROWALL; goes straight to stderr so a release build still shows it.
+ * Remove with the other temp probes. */
+static void mario_throw_trace(vm_t* vm, const char* tag, const char* message) {
+	static int s_on = -1;
+	if(s_on < 0) s_on = (getenv("MARIO_THROWALL") != NULL) ? 1 : 0;
+	if(!s_on) return;
+	fprintf(stderr, "[throwall] %s pc=%u msg=%s\n", tag, (unsigned)vm->pc,
+	        (message != NULL) ? message : "");
+	scope_t* sc = vm_get_scope(vm);
+	int hop = 0;
+	while(sc != NULL && hop++ < 6) {
+		if(sc->is_func && sc->func != NULL)
+			fprintf(stderr, "[throwall]   frame[%d] entrypc=%u\n", hop, (unsigned)sc->func->pc);
+		sc = sc->prev;
+	}
+	fflush(stderr);
+}
+
 void vm_throw(vm_t* vm, const char *format, ...) {
 	char message[BUF_SIZE+1] = {0};
 	va_list ap;
 	va_start(ap, format);
 	vsnprintf(message, BUF_SIZE, format, ap);
 	va_end(ap);
+	mario_throw_trace(vm, "throw", message);
 
 	/* Build the instance exactly like vm_throw_type() does: [[Prototype]] must be
 	 * Error.prototype (NOT the Error class var - that put the class's static
@@ -6132,9 +6343,11 @@ void vm_throw(vm_t* vm, const char *format, ...) {
 	var_t* err = vm_make_type_error(vm, "Error", message);
 	vm_push(vm, err);
 
-	scope_t* try_sc = vm_find_inrange_try(vm);
-	if(try_sc == NULL) {
-		/* No frame of this run can catch: propagate outward. The interrupted
+	scope_t* try_sc = vm_find_inrange_handler(vm);
+	if(try_sc == NULL || !try_sc->is_try) {
+		/* No catch here, or the innermost handler is a finally-only scope:
+		 * propagate outward (the loop-top abort handler runs every finally the
+		 * error leaves, inner-to-outer, before any outer catch). The interrupted
 		 * body must NOT keep executing (the old report-and-continue let a
 		 * throwing Promise executor still resolve), and redirecting vm->pc to an
 		 * outer frame's catch would run that frame's bytecode in this loop. */
@@ -6163,6 +6376,7 @@ void vm_throw_native(vm_t* vm, const char *format, ...) {
 	va_start(ap, format);
 	vsnprintf(message, BUF_SIZE, format, ap);
 	va_end(ap);
+	mario_throw_trace(vm, "native", message);
 
 	/* Build the instance exactly like vm_throw_type() does: [[Prototype]] must be
 	 * Error.prototype (NOT the Error class var - that put the class's static
@@ -6234,6 +6448,7 @@ void vm_throw_type_native(vm_t* vm, const char* type_name, const char* format, .
 	va_start(ap, format);
 	vsnprintf(message, BUF_SIZE, format, ap);
 	va_end(ap);
+	mario_throw_trace(vm, "tnative", message);
 
 	var_t* err = vm_make_type_error(vm, type_name, message);
 	if(vm->native_thrown != NULL)
@@ -6250,6 +6465,7 @@ void vm_throw_type(vm_t* vm, const char* type_name, const char* format, ...) {
 	va_start(ap, format);
 	vsnprintf(message, BUF_SIZE, format, ap);
 	va_end(ap);
+	mario_throw_trace(vm, type_name, message);
 
 	var_t* err = vm_make_type_error(vm, type_name, message);
 	vm_push(vm, err);
@@ -6265,9 +6481,10 @@ void vm_throw_type(vm_t* vm, const char* type_name, const char* format, ...) {
 	 * corrupting the shared scope/value stacks and clobbering the promise a
 	 * synchronous .then() was about to hand back (surfacing later as
 	 * "can not find function 'catch'/'then' on object{}"). */
-	scope_t* try_sc = vm_find_inrange_try(vm);
-	if(try_sc == NULL) {
-		/* No frame of this run can catch: propagate outward so every intermediate
+	scope_t* try_sc = vm_find_inrange_handler(vm);
+	if(try_sc == NULL || !try_sc->is_try) {
+		/* No catch here, or the innermost handler is a finally-only scope:
+		 * propagate outward so every intermediate
 		 * frame unwinds through func_call (exactly like vm_throw). The interrupted
 		 * body must NOT keep executing, and this must NOT print-and-continue. */
 		vm_pop2(vm); // lift err off the value stack keeping its ref for the propagation
@@ -6426,6 +6643,7 @@ static func_t* func_new() {
 	func->pc = 0;
 	func->data = NULL;
 	func->owner = NULL;
+	func->decl_length = -1;   /* -1 = report args.size; natives may override via decl "#N" */
 	array_init(&func->args);
 	array_init(&func->locals);
 	return func;
@@ -6457,6 +6675,10 @@ static void func_free(void* p) {
 	if(func->cls_self_name != NULL) {
 		mario_free(func->cls_self_name);
 		func->cls_self_name = NULL;
+	}
+	if(func->src_text != NULL) {
+		mario_free(func->src_text);
+		func->src_text = NULL;
 	}
 	/* Release the JIT'd body (see jit/mario_jit.h): the machine-code region
 	 * and the pc2off map are owned by this func_t, independent of the var
@@ -6989,6 +7211,53 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num, bool i
 			ret = NULL; // a callee of this native aborted: placeholder result, keep propagating
 		if(ret == NULL)
 			ret = var_new(vm);
+		/* TEMP DIAGNOSTIC (taobao baxia VMP al("") RCA): log every native/host call
+		 * whose CALL site is inside script_39's pc range, with the native's name and
+		 * a short repr of its return - surfaces which host API the VMP reads a
+		 * divergent value from. Gated by MARIO_NATDBG; remove with other probes. */
+		{
+			static int s_nd = -1;
+			if(s_nd < 0) s_nd = (getenv("MARIO_NATDBG") != NULL) ? 1 : 0;
+			if(s_nd && vm->dbg_tag != NULL &&
+			   strstr(vm->dbg_tag, "script_39") != NULL) {
+				const char* fnm = "-";
+				var_t* fnv = (func_var != NULL) ? var_find_own_member_var(func_var, "@@fname") : NULL;
+				if(fnv != NULL && fnv->type == V_STRING) fnm = var_get_str(fnv);
+				/* receiver brand: @@tostringtag, else constructor @@fname, else flags */
+				char ob[96]; ob[0] = 0;
+				if(obj != NULL) {
+					var_t* tg = var_find_member_var(obj, SYMKEY_TOSTRINGTAG);
+					var_t* ct = var_find_member_var(obj, "constructor");
+					const char* ctn = NULL;
+					if(ct != NULL) { var_t* cn = var_find_own_member_var(ct, "@@fname");
+						if(cn != NULL && cn->type == V_STRING) ctn = var_get_str(cn); }
+					snprintf(ob, sizeof(ob), "tag=%s ctor=%s t%u f%d c%d a%d",
+						(tg != NULL && tg->type == V_STRING) ? var_get_str(tg) : "-",
+						ctn != NULL ? ctn : "-", (unsigned)obj->type,
+						(int)obj->is_func, (int)obj->is_class, (int)obj->is_array);
+				}
+				char rb[160]; rb[0] = 0;
+				/* A native return is still unowned here.  Do not ref/unref it and do
+				 * not stringify objects: either operation can destroy or recurse into
+				 * the very value the caller is about to receive.  Primitive values can
+				 * be inspected in place without allocating or changing ownership. */
+				unsigned rtyp = (unsigned)ret->type;
+				if(ret->type == V_STRING) {
+					const char* sv = var_get_str(ret);
+					snprintf(rb, sizeof(rb), "t%u %.*s", rtyp, 120, sv != NULL ? sv : "");
+				} else if(ret->type == V_INT || ret->type == V_INT64) {
+					snprintf(rb, sizeof(rb), "t%u %lld", rtyp,
+						 (long long)var_get_int64(ret));
+				} else if(ret->type == V_FLOAT || ret->type == V_FLOAT64) {
+					snprintf(rb, sizeof(rb), "t%u %.12g", rtyp,
+						 (double)var_get_float64(ret));
+				} else {
+					snprintf(rb, sizeof(rb), "t%u", rtyp);
+				}
+				fprintf(stderr, "[natdbg] %s{%s} -> %s pc=%u\n", fnm, ob, rb, (unsigned)vm->pc);
+				fflush(stderr);
+			}
+		}
 	}
 	else if(func->is_generator) {
 		/* ES6 `function*`: calling a generator function does not run the body;
@@ -7285,9 +7554,10 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num, bool i
 		vm_push(vm, err);
 		var_unref(err); //the stack ref keeps it alive now
 		vm_throw_truncate(vm); //drop operands the caller's interrupted expression leaked (e.g. `let x = nativeCall()`)
-		scope_t* tsc = vm_find_inrange_try(vm);
-		if(tsc == NULL) {
-			/* No frame of this run can catch: propagate outward instead of
+		scope_t* tsc = vm_find_inrange_handler(vm);
+		if(tsc == NULL || !tsc->is_try) {
+			/* No catch here, or the innermost handler is a finally-only scope:
+			 * propagate outward instead of
 			 * killing the whole VM (the old vm_terminate), and give the caller
 			 * handler its placeholder result. */
 			var_t* e2 = vm_pop2(vm);
@@ -7344,6 +7614,30 @@ static var_t* func_def(vm_t* vm, int regular, bool is_static) {
 			continue;
 		}
 		array_add_buf(&func->args, (void*)s, (uint32_t)strlen(s) + 1);
+	}
+
+	/* Function.toString source span lookup: materialize the source slice so
+	 * native_Function_toString can return it verbatim (browser parity). */
+	if(func->pc != 0 && vm->bc.fspans_size > 0) {
+		uint32_t i;
+		for(i = 0; i < vm->bc.fspans_size; i++) {
+			if(vm->bc.fspans[i].entry_pc == func->pc) {
+				struct st_bc_fspan_ent* e = &vm->bc.fspans[i];
+				if(e->src < vm->bc.srcs.size) {
+					const char* src = (const char*)vm->bc.srcs.items[e->src];
+					size_t src_len = strlen(src);
+					if(e->start < src_len && e->end < src_len && e->end >= e->start) {
+						uint32_t len = e->end - e->start + 1;
+						func->src_text = (char*)mario_malloc(len + 1);
+						if(func->src_text != NULL) {
+							memcpy(func->src_text, src + e->start, len);
+							func->src_text[len] = '\0';
+						}
+					}
+				}
+				break;
+			}
+		}
 	}
 
 	var_t* ret = var_new_func(vm, func);
@@ -8017,10 +8311,10 @@ return;
 		var_to_str(v1, s);
 		mstr_t* json = mstr_new("");
 		var_to_str(v2, json);
-		mstr_append(s, json->cstr);
+		mstr_append_n(s, json->cstr, json->len);
 		mstr_free(json);
 
-		var_t* v = var_new_str(vm, s->cstr);
+		var_t* v = var_new_str_bin(vm, s->cstr, s->len);
 		mstr_free(s);
 		math_result(vm, op, n, v);
 		return;
@@ -8211,8 +8505,25 @@ static inline void compare(vm_t* vm, opr_code_t op, var_t* v1, var_t* v2) {
 				case INSTR_NEQ: 
 				case INSTR_NTEQ:
 					i = (strcmp((const char*)v1->value, (const char*)v2->value) != 0);
-					if(i && getenv("MARIO_CMPDBG"))
-						fprintf(stderr, "[CMPDBG] str NEQ true: '%s' vs '%s'\n", (const char*)v1->value, (const char*)v2->value);
+					/* TEMP DIAGNOSTIC (baxia et_f VMP al("") RCA): the VMP fingerprints
+					 * the environment with `u = typeof o; a = u !== expected`, so a
+					 * TRUE string-inequality where one side is a typeof keyword is a
+					 * direct typeof divergence from Chrome (mario's actual typeof vs the
+					 * VMP's hardcoded expected). Gated by MARIO_CMPDBG; not script-number
+					 * gated (they drift between runs) - filter by tag afterwards. Remove
+					 * with the other temp probes. */
+					if(i && getenv("MARIO_CMPDBG")) {
+						const char* s1 = (const char*)v1->value;
+						const char* s2 = (const char*)v2->value;
+						static const char* tk[] = {"undefined","object","boolean","number",
+							"string","function","symbol","bigint",NULL};
+						int istot = 0;
+						for(int k = 0; tk[k] != NULL; ++k)
+							if(strcmp(s1, tk[k]) == 0 || strcmp(s2, tk[k]) == 0) { istot = 1; break; }
+						if(istot)
+							fprintf(stderr, "[CMPDBG] typeof-mismatch tag=%s pc=%u a='%s' b='%s'\n",
+								vm->dbg_tag != NULL ? vm->dbg_tag : "-", (unsigned)vm->pc, s1, s2);
+					}
 					break;
 				/* Relational on two strings is lexicographic by code unit, not
 				 * numeric: these four cases were missing entirely, so "a"<"b"
@@ -8356,25 +8667,29 @@ static void merge_accessor(node_t* ex, var_t* acc) {
 
 /* JS string .length counts UTF-16 code units. mario stores string values as
  * UTF-8, so decode each code point and count 2 for astral ones (>0xFFFF, i.e. a
- * surrogate pair in UTF-16) and 1 otherwise. Pure ASCII counts 1 per byte, so
- * this matches the old strlen() behaviour for the common case. */
-static int mstr_utf16_length(const char* s) {
+ * surrogate pair in UTF-16) and 1 otherwise. Bounded by the stored byte length
+ * `bytes` (NOT strlen) so an embedded 0x00 code unit - which a byte-buffer
+ * string built by String.fromCharCode / atob legitimately contains - is counted
+ * instead of silently terminating the scan (that truncation emptied the taobao
+ * AWSC VMP's tables and aborted it with al("")). */
+static int mstr_utf16_length_n(const char* s, uint32_t bytes) {
 	if(s == NULL)
 		return 0;
 	const unsigned char* p = (const unsigned char*)s;
+	const unsigned char* end = (const unsigned char*)s + bytes;
 	int units = 0;
-	while(*p != 0) {
+	while(p < end) {
 		unsigned char c = *p;
 		uint32_t cp;
 		if(c < 0x80) { cp = c; p += 1; }
-		else if((c >> 5) == 0x6 && p[1] != 0) {
+		else if((c >> 5) == 0x6 && p + 1 < end) {
 			cp = (uint32_t)(c & 0x1F) << 6 | (uint32_t)(p[1] & 0x3F); p += 2;
 		}
-		else if((c >> 4) == 0xE && p[1] != 0 && p[2] != 0) {
+		else if((c >> 4) == 0xE && p + 2 < end) {
 			cp = (uint32_t)(c & 0x0F) << 12 | (uint32_t)(p[1] & 0x3F) << 6 |
 					(uint32_t)(p[2] & 0x3F); p += 3;
 		}
-		else if((c >> 3) == 0x1E && p[1] != 0 && p[2] != 0 && p[3] != 0) {
+		else if((c >> 3) == 0x1E && p + 3 < end) {
 			cp = (uint32_t)(c & 0x07) << 18 | (uint32_t)(p[1] & 0x3F) << 12 |
 					(uint32_t)(p[2] & 0x3F) << 6 | (uint32_t)(p[3] & 0x3F); p += 4;
 		}
@@ -8452,7 +8767,7 @@ void do_get(vm_t* vm, var_t* v, const char* name, bool for_write) {
 		return;
 	}
 	if(strcmp(name, "length") == 0 && (v->type == V_STRING || var_is_string_obj(v))) {
-		int len = mstr_utf16_length(var_get_str(v));
+		int len = mstr_utf16_length_n(var_get_str(v), v->size);
 		vm_push(vm, var_new_int(vm, len));
 		return;
 	}
@@ -8495,6 +8810,22 @@ void do_get(vm_t* vm, var_t* v, const char* name, bool for_write) {
 		if(n != NULL)
 			mic_fill(vm, mic_site, v, name, n);
 	}
+	/* TEMP DIAGNOSTIC (taobao baxia VMP env-gap RCA): a READ whose name resolves to
+	 * nothing on the base (own + prototype chain) yields undefined - exactly the
+	 * signal of a host/BOM property Chrome has but this engine lacks. Log the name
+	 * for script_39 (gate on dbg_tag, immune to pc-base drift). Read-only, no value
+	 * mutation. Gated by MARIO_MISSGET; remove with the other temp probes. */
+	if(n == NULL && !for_write) {
+		static int s_mg = -1;
+		if(s_mg < 0) {
+			const char* me = getenv("MARIO_MISSGET");
+			s_mg = (me == NULL) ? 0 : (me[0] == '2' ? 2 : 1);
+		}
+		if(s_mg == 2)
+			fprintf(stderr, "[missget] '%s' base_type=%u pc=%u tag=%s\n", name, (unsigned)v->type, (unsigned)vm->pc, vm->dbg_tag != NULL ? vm->dbg_tag : "-");
+		else if(s_mg == 1 && vm->dbg_tag != NULL && strstr(vm->dbg_tag, "script_39") != NULL)
+			fprintf(stderr, "[missget] '%s' base_type=%u pc=%u\n", name, (unsigned)v->type, (unsigned)vm->pc);
+	}
 	if(getenv("MARIO_LMDBG") != NULL && strcmp(name, "lm") == 0) {
 		fprintf(stderr, "[lmdbg] GET base=%p type=%u refs=%d own=%p found=%p value=%p type=%u str=[%s] pc=%u\n",
 			(void*)v, (unsigned)v->type, (int)v->refs,
@@ -8527,12 +8858,37 @@ void do_get(vm_t* vm, var_t* v, const char* name, bool for_write) {
 	 * the declared arity. Own/inherited members still win (n != NULL skips). */
 	if(!for_write && n == NULL && (v->is_func || v->is_class) && strcmp(name, "name") == 0) {
 		var_t* fnv = var_find_own_member_var(v, "@@fname");
-		vm_push(vm, var_new_str(vm, (fnv != NULL && fnv->type == V_STRING) ? var_get_str(fnv) : ""));
+		const char* nm = (fnv != NULL && fnv->type == V_STRING) ? var_get_str(fnv) : NULL;
+		/* Script functions carry no @@fname member; fall back to the source name
+		 * the compiler stashed for self-binding (func_t.nfe_name) so `f.name`
+		 * reports the declared name like a real engine (Chrome parity). */
+		if(nm == NULL || nm[0] == 0) {
+			func_t* ff = var_get_func(v);
+			if(ff != NULL && ff->nfe_name != NULL)
+				nm = ff->nfe_name;
+		}
+		/* TEMP DIAGNOSTIC (taobao baxia VMP al("") RCA): log every empty fn.name
+		 * read so we can see whether the VMP resolves a symbol to "" via .name.
+		 * Gated by MARIO_NAMEDBG; remove with the other temp probes. */
+		if((nm == NULL || nm[0] == 0)) {
+			static int s_namedbg = -1;
+			if(s_namedbg < 0) s_namedbg = (getenv("MARIO_NAMEDBG") != NULL) ? 1 : 0;
+			if(s_namedbg) {
+				int inr = (vm->pc >= 715843 && vm->pc < 912412);
+				fprintf(stderr, "[namedbg] EMPTY fn.name pc=%u in_script39=%d tag=%s is_class=%d\n",
+					(unsigned)vm->pc, inr, vm->dbg_tag != NULL ? vm->dbg_tag : "-", (int)v->is_class);
+				fflush(stderr);
+			}
+		}
+		vm_push(vm, var_new_str(vm, (nm != NULL) ? nm : ""));
 		return;
 	}
 	if(!for_write && n == NULL && v->is_func && strcmp(name, "length") == 0) {
 		func_t* f = var_get_func(v);
-		vm_push(vm, var_new_int(vm, (f != NULL) ? (int)f->args.size : 0));
+		int flen = 0;
+		if(f != NULL)
+			flen = (f->decl_length >= 0) ? (int)f->decl_length : (int)f->args.size;
+		vm_push(vm, var_new_int(vm, flen));
 		return;
 	}
 	/* Reading `.call`/`.apply`/`.bind` off a callable: the universal Function
@@ -8628,6 +8984,22 @@ void do_get(vm_t* vm, var_t* v, const char* name, bool for_write) {
 		vm_push(vm, n->var);
 	else
 		vm_push_node(vm, n);
+	/* TEMP DIAGNOSTIC (taobao baxia VMP al("") RCA): log member reads that yield
+	 * an EMPTY STRING inside script_39's pc range, with the property name - the
+	 * VMP feeds one of these into its ReferenceError(name+" is not defined") guard
+	 * as "". Gated by MARIO_EMPTYGET; remove with the other temp probes. */
+	{
+		static int s_eg = -1;
+		if(s_eg < 0) s_eg = (getenv("MARIO_EMPTYGET") != NULL) ? 1 : 0;
+		if(s_eg && n != NULL && n->var != NULL && n->var->type == V_STRING &&
+		   vm->pc >= 715843 && vm->pc < 912412) {
+			const char* sv = var_get_str(n->var);
+			if(sv != NULL && sv[0] == 0) {
+				fprintf(stderr, "[emptyget] prop='%s' -> \"\" pc=%u\n", name, (unsigned)vm->pc);
+				fflush(stderr);
+			}
+		}
+	}
 }
 /* Link cls_var under its superclass. `implicit_obj` marks the default
  * `extends Object` every class gets from vm_new_class()/INSTR_EXTENDS, as
@@ -8688,6 +9060,14 @@ var_t* new_obj_with_ctor(vm_t* vm, var_t* ctor_var, const char* name, int arg_nu
 				bool hs = (op==0x03||op==0x06||op==0x09||op==0x0e||op==0x0f||op==0x13||op==0x17||op==0x47||op==0x64);
 				fprintf(stderr, "  pc=%u op=%02x oph=%05x%s%s\n", i, op, oph, hs ? " str=" : "", hs ? bc_getstr(&vm->bc, oph) : "");
 			}
+			for(scope_t* sc2 = vm_get_scope(vm); sc2 != NULL; sc2 = sc2->prev) {
+				node_t* on = (sc2->var != NULL) ? var_find_own_member(sc2->var, name) : NULL;
+				fprintf(stderr, "  scope is_func=%d fpc=%u var=%p own=%d type=%u\n",
+					(int)sc2->is_func, (sc2->func != NULL) ? (unsigned)sc2->func->pc : 0u,
+					(void*)sc2->var, on != NULL,
+					(on != NULL && on->var != NULL) ? (unsigned)on->var->type : 98u);
+			}
+			fflush(stderr);
 		}
 		/* Stack balance: the compiler already pushed arg_num operands for this
 		 * `new`. Every other early-out (the dangling-binding guard below and the
@@ -9749,17 +10129,23 @@ static inline void handle_load_impl(vm_t* vm, uint32_t offset, bool safe, bool r
 			var_t* var = raw ? vm->root : vm_get_scope_var(vm);
 			node = var_add(var, s, NULL);
 		}
-		/* Rvalue read of an accessor binding (e.g. `body` inside `with(document)`):
-		 * invoke the getter and push its result. The receiver is the innermost
-		 * scope var that provided the binding (the with-object), matching member
-		 * access semantics; without this the raw accessor var leaks as the value
-		 * and `with(body)` scopes a getter wrapper instead of the body element.
-		 * Assignment targets are retargeted to INSTR_LOADW by the compiler and
-		 * skip this so the raw node reaches the write path. */
-		if(!raw && node->var != NULL && var_is_accessor(node->var)) {
+		/* Accessor bindings need the scope object that supplied them as their
+		 * receiver, for BOTH reads and writes. A read invokes the getter now. A
+		 * write leaves [owner,node] just like do_get(for_write): handle_asign pops
+		 * that pair to invoke the setter. LOADW used to push only the node, so in
+		 * `with (script) f(a, id=x, src=y)` ASIGN consumed the preceding argument
+		 * as the setter's `this`, shifted the call's operand window and never wrote
+		 * the element. Fall back to the global object if no scope owner is found;
+		 * the pair must stay balanced even for a receiverless binding. */
+		if(node->var != NULL && var_is_accessor(node->var)) {
+			var_t* owner = vm_accessor_scope_owner(vm, s, node);
+			if(raw) {
+				vm_push(vm, owner != NULL ? owner : vm->root);
+				vm_push_node(vm, node);
+				return; /* never cache an accessor binding */
+			}
 			var_t* getter = var_accessor_getter(node->var);
 			if(getter != NULL) {
-				var_t* owner = vm_accessor_scope_owner(vm, s, node);
 				var_ref(getter);           /* protect across the nested run */
 				func_call(vm, owner, getter, 0, false); /* pushes the getter's return value */
 				var_unref(getter);
@@ -9803,9 +10189,9 @@ static inline void handle_loadv(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 	handle_load_impl(vm, offset, false, false, true);
 }
 
-/* LOADW: assignment-target form of LOAD - always pushes the raw binding node
- * (the compiler retargets the target LOAD of `x = v` / `x += v`), so accessor
- * setters see their node instead of the getter's result. */
+/* LOADW: assignment-target form of LOAD - pushes the raw binding node (the
+ * compiler retargets the target LOAD of `x = v` / `x += v`). Accessor targets
+ * also carry their receiver underneath the node for handle_asign's setter call. */
 static inline void handle_loadw(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
 	handle_load_impl(vm, offset, false, true, false);
 }
@@ -11004,6 +11390,39 @@ static void dbg_dump_member(const char* key, void* value, void* ud) {
 	fprintf(stderr, " %s%s", key, (nd && nd->be_const) ? "!" : "");
 }
 
+/* ES NamedEvaluation (Chrome parity): storing a NAMELESS function under a name
+ * gives it that name as its .name (`const f = () => {}` -> "f", `obj.m = fn`,
+ * object-literal / class members). Only fills an empty name so explicit
+ * declaration / named-expression names always win. The taobao baxia VMP reads
+ * .name of its arrows and methods; an empty name made it abort via al("").
+ * Stored as @@fname, the same slot the .name getter and native registration use,
+ * and deliberately NOT nfe_name (which would also create an in-body self-binding
+ * that only genuine named function expressions get). */
+static void infer_func_name(var_t* v, const char* name) {
+	if(v == NULL || name == NULL || name[0] == 0)
+		return;
+	{ /* A/B gate while RCA-ing the taobao script_29 chunk-loader throw. */
+		static int s_ni = -1;
+		if(s_ni < 0) s_ni = (getenv("MARIO_NOINFER") != NULL) ? 1 : 0;
+		if(s_ni) return;
+	}
+	if(!v->is_func && !v->is_class)
+		return;
+	var_t* fnv = var_find_own_member_var(v, "@@fname");
+	if(fnv != NULL && fnv->type == V_STRING && var_get_str(fnv)[0] != 0)
+		return;
+	func_t* f = var_get_func(v);
+	if(f != NULL && f->nfe_name != NULL && f->nfe_name[0] != 0)
+		return;
+	node_t* n = var_add(v, "@@fname", var_new_str(v->vm, name));
+	/* V8: Function.name is a NON-enumerable own property. Leaving the slot
+	 * enumerable leaked "@@fname" into Object.keys(fn) and broke webpack's
+	 * chunk registry (script_29 iterates Object.keys of a function and calls
+	 * each value). */
+	if(n != NULL)
+		n->be_unenumerable = 1;
+}
+
 static inline void handle_asign(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
 	register PC* code = vm->bc.code_buf;
 	var_t* v = vm_pop2(vm);
@@ -11014,6 +11433,32 @@ static inline void handle_asign(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 	 * need it (node_replace() would then var_ref() freed memory). Keep the
 	 * collector out until v is back on the stack or released. See vm_step_op(). */
 	vm->gc.gc_defer++;
+	/* TEMP DIAGNOSTIC (baxia et_f VMP al("") RCA): log every store of an EMPTY
+	 * string into a numeric (array-index) target while running a page script. The
+	 * VMP register file r[] is an array; r[q]=="" at the failing dispatch means an
+	 * earlier opcode stored "" into a register, so this pinpoints the write's pc
+	 * (which maps back to the VMP source op that produced the empty name). Gated by
+	 * MARIO_EMPTYSTORE; read-only. Remove with the other temp probes. */
+	if(v != NULL && n != NULL && n->name != NULL && v->type == V_STRING) {
+		static int s_es = -1;
+		if(s_es < 0) s_es = (getenv("MARIO_EMPTYSTORE") != NULL) ? 1 : 0;
+		if(s_es && ((const char*)v->value)[0] == '\0' && vm->dbg_tag != NULL) {
+			const char* nm = n->name;
+			int numeric = (nm[0] != '\0');
+			for(const char* p = nm; *p != '\0'; ++p)
+				if(*p < '0' || *p > '9') { numeric = 0; break; }
+			if(numeric) {
+				mstr_t* sm = mstr_new("");
+				bc_srcmap_locate(&vm->bc, vm->pc, sm);
+				fprintf(stderr, "[emptystore] tag=%s pc=%u idx=%s src=%s\n",
+					vm->dbg_tag, (unsigned)vm->pc, nm, sm->cstr);
+				mstr_free(sm);
+			}
+		}
+	}
+	/* NamedEvaluation: `f = () => {}` / `f = function(){}` names the function. */
+	if(v != NULL && n != NULL && n->name != NULL)
+		infer_func_name(v, n->name);
 	if(n == NULL) {
 		/* The target did not resolve to a writable node (e.g. `(a+b) = v`, or a
 		 * write through a bare rvalue). Still honour the assignment-expression
@@ -11696,6 +12141,24 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 
 	if(func == NULL && obj != NULL)
 		func = find_func(vm, obj, name->cstr, instr != INSTR_CALLO);
+
+	/* TEMP DIAGNOSTIC (baxia VMP al("") provenance): log the CALL-SITE pc of every
+	 * call to the VMP's ReferenceError guard `al` (a named function expression, so
+	 * nfe_name=="al") so the argument push sequence at that site can be mapped to a
+	 * script-local offset and disassembled. Gated by MARIO_ALDBG; remove with the
+	 * other temp probes. */
+	if(func != NULL && func->is_func) {
+		static int s_aldbg = -1;
+		if(s_aldbg < 0) s_aldbg = (getenv("MARIO_ALDBG") != NULL) ? 1 : 0;
+		if(s_aldbg) {
+			func_t* cf = var_get_func(func);
+			if(cf != NULL && cf->nfe_name != NULL && strcmp(cf->nfe_name, "al") == 0) {
+				fprintf(stderr, "[aldbg] CALL al callsite_pc=%u tag=%s argc=%d\n",
+					(unsigned)vm->pc, vm->dbg_tag != NULL ? vm->dbg_tag : "-", arg_num);
+				fflush(stderr);
+			}
+		}
+	}
 
 	/* A Proxy receiver on a fused member call (`proxy.method(args)`): find_func
 	 * walks the raw own/prototype member chain and never runs the proxy's `get`
@@ -12490,6 +12953,9 @@ static inline void handle_member(vm_t* vm, PC ins, opr_code_t instr, uint32_t of
 				return;
 			}
 		}
+		/* NamedEvaluation: object-literal / class member / `obj.m = fn`. */
+		if(v->is_func && s != NULL && s[0] != 0)
+			infer_func_name(v, s);
 		node_t* n = var_add(var, s, v);
 		/* ES6: methods defined in a class body live on the prototype (or on the
 		 * constructor for statics) and are non-enumerable, unlike object-literal
@@ -12758,13 +13224,13 @@ static var_t* native_string_iter_next(vm_t* vm, var_t* env, void* data) {
 	var_t* src = var_find_member_var(this_v, "@@src");
 	var_t* idxv = var_find_member_var(this_v, "@@idx");
 	const char* s = (src != NULL && (src->type == V_STRING || var_is_string_obj(src))) ? var_get_str(src) : NULL;
-	int len = (s != NULL) ? (int)strlen(s) : 0;
+	int len = (s != NULL) ? (int)src->size : 0;
 	int idx = (idxv != NULL) ? var_get_int(idxv) : 0;
 	if(s != NULL && idx < len) {
 		int n = utf8_cp_len((unsigned char)s[idx]);
 		if(idx + n > len) n = len - idx;
 		if(idxv != NULL) var_set_int(idxv, idx + n);
-		return iter_result(vm, var_new_str2(vm, s + idx, (uint32_t)n), false);
+		return iter_result(vm, var_new_str_bin(vm, s + idx, (uint32_t)n), false);
 	}
 	return iter_result(vm, NULL, true);
 }
@@ -12803,15 +13269,28 @@ var_t* vm_new_string_iterator(vm_t* vm, var_t* str) {
 var_t* vm_get_iterator(vm_t* vm, var_t* iterable) {
 	if(iterable == NULL)
 		return NULL;
+	/* TEMP DIAGNOSTIC (MARIO_TADB): why does GetIterator return NULL for the
+	 * baxia VMP's array-like at pc=909086? Log the branch actually taken. */
+	int s39i = (getenv("MARIO_TADB") != NULL && vm->pc >= 715843 && vm->pc < 912412);
 	if(iterable->type == V_OBJECT) {
 		node_t* m = var_find_member(iterable, SYMKEY_ITERATOR);
+		if(s39i)
+			fprintf(stderr, "[tadb-iter] OBJ isarr=%d sym=%p symfunc=%d pc=%u\n",
+				(int)iterable->is_array, (void*)m,
+				(int)(m!=NULL && m->var!=NULL && m->var->is_func), (unsigned)vm->pc);
 		if(m != NULL && m->var != NULL && m->var->is_func) {
 			func_call(vm, iterable, m->var, 0, false); /* pushes the iterator */
-			return vm_pop2(vm); /* carries the push ref */
+			var_t* it = vm_pop2(vm); /* carries the push ref */
+			if(s39i)
+				fprintf(stderr, "[tadb-iter]   => called symiter, ret=%p properr=%p pc=%u\n",
+					(void*)it, (void*)vm->propagating_err, (unsigned)vm->pc);
+			return it;
 		}
 		if(iterable->is_array) {
 			var_t* it = new_native_iter(vm, iterable, false);
 			var_ref(it);
+			if(s39i)
+				fprintf(stderr, "[tadb-iter]   => is_array native iter=%p pc=%u\n", (void*)it, (unsigned)vm->pc);
 			return it;
 		}
 	}
@@ -14140,6 +14619,8 @@ static inline void handle_memberv(vm_t* vm, PC ins, opr_code_t instr, uint32_t o
 				return;
 			}
 		}
+		if(v->is_func && key != NULL && key[0] != 0 && !key_is_symbol)
+			infer_func_name(v, key);   /* NamedEvaluation for computed-key stores */
 		node_t* n = var_add(var, key, v);
 		if(key_is_symbol && n != NULL)
 			n->be_unenumerable = 1; /* symbol keys hidden from Object.keys/for..in */
@@ -14226,6 +14707,27 @@ static void array_at_push(vm_t* vm, var_t* v1, var_t* v2, bool for_write) {
 		var_unref(v2);
 		return;
 	}
+	/* Arrays and strings expose length as a virtual own data property. Computed
+	 * access must agree with do_get: resolving through the prototype chain here
+	 * returned the native length() method instead of the numeric length. */
+	if(v2->type == V_STRING && strcmp(var_get_str(v2), "length") == 0) {
+		if(v1->is_array) {
+			if(for_write)
+				arrlen_push(vm, v1);
+			else
+				vm_push(vm, var_new_int(vm, (int)var_array_size(v1)));
+			var_unref(v1);
+			var_unref(v2);
+			return;
+		}
+		if(!for_write && (v1->type == V_STRING || var_is_string_obj(v1))) {
+			int len = mstr_utf16_length_n(var_get_str(v1), v1->size);
+			vm_push(vm, var_new_int(vm, len));
+			var_unref(v1);
+			var_unref(v2);
+			return;
+		}
+	}
 	/* TypedArray indexed read: `ta[i]` (or canonical `ta["i"]`) decodes element i
 	 * straight from the shared buffer. The cheap `!is_array && var_is_typedarray`
 	 * guard is one hash miss for every plain object/array, so the hot path is a
@@ -14292,14 +14794,25 @@ static void array_at_push(vm_t* vm, var_t* v1, var_t* v2, bool for_write) {
 		 * short-circuits, so arrays never pay it and plain objects pay one miss. */
 		int at = var_get_int(v2);
 		const char* s = var_get_str(v1);
-		int len = (s != NULL) ? (int)strlen(s) : 0;
-		if(at >= 0 && at < len) {
-			char ch[2] = { s[at], 0 };
-			vm_push(vm, var_new_str(vm, ch));
+		uint32_t bytes = (s != NULL) ? v1->size : 0;
+		if(s != NULL && at >= 0) {
+			/* Code-unit index (consistent with .length / charCodeAt / at), NUL-safe:
+			 * walk the stored byte length, not strlen, so an embedded 0x00 is a real
+			 * code unit and a multi-byte code point is returned whole. */
+			const char* p = s;
+			const char* end = s + bytes;
+			int i = 0;
+			while(p < end && i < at) { p += utf8_cp_len((unsigned char)*p); i++; }
+			if(p < end) {
+				int n = utf8_cp_len((unsigned char)*p);
+				if(p + n > end) n = (int)(end - p);
+				vm_push(vm, var_new_str_bin(vm, p, (uint32_t)n));
+				var_unref(v1);
+				var_unref(v2);
+				return;
+			}
 		}
-		else {
-			vm_push(vm, var_new(vm));
-		}
+		vm_push(vm, var_new(vm));
 		var_unref(v1);
 		var_unref(v2);
 		return;
@@ -15020,10 +15533,45 @@ static var_t* proxy_call_trap(vm_t* vm, var_t* p, var_t* fn, var_t** argv, int a
 /* Call `func` with this=thisArg and the natural-order args array. OWNED result. */
 static var_t* call_with_args(vm_t* vm, var_t* thisArg, var_t* func, var_t* argsNatural) {
 	var_t* args = var_new_array(vm);
-	int n = (argsNatural != NULL) ? (int)var_array_size(argsNatural) : 0;
-	for(int i = 0; i < n; i++) {
-		node_t* nd = var_array_get(argsNatural, i);
-		var_array_add(args, (nd != NULL && nd->var != NULL) ? nd->var : var_new(vm));
+	/* Function.prototype.apply treats its argArray as ANY array-like (ES
+	 * LengthOfArrayLike + per-index Get), not just a plain Array. The old code
+	 * read it through var_array_size/var_array_get, which only understand this
+	 * VM's internal `_ARRAY_` child-node store: a TypedArray keeps its elements
+	 * in the backing buffer (no `_ARRAY_`), so apply saw ZERO arguments and
+	 * `String.fromCharCode.apply(null, new Uint16Array(...))` collapsed to
+	 * `String.fromCharCode()` == "". Dispatch by shape. */
+	if(argsNatural != NULL && argsNatural->type != V_UNDEF && argsNatural->type != V_NULL) {
+		if(var_is_typedarray(argsNatural)) {
+			/* Elements live in the buffer; read length then materialize each via
+			 * the etype-aware accessor (returns a fresh owned var, adopted by the
+			 * args array). */
+			var_t* lenv = var_find_own_member_var(argsNatural, "length");
+			int64_t n = (lenv != NULL) ? var_get_int64(lenv) : 0;
+			for(int64_t i = 0; i < n; i++) {
+				var_t* el = var_typedarray_get_at(vm, argsNatural, i);
+				var_array_add(args, (el != NULL) ? el : var_new(vm));
+			}
+		}
+		else if(argsNatural->is_array) {
+			int n = (int)var_array_size(argsNatural);
+			for(int i = 0; i < n; i++) {
+				node_t* nd = var_array_get(argsNatural, i);
+				var_array_add(args, (nd != NULL && nd->var != NULL) ? nd->var : var_new(vm));
+			}
+		}
+		else {
+			/* Generic array-like: arguments object, NodeList, {length,0,1,..}.
+			 * Read the length member (own or inherited) then each index by its
+			 * canonical numeric-string key. */
+			var_t* lenv = var_find_member_var(argsNatural, "length");
+			int64_t n = (lenv != NULL) ? var_get_int64(lenv) : 0;
+			for(int64_t i = 0; i < n; i++) {
+				char key[32];
+				snprintf(key, sizeof(key), "%lld", (long long)i);
+				var_t* el = var_find_member_var(argsNatural, key);
+				var_array_add(args, (el != NULL) ? el : var_new(vm));
+			}
+		}
 	}
 	var_array_reverse(args);
 	var_t* res = call_m_func(vm, thisArg, func, args);
@@ -16118,9 +16666,48 @@ static inline void handle_throw(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 	/* A `throw` inside a finally body overrides any return parked for that finally. */
 	vm_clear_pending(vm);
 	vm_throw_truncate(vm); // the thrown value is on top; drop operands the interrupted expression leaked
-	scope_t* try_sc = vm_find_inrange_try(vm);
-	if(try_sc == NULL) {
-		/* Unhandled user throw: propagate outward (a vm_run frame with an
+	scope_t* try_sc = vm_find_inrange_handler(vm);
+	/* TEMP DIAGNOSTIC (baxia VMP empty-name ReferenceError): capture the exact pc
+	 * of a JS-level `throw`, whether an in-range try existed, and the frame chain,
+	 * so the throw site can be mapped into the script's local offset and
+	 * disassembled. Gated by MARIO_THROWJS; remove with the other temp probes. */
+	static int s_throwjs = -1;
+	if(s_throwjs < 0) s_throwjs = (getenv("MARIO_THROWJS") != NULL) ? 1 : 0;
+	if(s_throwjs) {
+		const char* tmsg = "";
+		var_t* tv0 = vm_peek_var(vm);
+		if(tv0 != NULL && tv0->type == V_OBJECT) {
+			var_t* mv = var_find_member_var(tv0, "message");
+			if(mv != NULL && mv->type == V_STRING) tmsg = var_get_str(mv);
+		}
+		fprintf(stderr, "[throwjs] pc=%u try_inrange=%d tag=%s msg='%s'\n",
+			(unsigned)vm->pc, (try_sc != NULL) ? 1 : 0,
+			vm->dbg_tag != NULL ? vm->dbg_tag : "-", tmsg);
+		{
+			const char* turl = NULL; int tln = 0, tcl = 0;
+			if(bc_srcmap_locate_v8(&vm->bc, vm->pc, &turl, &tln, &tcl))
+				fprintf(stderr, "[throwjs]   at %s:%d:%d\n", turl ? turl : "-", tln, tcl);
+		}
+		scope_t* tsc = vm_get_scope(vm);
+		int thop = 0;
+		while(tsc != NULL && thop++ < 8) {
+			if(tsc->is_func && tsc->func != NULL) {
+				const char* furl = NULL; int fln = 0, fcl = 0;
+				char floc[512];
+				if(bc_srcmap_locate_v8(&vm->bc, tsc->func->pc, &furl, &fln, &fcl))
+					snprintf(floc, sizeof floc, "%s:%d:%d", furl ? furl : "-", fln, fcl);
+				else
+					snprintf(floc, sizeof floc, "<nosrc>");
+				fprintf(stderr, "[throwjs]   frame[%d] entrypc=%u is_try=%d at %s\n",
+					thop, (unsigned)tsc->func->pc, (int)tsc->is_try, floc);
+			}
+			tsc = tsc->prev;
+		}
+		fflush(stderr);
+	}
+	if(try_sc == NULL || !try_sc->is_try) {
+		/* No catch here, or the innermost handler is a finally-only scope: an
+		 * unhandled user throw propagates outward (a vm_run frame with an
 		 * in-range catch consumes it; the script top reports it).
 		 *
 		 * The value-stack slot is a void* that may hold EITHER a var_t* (magic==0)
@@ -16620,10 +17207,10 @@ bool vm_run(vm_t* vm) {
 #endif
 	do {
 		if(vm->abort_run) {
-			scope_t* try_sc = vm_find_inrange_try(vm);
+			scope_t* try_sc = vm_find_inrange_handler(vm);
 			if(getenv("MARIO_DIAGX"))
 				mario_printf("[DIAGX] vm_run abort try_sc=%p base=%d top=%d stack=%d sbase=%d\n", (void*)try_sc, vm->run_scope_base, vm->scope_stack_top, vm->stack_top, vm->run_stack_base);
-			if(try_sc != NULL) {
+			if(try_sc != NULL && try_sc->is_try) {
 				/* Catch in THIS frame: discard operands the interrupted expression
 				 * leaked, re-seat the propagated error for handle_catch, enter the
 				 * catch body and keep running this loop. */
@@ -16641,19 +17228,20 @@ bool vm_run(vm_t* vm) {
 				vm->pc = try_sc->pc;
 				continue;
 			}
-			/* No catch in this frame. Before unwinding out, run any `finally` the
-			 * propagating error leaves behind: a throw out of try{}finally{} (whose
-			 * TRY was demoted to a BLOCK, so vm_find_inrange_try skips it), or out of
-			 * a try{}catch{}finally{} whose catch rethrew. Park the error as
-			 * pending_value (FIN_THROW), clear abort_run, pop scopes down to and
-			 * including the finally's scope, and jump into the finally body; its
+			/* The innermost handler is a `finally` with no live catch inner to it
+			 * (try_sc is NULL or a finally-only scope here, since the is_try case
+			 * continued above): a throw out of try{}finally{} (whose TRY was demoted
+			 * to a BLOCK), or out of a try{}catch{}finally{} whose catch rethrew.
+			 * Run that finally BEFORE the error reaches any outer catch. Park the
+			 * error as pending_value (FIN_THROW), clear abort_run, pop scopes down to
+			 * and including the finally's scope, and jump into the finally body; its
 			 * INSTR_FINALLY_END re-arms propagation (handle_finally_end), so this
-			 * branch is re-entered, finds no finally left, and unwinds out. Nested
-			 * finallys thus run inner-to-outer, matching return/break/continue. This
-			 * is what lets React's scheduler reset isMessageLoopRunning in the finally
-			 * of performWorkUntilDeadline when flushWork throws - without it the flag
-			 * stays true forever and no further work is ever scheduled/committed. */
-			scope_t* fin = vm_find_inrange_finally(vm);
+			 * branch is re-entered, finds the next handler outward, and continues.
+			 * Nested finallys thus run inner-to-outer, matching return/break/continue.
+			 * This is what lets React's scheduler reset isMessageLoopRunning in the
+			 * finally of performWorkUntilDeadline when flushWork throws - without it the
+			 * flag stays true forever and no further work is ever scheduled/committed. */
+			scope_t* fin = (try_sc != NULL && try_sc->has_finally) ? try_sc : NULL;
 			if(fin != NULL) {
 				PC fpc = fin->pc_finally;   /* read before fin is popped/freed */
 				/* Discard operands the interrupted expression leaked (stack BEFORE
@@ -17146,6 +17734,17 @@ static node_t* reg_native_to(vm_t* vm, var_t* target, const char* decl, native_f
 	} 
 	mstr_free(arg);
 
+	/* Optional explicit Function.prototype.length override: a trailing "#N" on the
+	 * decl sets the reported arity independently of the parameter list. Natives
+	 * read arguments positionally (get_func_arg), so the parameter names remain
+	 * documentation while N carries the spec length (Array.from#1, fill#2, ...).
+	 * The arg loop above stops flushing at ')' and discards any trailing text,
+	 * so "#N" never leaks into args; scan the raw decl for the marker here. */
+	{
+		const char* h = strchr(decl, '#');
+		if(h != NULL) func->decl_length = (int16_t)atoi(h + 1);
+	}
+
 	var_t* var = var_new_func(vm, func);
 	node_t* node = NULL;
 	if(func->regular == FUNC_GETTER || func->regular == FUNC_SETTER) {
@@ -17224,7 +17823,17 @@ float get_float(var_t* var, const char* name) {
 
 double get_float64(var_t* var, const char* name) {
 	var_t* v = get_obj(var, name);
-	return v == NULL ? 0 : var_get_float64(v);
+	if(v == NULL) return 0;
+	/* This named-member accessor is used only by the Math natives; coerce a
+	 * non-number operand with the exact ECMA ToNumber so e.g. Math.sin("0") and
+	 * Math.log("1") match Chrome (var_get_float64 alone returns 0 for strings). */
+	switch(v->type) {
+		case V_INT: case V_INT64: case V_FLOAT: case V_FLOAT64:
+		case V_BOOL: case V_BIGINT:
+			return var_get_float64(v);
+		default:
+			return vm_to_number(v->vm, v);
+	}
 }
 
 var_t* get_obj(var_t* var, const char* name) {

@@ -256,27 +256,10 @@ var_t* number_to_locale_var(vm_t* vm, var_t* v, var_t* opts) {
 	return var_new_str(vm, out);
 }
 
-/* Number.prototype.toFixed(digits): fixed-point decimal string with `digits`
- * places after the point. digits is clamped to [0,100] (JS throws RangeError
- * outside that range; we clamp instead). NaN/Infinity render as their JS strings.
- * The underlying value is read at full double width. */
-var_t* native_Number_toFixed(vm_t* vm, var_t* env, void* data) {
-	(void)data;
-	var_t* v = number_this_value(env);
-	if(v == NULL) v = get_obj(env, THIS);
-	double d = var_get_float64(v);
-	int digits = get_int(env, "digits");
-	if(digits < 0) digits = 0;
-	if(digits > 100) digits = 100;
-	char buf[360];
-	if(isnan(d))
-		snprintf(buf, sizeof(buf), "NaN");
-	else if(isinf(d))
-		snprintf(buf, sizeof(buf), "%s", d < 0 ? "-Infinity" : "Infinity");
-	else
-		snprintf(buf, sizeof(buf), "%.*f", digits, d);
-	return var_new_str(vm, buf);
-}
+/* Number.prototype.toFixed is defined below, after the exact-decimal helpers
+ * (js_dec_expand/js_dec_round): libc "%.*f" rounds half-to-even while JS rounds
+ * a tie away from zero (ES2024 21.1.3.3 step 6 picks the larger n, so
+ * (2.5).toFixed(0) is "3" and (1.25).toFixed(1) is "1.3", not libc's "2"/"1.2"). */
 
 /* ---- exact decimal expansion, shared by toExponential / toPrecision ------
  * Neither can be delegated to "%.*e": printf() rounds half-to-even while JS
@@ -352,6 +335,87 @@ static void js_dec_round(js_dec_t* v, int keep) {
 		v->digits[keep + 1] = '\0';
 		v->exp += 1;
 	}
+}
+
+/* Fixed-point "<sign>ddd[.ddd]" from an already-rounded exact expansion. The
+ * decimal point sits after digit index v->exp (value = 0.<digits> * 10^(exp+1)),
+ * so the integer part is the first exp+1 digits and the fraction runs from there.
+ * Indices outside the digit string render as '0' - which also yields the leading
+ * fraction zeros for |x|<1 (exp+1 <= 0). */
+static void js_dec_fmt_fixed(const js_dec_t* v, int frac, char* out, size_t outsz) {
+	int L = (int)strlen(v->digits);
+	int intLen = v->exp + 1;
+	char buf[JS_NUM_DEC_DIGITS + 16];
+	char* p = buf;
+	if(v->sign) *p++ = '-';
+	if(intLen <= 0) {
+		*p++ = '0';
+	} else {
+		for(int i = 0; i < intLen; ++i)
+			*p++ = (i < L) ? v->digits[i] : '0';
+	}
+	if(frac > 0) {
+		*p++ = '.';
+		for(int i = intLen; i < intLen + frac; ++i)
+			*p++ = (i >= 0 && i < L) ? v->digits[i] : '0';
+	}
+	*p = '\0';
+	snprintf(out, outsz, "%s", buf);
+}
+
+/* Number.prototype.toFixed(digits): fixed-point decimal string with `digits`
+ * places after the point. digits is clamped to [0,100] (JS throws RangeError
+ * outside that range; we clamp instead). NaN/Infinity render as their JS strings.
+ * Ties round away from zero per spec (see js_dec_round), NOT libc's half-to-even,
+ * so (2.5).toFixed(0)=="3" and (1.25).toFixed(1)=="1.3" like V8. */
+var_t* native_Number_toFixed(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	var_t* v = number_this_value(env);
+	if(v == NULL) v = get_obj(env, THIS);
+	double d = var_get_float64(v);
+	int digits = get_int(env, "digits");
+	if(digits < 0) digits = 0;
+	if(digits > 100) digits = 100;
+	char buf[JS_NUM_DEC_DIGITS + 16];
+	if(isnan(d))
+		snprintf(buf, sizeof(buf), "NaN");
+	else if(isinf(d))
+		snprintf(buf, sizeof(buf), "%s", d < 0 ? "-Infinity" : "Infinity");
+	else if(fabs(d) >= 1e21) {
+		/* ES Number.prototype.toFixed step 8: when |x| >= 10^21 the result is
+		 * ToString(x), so (1e21).toFixed(2) is "1e+21" rather than a 22-digit
+		 * fixed expansion. ToString already carries the sign, so no prefix here. */
+		mstr_t* ms = mstr_new("");
+		var_to_str(v, ms);
+		var_t* r = var_new_str(vm, ms->cstr);
+		mstr_free(ms);
+		return r;
+	}
+	else {
+		/* Expand to exact decimal digits, keep (integer digits + frac) of them
+		 * rounded half-up, then lay out the fixed form. keep is derived from the
+		 * pre-round exponent; js_dec_round absorbs a carry by bumping exp, which
+		 * js_dec_fmt_fixed re-reads so 9.99 -> "10.0" places the point right. */
+		js_dec_t dec;
+		js_dec_expand(d, &dec);
+		int keep = dec.exp + digits + 1;
+		if(keep <= 0) {
+			/* The first significant digit sits strictly below the last kept
+			 * fraction place, so |x| < 10^-digits: the result is 0, except an
+			 * exact half-up tie at keep==0 (first digit >= 5) rounds to
+			 * 10^-digits (e.g. (0.9).toFixed(0)=="1", (0.06).toFixed(1)=="0.1").
+			 * Encode the rounded single digit + exponent so the shared fixed
+			 * formatter lays out the point and leading zeros. */
+			int roundup = (keep == 0 && dec.digits[0] >= '5');
+			if(roundup) { dec.digits[0] = '1'; dec.digits[1] = '\0'; dec.exp = -digits; }
+			else        { dec.digits[0] = '0'; dec.digits[1] = '\0'; dec.exp = -1; }
+			js_dec_fmt_fixed(&dec, digits, buf, sizeof(buf));
+			return var_new_str(vm, buf);
+		}
+		js_dec_round(&dec, keep);
+		js_dec_fmt_fixed(&dec, digits, buf, sizeof(buf));
+	}
+	return var_new_str(vm, buf);
 }
 
 /* Shortest expansion that parses back to the same double (used when
@@ -728,11 +792,11 @@ void reg_native_Number(vm_t* vm) {
 	 * class first so var_new_int64()/var_new_float64() can attach Number.prototype;
 	 * otherwise Number.MIN_SAFE_INTEGER.toString() has no method chain. */
 	vm->builtin_vars.var_Number = cls;
-	vm_reg_native(vm, cls, "toString(radix)", native_Number_toString, NULL); 
-	vm_reg_native(vm, cls, "toLocaleString(locale, options)", native_Number_toLocaleString, NULL); 
-	vm_reg_native(vm, cls, "toFixed(digits)", native_Number_toFixed, NULL);
-	vm_reg_native(vm, cls, "toExponential(fractionDigits)", native_Number_toExponential, NULL);
-	vm_reg_native(vm, cls, "toPrecision(precision)", native_Number_toPrecision, NULL);
+	vm_reg_native(vm, cls, "toString(radix)#0", native_Number_toString, NULL); 
+	vm_reg_native(vm, cls, "toLocaleString(locale, options)#0", native_Number_toLocaleString, NULL); 
+	vm_reg_native(vm, cls, "toFixed(digits)#0", native_Number_toFixed, NULL);
+	vm_reg_native(vm, cls, "toExponential(fractionDigits)#0", native_Number_toExponential, NULL);
+	vm_reg_native(vm, cls, "toPrecision(precision)#0", native_Number_toPrecision, NULL);
 	vm_reg_native(vm, cls, "valueOf()", native_Number_valueOf, NULL);
 	vm_reg_native(vm, cls, "constructor(value)", native_Number_constructor, NULL); 
 

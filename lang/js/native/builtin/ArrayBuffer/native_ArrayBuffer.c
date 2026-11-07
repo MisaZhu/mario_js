@@ -4,6 +4,8 @@ extern "C" {
 
 #include "native_ArrayBuffer.h"
 #include <string.h>
+#include <stdio.h>   /* TEMP DIAGNOSTIC (MARIO_TADB) */
+#include <stdlib.h>  /* TEMP DIAGNOSTIC (getenv) */
 
 #define CLS_ARRAYBUFFER "ArrayBuffer"
 
@@ -58,6 +60,11 @@ var_t* native_ArrayBuffer_constructor(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* this_v = get_obj(env, THIS);
 	int64_t len = var_get_int64(get_obj(env, "length"));
+	if(getenv("MARIO_TADB") != NULL && vm->pc >= 715843 && vm->pc < 912412) {
+		var_t* lv = get_obj(env, "length");
+		fprintf(stderr, "[tabd-ab] new ArrayBuffer len=%lld argtype=%u pc=%u\n",
+			(long long)len, (unsigned)(lv!=NULL?lv->type:99), (unsigned)vm->pc);
+	}
 	if(len < 0) {
 		vm_throw_type_native(vm, "RangeError", "Invalid array buffer length");
 		ab_setup(vm, this_v, NULL, 0);
