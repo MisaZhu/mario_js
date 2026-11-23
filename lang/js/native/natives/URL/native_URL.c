@@ -99,6 +99,11 @@ static void usp_parse_query(vm_t* vm, var_t* pairs, const char* q) {
         size_t seglen = amp ? (size_t)(amp - p) : strlen(p);
         if(seglen > 0) {
             char* seg = (char*)mario_malloc((uint32_t)seglen + 1);
+            if(seg == NULL) { /* OOM: drop this pair */
+        	if(amp == NULL) break;
+        	p = amp + 1;
+        	continue;
+            }
             memcpy(seg, p, seglen); seg[seglen] = 0;
             char* eq = strchr(seg, '=');
             mstr_t* k = mstr_new(""), *v = mstr_new("");
@@ -109,7 +114,7 @@ static void usp_parse_query(vm_t* vm, var_t* pairs, const char* q) {
             } else {
                 usp_decode(k, seg);   /* no '=': value is the empty string */
             }
-            usp_add_pair(vm, pairs, k->cstr, v->cstr);
+            usp_add_pair(vm, pairs, MSTR_CSTR(k), v->cstr);
             mstr_free(k); mstr_free(v); mario_free(seg);
         }
         if(amp == NULL) break;
@@ -128,7 +133,7 @@ static void usp_record_cb(const char* key, void* value, void* user_data) {
     if(strcmp(key, "_ARRAY_") == 0) return;
     mstr_t* v = mstr_new("");
     if(nd->var != NULL) var_to_str(nd->var, v);
-    usp_add_pair(c->vm, c->pairs, key, v->cstr);
+    usp_add_pair(c->vm, c->pairs, key, MSTR_CSTR(v));
     mstr_free(v);
 }
 
@@ -158,7 +163,7 @@ static var_t* usp_constructor(vm_t* vm, var_t* env, void* data) {
                 mstr_t* k = mstr_new(""), *v = mstr_new("");
                 if(kn && kn->var) var_to_str(kn->var, k);
                 if(vn && vn->var) var_to_str(vn->var, v);
-                usp_add_pair(vm, pairs, k->cstr, v->cstr);
+                usp_add_pair(vm, pairs, MSTR_CSTR(k), v->cstr);
                 mstr_free(k); mstr_free(v);
             }
         } else {
@@ -179,7 +184,7 @@ static var_t* usp_append(vm_t* vm, var_t* env, void* data) {
     var_t* kv = get_obj(env, "name"); var_t* vv = get_obj(env, "value");
     if(kv) var_to_str(kv, k);
     if(vv) var_to_str(vv, v);
-    usp_add_pair(vm, pairs, k->cstr, v->cstr);
+    usp_add_pair(vm, pairs, MSTR_CSTR(k), v->cstr);
     mstr_free(k); mstr_free(v);
     return NULL;
 }
@@ -198,7 +203,7 @@ static var_t* usp_delete(vm_t* vm, var_t* env, void* data) {
         node_t* pn = var_array_get(pairs, (int32_t)i);
         if(pn == NULL || pn->var == NULL) continue;
         node_t* kn = var_array_get(pn->var, 0);
-        if(kn && kn->var && strcmp(var_get_str(kn->var), k->cstr) == 0)
+        if(kn && kn->var && strcmp(var_get_str(kn->var), MSTR_CSTR(k)) == 0)
             continue;
         var_array_add(out, pn->var);
     }
@@ -219,7 +224,7 @@ static var_t* usp_get(vm_t* vm, var_t* env, void* data) {
         node_t* pn = var_array_get(pairs, (int32_t)i);
         if(pn == NULL || pn->var == NULL) continue;
         node_t* kn = var_array_get(pn->var, 0);
-        if(kn && kn->var && strcmp(var_get_str(kn->var), k->cstr) == 0) {
+        if(kn && kn->var && strcmp(var_get_str(kn->var), MSTR_CSTR(k)) == 0) {
             node_t* vn = var_array_get(pn->var, 1);
             mstr_free(k);
             /* Return a fresh copy so the caller owns an independent string. */
@@ -243,7 +248,7 @@ static var_t* usp_getAll(vm_t* vm, var_t* env, void* data) {
         node_t* pn = var_array_get(pairs, (int32_t)i);
         if(pn == NULL || pn->var == NULL) continue;
         node_t* kn = var_array_get(pn->var, 0);
-        if(kn && kn->var && strcmp(var_get_str(kn->var), k->cstr) == 0) {
+        if(kn && kn->var && strcmp(var_get_str(kn->var), MSTR_CSTR(k)) == 0) {
             node_t* vn = var_array_get(pn->var, 1);
             var_array_add(out, (vn && vn->var) ? vn->var : var_new_str(vm, ""));
         }
@@ -264,7 +269,7 @@ static var_t* usp_has(vm_t* vm, var_t* env, void* data) {
         node_t* pn = var_array_get(pairs, (int32_t)i);
         if(pn == NULL || pn->var == NULL) continue;
         node_t* kn = var_array_get(pn->var, 0);
-        if(kn && kn->var && strcmp(var_get_str(kn->var), k->cstr) == 0) {
+        if(kn && kn->var && strcmp(var_get_str(kn->var), MSTR_CSTR(k)) == 0) {
             mstr_free(k);
             return var_new_bool(vm, true);
         }
@@ -291,13 +296,13 @@ static var_t* usp_set(vm_t* vm, var_t* env, void* data) {
         node_t* pn = var_array_get(pairs, (int32_t)i);
         if(pn == NULL || pn->var == NULL) continue;
         node_t* kn = var_array_get(pn->var, 0);
-        if(kn && kn->var && strcmp(var_get_str(kn->var), k->cstr) == 0) {
-            if(!done) { usp_add_pair(vm, out, k->cstr, v->cstr); done = true; }
+        if(kn && kn->var && strcmp(var_get_str(kn->var), MSTR_CSTR(k)) == 0) {
+            if(!done) { usp_add_pair(vm, out, MSTR_CSTR(k), v->cstr); done = true; }
             continue;
         }
         var_array_add(out, pn->var);
     }
-    if(!done) usp_add_pair(vm, out, k->cstr, v->cstr);
+    if(!done) usp_add_pair(vm, out, MSTR_CSTR(k), v->cstr);
     mstr_free(k); mstr_free(v);
     usp_replace_pairs(self, out);
     return NULL;
@@ -327,7 +332,7 @@ static var_t* usp_toString(vm_t* vm, var_t* env, void* data) {
     var_t* self = get_obj(env, THIS);
     mstr_t* out = mstr_new("");
     usp_write(self, out);
-    var_t* r = var_new_str(vm, out->cstr);
+    var_t* r = var_new_str(vm, MSTR_CSTR(out));
     mstr_free(out);
     return r;
 }
@@ -635,32 +640,34 @@ static void url_parse(url_parts* out, const char* raw, const url_parts* base) {
     size_t len = strlen(s);
     while(len > 0 && (unsigned char)s[len - 1] <= ' ') len--;
     char* input = (char*)mario_malloc(len + 1);
+    if(input == NULL) /* OOM: degrade to an empty URL instead of faulting */
+        return;
     memcpy(input, s, len); input[len] = 0;
 
     mstr_t* scheme = mstr_new("");
     const char* rest = NULL;
     if(url_try_scheme(input, scheme, &rest)) {
-        mstr_cpy(out->scheme, scheme->cstr);
-        url_parse_after_scheme(out, rest, url_scheme_is_special(scheme->cstr));
+        mstr_cpy(out->scheme, MSTR_CSTR(scheme));
+        url_parse_after_scheme(out, rest, url_scheme_is_special(MSTR_CSTR(scheme)));
     } else if(input[0] == '/' && input[1] == '/') {
         /* protocol-relative: inherit base scheme (if any) */
-        if(base != NULL) mstr_cpy(out->scheme, base->scheme->cstr);
+        if(base != NULL) mstr_cpy(out->scheme, MSTR_CSTR(base->scheme));
         url_parse_after_scheme(out, input,
-            base != NULL ? url_scheme_is_special(base->scheme->cstr) : false);
+            base != NULL ? url_scheme_is_special(MSTR_CSTR(base->scheme)) : false);
     } else if(base != NULL) {
-        mstr_cpy(out->scheme,   base->scheme->cstr);
-        mstr_cpy(out->username, base->username->cstr);
-        mstr_cpy(out->password, base->password->cstr);
-        mstr_cpy(out->hostname, base->hostname->cstr);
-        mstr_cpy(out->port,     base->port->cstr);
+        mstr_cpy(out->scheme,   MSTR_CSTR(base->scheme));
+        mstr_cpy(out->username, MSTR_CSTR(base->username));
+        mstr_cpy(out->password, MSTR_CSTR(base->password));
+        mstr_cpy(out->hostname, MSTR_CSTR(base->hostname));
+        mstr_cpy(out->port,     MSTR_CSTR(base->port));
         out->has_authority = base->has_authority;
 
         if(input[0] == '?') {
-            mstr_cpy(out->path, base->path->cstr);
+            mstr_cpy(out->path, MSTR_CSTR(base->path));
             url_parse_tail(out, input);
         } else if(input[0] == '#') {
-            mstr_cpy(out->path, base->path->cstr);
-            if(base->has_query) { out->has_query = true; mstr_cpy(out->query, base->query->cstr); }
+            mstr_cpy(out->path, MSTR_CSTR(base->path));
+            if(base->has_query) { out->has_query = true; mstr_cpy(out->query, MSTR_CSTR(base->query)); }
             url_parse_tail(out, input);
         } else if(input[0] == '/') {
             const char* sep = input;
@@ -672,13 +679,13 @@ static void url_parse(url_parts* out, const char* raw, const url_parts* base) {
             const char* sep = input;
             while(*sep != 0 && *sep != '?' && *sep != '#') sep++;
             mstr_t* merged = mstr_new("");
-            const char* lastslash = strrchr(base->path->cstr, '/');
+            const char* lastslash = strrchr(MSTR_CSTR(base->path), '/');
             if(lastslash != NULL)
-                mstr_appendn(merged, base->path->cstr, (size_t)(lastslash - base->path->cstr + 1));
+                mstr_appendn(merged, MSTR_CSTR(base->path), (size_t)(lastslash - MSTR_CSTR(base->path) + 1));
             else if(base->has_authority)
                 mstr_add(merged, '/');
             mstr_appendn(merged, input, (size_t)(sep - input));
-            mstr_append(out->path, merged->cstr);
+            mstr_append(out->path, MSTR_CSTR(merged));
             mstr_free(merged);
             url_parse_tail(out, sep);
         }
@@ -689,8 +696,8 @@ static void url_parse(url_parts* out, const char* raw, const url_parts* base) {
     /* Normalise dot segments for hierarchical URLs (those with an authority). */
     if(out->has_authority) {
         mstr_t* cleaned = mstr_new("");
-        url_remove_dot_segments(cleaned, out->path->cstr);
-        mstr_cpy(out->path, cleaned->cstr);
+        url_remove_dot_segments(cleaned, MSTR_CSTR(out->path));
+        mstr_cpy(out->path, MSTR_CSTR(cleaned));
         mstr_free(cleaned);
     }
 
@@ -700,20 +707,20 @@ static void url_parse(url_parts* out, const char* raw, const url_parts* base) {
 
 /* Serialize parts into href form. */
 static void url_serialize(mstr_t* out, const url_parts* p) {
-    if(p->scheme->len > 0) { mstr_append(out, p->scheme->cstr); mstr_add(out, ':'); }
+    if(MSTR_LEN(p->scheme) > 0) { mstr_append(out, MSTR_CSTR(p->scheme)); mstr_add(out, ':'); }
     if(p->has_authority) {
         mstr_append(out, "//");
-        if(p->username->len > 0 || p->password->len > 0) {
-            mstr_append(out, p->username->cstr);
-            if(p->password->len > 0) { mstr_add(out, ':'); mstr_append(out, p->password->cstr); }
+        if(MSTR_LEN(p->username) > 0 || MSTR_LEN(p->password) > 0) {
+            mstr_append(out, MSTR_CSTR(p->username));
+            if(MSTR_LEN(p->password) > 0) { mstr_add(out, ':'); mstr_append(out, MSTR_CSTR(p->password)); }
             mstr_add(out, '@');
         }
-        mstr_append(out, p->hostname->cstr);
-        if(p->port->len > 0) { mstr_add(out, ':'); mstr_append(out, p->port->cstr); }
+        mstr_append(out, MSTR_CSTR(p->hostname));
+        if(MSTR_LEN(p->port) > 0) { mstr_add(out, ':'); mstr_append(out, MSTR_CSTR(p->port)); }
     }
-    mstr_append(out, p->path->cstr);
-    if(p->has_query) { mstr_add(out, '?'); mstr_append(out, p->query->cstr); }
-    if(p->has_fragment) { mstr_add(out, '#'); mstr_append(out, p->fragment->cstr); }
+    mstr_append(out, MSTR_CSTR(p->path));
+    if(p->has_query) { mstr_add(out, '?'); mstr_append(out, MSTR_CSTR(p->query)); }
+    if(p->has_fragment) { mstr_add(out, '#'); mstr_append(out, MSTR_CSTR(p->fragment)); }
 }
 
 static void url_add_str(vm_t* vm, var_t* self, const char* key, const char* val) {
@@ -724,22 +731,22 @@ static void url_add_str(vm_t* vm, var_t* self, const char* key, const char* val)
  * @@pfx = protocol + [//userinfo@host] + pathname, @@sfx = hash. */
 static void url_store_halves(vm_t* vm, var_t* self, const url_parts* p) {
     mstr_t* pfx = mstr_new("");
-    if(p->scheme->len > 0) { mstr_append(pfx, p->scheme->cstr); mstr_add(pfx, ':'); }
+    if(MSTR_LEN(p->scheme) > 0) { mstr_append(pfx, MSTR_CSTR(p->scheme)); mstr_add(pfx, ':'); }
     if(p->has_authority) {
         mstr_append(pfx, "//");
-        if(p->username->len > 0 || p->password->len > 0) {
-            mstr_append(pfx, p->username->cstr);
-            if(p->password->len > 0) { mstr_add(pfx, ':'); mstr_append(pfx, p->password->cstr); }
+        if(MSTR_LEN(p->username) > 0 || MSTR_LEN(p->password) > 0) {
+            mstr_append(pfx, MSTR_CSTR(p->username));
+            if(MSTR_LEN(p->password) > 0) { mstr_add(pfx, ':'); mstr_append(pfx, MSTR_CSTR(p->password)); }
             mstr_add(pfx, '@');
         }
-        mstr_append(pfx, p->hostname->cstr);
-        if(p->port->len > 0) { mstr_add(pfx, ':'); mstr_append(pfx, p->port->cstr); }
+        mstr_append(pfx, MSTR_CSTR(p->hostname));
+        if(MSTR_LEN(p->port) > 0) { mstr_add(pfx, ':'); mstr_append(pfx, MSTR_CSTR(p->port)); }
     }
-    mstr_append(pfx, p->path->cstr);
+    mstr_append(pfx, MSTR_CSTR(p->path));
     mstr_t* sfx = mstr_new("");
-    if(p->has_fragment) { mstr_add(sfx, '#'); mstr_append(sfx, p->fragment->cstr); }
-    node_t* n1 = var_add(self, "@@pfx", var_new_str(vm, pfx->cstr));
-    node_t* n2 = var_add(self, "@@sfx", var_new_str(vm, sfx->cstr));
+    if(p->has_fragment) { mstr_add(sfx, '#'); mstr_append(sfx, MSTR_CSTR(p->fragment)); }
+    node_t* n1 = var_add(self, "@@pfx", var_new_str(vm, MSTR_CSTR(pfx)));
+    node_t* n2 = var_add(self, "@@sfx", var_new_str(vm, MSTR_CSTR(sfx)));
     node_t* n3 = var_add(self, "@@hadq", var_new_bool(vm, p->has_query));
     if(n1) { n1->invisable = 1; n1->be_unenumerable = 1; }
     if(n2) { n2->invisable = 1; n2->be_unenumerable = 1; }
@@ -759,57 +766,57 @@ static var_t* url_constructor(vm_t* vm, var_t* env, void* data) {
     if(basev != NULL && basev->type != V_UNDEF && basev->type != V_NULL) var_to_str(basev, basestr);
 
     url_parts* base = NULL;
-    if(basestr->len > 0) { base = url_parts_new(); url_parse(base, basestr->cstr, NULL); }
+    if(MSTR_LEN(basestr) > 0) { base = url_parts_new(); url_parse(base, MSTR_CSTR(basestr), NULL); }
     url_parts* p = url_parts_new();
-    url_parse(p, instr->cstr, base);
+    url_parse(p, MSTR_CSTR(instr), base);
 
-    bool special = url_scheme_is_special(p->scheme->cstr);
-    if(url_port_is_default(p->scheme->cstr, p->port->cstr)) mstr_ncpy(p->port, "", 0);
-    if(p->has_authority && special && p->path->len == 0) mstr_cpy(p->path, "/");
+    bool special = url_scheme_is_special(MSTR_CSTR(p->scheme));
+    if(url_port_is_default(MSTR_CSTR(p->scheme), MSTR_CSTR(p->port))) mstr_ncpy(p->port, "", 0);
+    if(p->has_authority && special && MSTR_LEN(p->path) == 0) mstr_cpy(p->path, "/");
 
     /* href */
     mstr_t* href = mstr_new("");
     url_serialize(href, p);
-    url_add_str(vm, self, "href", href->cstr);
+    url_add_str(vm, self, "href", MSTR_CSTR(href));
 
     /* origin: scheme://host[:port] for special (non-file); otherwise "null" */
     mstr_t* origin = mstr_new("");
-    if(special && p->scheme->len > 0 && strcmp(p->scheme->cstr, "file") != 0) {
-        mstr_append(origin, p->scheme->cstr); mstr_append(origin, "://");
-        mstr_append(origin, p->hostname->cstr);
-        if(p->port->len > 0) { mstr_add(origin, ':'); mstr_append(origin, p->port->cstr); }
+    if(special && MSTR_LEN(p->scheme) > 0 && strcmp(MSTR_CSTR(p->scheme), "file") != 0) {
+        mstr_append(origin, MSTR_CSTR(p->scheme)); mstr_append(origin, "://");
+        mstr_append(origin, MSTR_CSTR(p->hostname));
+        if(MSTR_LEN(p->port) > 0) { mstr_add(origin, ':'); mstr_append(origin, MSTR_CSTR(p->port)); }
     } else {
         mstr_append(origin, "null");
     }
-    url_add_str(vm, self, "origin", origin->cstr);
+    url_add_str(vm, self, "origin", MSTR_CSTR(origin));
 
     /* protocol / host / hostname / port / pathname / search / hash / user:pass */
     mstr_t* protocol = mstr_new("");
-    if(p->scheme->len > 0) { mstr_append(protocol, p->scheme->cstr); mstr_add(protocol, ':'); }
-    url_add_str(vm, self, "protocol", protocol->cstr);
+    if(MSTR_LEN(p->scheme) > 0) { mstr_append(protocol, MSTR_CSTR(p->scheme)); mstr_add(protocol, ':'); }
+    url_add_str(vm, self, "protocol", MSTR_CSTR(protocol));
 
     mstr_t* host = mstr_new("");
-    mstr_append(host, p->hostname->cstr);
-    if(p->port->len > 0) { mstr_add(host, ':'); mstr_append(host, p->port->cstr); }
-    url_add_str(vm, self, "host", host->cstr);
+    mstr_append(host, MSTR_CSTR(p->hostname));
+    if(MSTR_LEN(p->port) > 0) { mstr_add(host, ':'); mstr_append(host, MSTR_CSTR(p->port)); }
+    url_add_str(vm, self, "host", MSTR_CSTR(host));
 
-    url_add_str(vm, self, "hostname", p->hostname->cstr);
-    url_add_str(vm, self, "port", p->port->cstr);
-    url_add_str(vm, self, "pathname", p->path->cstr);
+    url_add_str(vm, self, "hostname", MSTR_CSTR(p->hostname));
+    url_add_str(vm, self, "port", MSTR_CSTR(p->port));
+    url_add_str(vm, self, "pathname", MSTR_CSTR(p->path));
 
     mstr_t* search = mstr_new("");
-    if(p->has_query) { mstr_add(search, '?'); mstr_append(search, p->query->cstr); }
-    url_add_str(vm, self, "search", search->cstr);
+    if(p->has_query) { mstr_add(search, '?'); mstr_append(search, MSTR_CSTR(p->query)); }
+    url_add_str(vm, self, "search", MSTR_CSTR(search));
 
     mstr_t* hash = mstr_new("");
-    if(p->has_fragment) { mstr_add(hash, '#'); mstr_append(hash, p->fragment->cstr); }
-    url_add_str(vm, self, "hash", hash->cstr);
+    if(p->has_fragment) { mstr_add(hash, '#'); mstr_append(hash, MSTR_CSTR(p->fragment)); }
+    url_add_str(vm, self, "hash", MSTR_CSTR(hash));
 
-    url_add_str(vm, self, "username", p->username->cstr);
-    url_add_str(vm, self, "password", p->password->cstr);
+    url_add_str(vm, self, "username", MSTR_CSTR(p->username));
+    url_add_str(vm, self, "password", MSTR_CSTR(p->password));
 
     /* Live searchParams built from the query (no leading '?'). */
-    var_t* sp = usp_new_from_query(vm, p->has_query ? p->query->cstr : "");
+    var_t* sp = usp_new_from_query(vm, p->has_query ? MSTR_CSTR(p->query) : "");
     var_add(self, "searchParams", sp);
 
     url_store_halves(vm, self, p);
@@ -836,11 +843,11 @@ static var_t* url_toString(vm_t* vm, var_t* env, void* data) {
         mstr_t* q = mstr_new("");
         usp_write(sp, q);
         bool had = (hadq != NULL) ? var_get_bool(hadq) : false;
-        if(q->len > 0 || had) { mstr_add(out, '?'); mstr_append(out, q->cstr); }
+        if(MSTR_LEN(q) > 0 || had) { mstr_add(out, '?'); mstr_append(out, MSTR_CSTR(q)); }
         mstr_free(q);
     }
     if(sfx != NULL && sfx->type == V_STRING) mstr_append(out, var_get_str(sfx));
-    var_t* r = var_new_str(vm, out->cstr);
+    var_t* r = var_new_str(vm, MSTR_CSTR(out));
     mstr_free(out);
     return r;
 }
@@ -855,10 +862,10 @@ static var_t* url_canParse(vm_t* vm, var_t* env, void* data) {
     mstr_t* basestr = mstr_new("");
     if(basev != NULL && basev->type != V_UNDEF && basev->type != V_NULL) var_to_str(basev, basestr);
     url_parts* base = NULL;
-    if(basestr->len > 0) { base = url_parts_new(); url_parse(base, basestr->cstr, NULL); }
+    if(MSTR_LEN(basestr) > 0) { base = url_parts_new(); url_parse(base, MSTR_CSTR(basestr), NULL); }
     url_parts* p = url_parts_new();
-    url_parse(p, instr->cstr, base);
-    bool ok = (p->scheme->len > 0);
+    url_parse(p, MSTR_CSTR(instr), base);
+    bool ok = (MSTR_LEN(p->scheme) > 0);
     url_parts_free(p); url_parts_free(base);
     mstr_free(instr); mstr_free(basestr);
     return var_new_bool(vm, ok);

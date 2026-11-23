@@ -1718,7 +1718,7 @@ var_t* native_RegExpToString(vm_t* vm, var_t* env, void* data) {
 	mstr_append(s, get_str(this_v, "source"));
 	mstr_add(s, '/');
 	mstr_append(s, get_str(this_v, "flags"));
-	var_t* ret = var_new_str(vm, s->cstr);
+	var_t* ret = var_new_str(vm, MSTR_CSTR(s));
 	mstr_free(s);
 	return ret;
 }

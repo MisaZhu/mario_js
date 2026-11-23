@@ -320,10 +320,14 @@ var_t* native_IntlDateTimeFormatCtor(vm_t* vm, var_t* env, void* data) {
 	var_t* locale = get_func_arg(env, 0);
 	var_t* opts = get_func_arg(env, 1);
 	node_t* tn = var_add(obj, INTL_OPTS, (opts != NULL && opts->type == V_OBJECT) ? opts : var_new_obj(vm, NULL, NULL, NULL));
-	tn->be_unenumerable = 1; tn->invisable = 1;
+	if(tn != NULL) {
+		tn->be_unenumerable = 1; tn->invisable = 1;
+	}
 	tn = var_add(obj, INTL_LOCALE, var_new_str(vm,
 	       (locale != NULL && locale->type == V_STRING) ? var_get_str(locale) : "en-US"));
-	tn->be_unenumerable = 1; tn->invisable = 1;
+	if(tn != NULL) {
+		tn->be_unenumerable = 1; tn->invisable = 1;
+	}
 	return obj;
 }
 
@@ -524,10 +528,14 @@ var_t* native_IntlNumberFormatCtor(vm_t* vm, var_t* env, void* data) {
 	var_t* locale = get_func_arg(env, 0);
 	var_t* opts = get_func_arg(env, 1);
 	node_t* tn = var_add(obj, INTL_OPTS, (opts != NULL && opts->type == V_OBJECT) ? opts : var_new_obj(vm, NULL, NULL, NULL));
-	tn->be_unenumerable = 1; tn->invisable = 1;
+	if(tn != NULL) {
+		tn->be_unenumerable = 1; tn->invisable = 1;
+	}
 	tn = var_add(obj, INTL_LOCALE, var_new_str(vm,
 	       (locale != NULL && locale->type == V_STRING) ? var_get_str(locale) : "en-US"));
-	tn->be_unenumerable = 1; tn->invisable = 1;
+	if(tn != NULL) {
+		tn->be_unenumerable = 1; tn->invisable = 1;
+	}
 	return obj;
 }
 
@@ -628,15 +636,15 @@ var_t* native_intl_lf_format(vm_t* vm, var_t* env, void* data) {
 			var_to_str(nd->var, one);
 		char glue[8];
 		if(i == 0)
-			mstr_append(s, one->cstr);
+			mstr_append(s, MSTR_CSTR(one));
 		else {
 			snprintf(glue, sizeof(glue), "%s", (i + 1 == n) ? ((n == 2) ? " and " : ", and ") : ", ");
 			mstr_append(s, glue);
-			mstr_append(s, one->cstr);
+			mstr_append(s, MSTR_CSTR(one));
 		}
 		mstr_free(one);
 	}
-	var_t* out = var_new_str(vm, s->cstr);
+	var_t* out = var_new_str(vm, MSTR_CSTR(s));
 	mstr_free(s);
 	return out;
 }
@@ -653,7 +661,7 @@ var_t* native_intl_collator_compare(vm_t* vm, var_t* env, void* data) {
 	mstr_t* sb = mstr_new("");
 	if(a != NULL) var_to_str(a, sa);
 	if(b != NULL) var_to_str(b, sb);
-	int c = strcmp(sa->cstr, sb->cstr);
+	int c = strcmp(MSTR_CSTR(sa), MSTR_CSTR(sb));
 	mstr_free(sa); mstr_free(sb);
 	return var_new_int(vm, (c > 0) - (c < 0));
 }

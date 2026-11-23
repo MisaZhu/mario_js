@@ -64,20 +64,34 @@ static var_t* ta_make(vm_t* vm, int et) {
 static void ta_setup(vm_t* vm, var_t* ta, int et, var_t* buffer, int64_t byteOffset, int64_t length) {
 	uint32_t esz = ta_sizes[et];
 	node_t* mn = var_add(ta, EXOTIC_MARKER, var_new_str(vm, EXOTIC_TYPEDARRAY));
-	mn->invisable = 1; mn->be_unenumerable = 1;
+	if(mn != NULL) {
+		mn->invisable = 1; mn->be_unenumerable = 1;
+	}
 	node_t* en = var_add(ta, TA_ETYPE, var_new_int(vm, et));
-	en->invisable = 1; en->be_unenumerable = 1;
+	if(en != NULL) {
+		en->invisable = 1; en->be_unenumerable = 1;
+	}
 
 	node_t* bn = var_add(ta, "buffer", buffer);            // node refs buffer
-	bn->be_unenumerable = 1;
+	if(bn != NULL) {
+		bn->be_unenumerable = 1;
+	}
 	node_t* on = var_add(ta, "byteOffset", var_new_int(vm, (int)byteOffset));
-	on->be_unenumerable = 1;
+	if(on != NULL) {
+		on->be_unenumerable = 1;
+	}
 	node_t* bln = var_add(ta, "byteLength", var_new_int(vm, (int)(length * (int64_t)esz)));
-	bln->be_unenumerable = 1;
+	if(bln != NULL) {
+		bln->be_unenumerable = 1;
+	}
 	node_t* ln = var_add(ta, "length", var_new_int(vm, (int)length));
-	ln->be_unenumerable = 1;
+	if(ln != NULL) {
+		ln->be_unenumerable = 1;
+	}
 	node_t* bpe = var_add(ta, "BYTES_PER_ELEMENT", var_new_int(vm, (int)esz));
-	bpe->be_unenumerable = 1;
+	if(bpe != NULL) {
+		bpe->be_unenumerable = 1;
+	}
 }
 
 static int64_t ta_length(var_t* ta) {
@@ -887,11 +901,11 @@ var_t* native_TypedArray_join(vm_t* vm, var_t* env, void* data) {
 		var_t* el = var_typedarray_get_at(vm, ta, i);
 		mstr_t* s = mstr_new("");
 		if(el != NULL) { var_to_str(el, s); var_unref(el); }
-		mstr_append(out, s->cstr);
+		mstr_append(out, MSTR_CSTR(s));
 		mstr_free(s);
 	}
 	vm->gc.gc_defer--;
-	var_t* ret = var_new_str(vm, out->cstr);
+	var_t* ret = var_new_str(vm, MSTR_CSTR(out));
 	mstr_free(out);
 	return ret;
 }
@@ -907,11 +921,11 @@ var_t* native_TypedArray_toString(vm_t* vm, var_t* env, void* data) {
 		var_t* el = var_typedarray_get_at(vm, ta, i);
 		mstr_t* s = mstr_new("");
 		if(el != NULL) { var_to_str(el, s); var_unref(el); }
-		mstr_append(out, s->cstr);
+		mstr_append(out, MSTR_CSTR(s));
 		mstr_free(s);
 	}
 	vm->gc.gc_defer--;
-	var_t* ret = var_new_str(vm, out->cstr);
+	var_t* ret = var_new_str(vm, MSTR_CSTR(out));
 	mstr_free(out);
 	return ret;
 }
@@ -924,7 +938,7 @@ var_t* native_TypedArray_localeCompare(vm_t* vm, var_t* env, void* data) {
 	const char* sa = var_get_str(a);
 	mstr_t* ob = mstr_new("");
 	if(other != NULL) var_to_str(other, ob);
-	int r = strcmp(sa, ob->cstr);
+	int r = strcmp(sa, MSTR_CSTR(ob));
 	var_t* ret = var_new_int(vm, (r < 0) ? -1 : (r > 0) ? 1 : 0);
 	mstr_free(ob);
 	var_unref(a);

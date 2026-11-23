@@ -192,15 +192,21 @@ var_t* native_Function_bind(vm_t* vm, var_t* env, void* data) {
 	var_get_func(bound)->data = bound;   // self-pointer, valid while bound is reachable
 
 	node_t* tn = var_add(bound, BIND_TARGET, target);
-	tn->invisable = 1; tn->be_unenumerable = 1;
+	if(tn != NULL) {
+		tn->invisable = 1; tn->be_unenumerable = 1;
+	}
 	node_t* hn = var_add(bound, BIND_THIS, (thisArg != NULL) ? thisArg : var_new(vm));
-	hn->invisable = 1; hn->be_unenumerable = 1;
+	if(hn != NULL) {
+		hn->invisable = 1; hn->be_unenumerable = 1;
+	}
 	/* preArgs is a baseline refs==0 array; var_add takes the one owning reference
 	 * for the member, so it must NOT be unref'd here (doing so frees it and the
 	 * bound function loses its captured leading arguments). target/thisArg are
 	 * borrowed from env and likewise only gain the member's reference. */
 	node_t* an = var_add(bound, BIND_ARGS, preArgs);
-	an->invisable = 1; an->be_unenumerable = 1;
+	if(an != NULL) {
+		an->invisable = 1; an->be_unenumerable = 1;
+	}
 
 	/* Spec: a bound function's `length` is max(0, target.length - prependedArgs).
 	 * mario resolves fn.length from func->args.size (mario.c handle_member), which
@@ -219,7 +225,9 @@ var_t* native_Function_bind(vm_t* vm, var_t* env, void* data) {
 	int blen = target_len - (int)var_array_size(preArgs);
 	if(blen < 0) blen = 0;
 	node_t* ln = var_add(bound, "length", var_new_int(vm, blen));
-	ln->invisable = 1; ln->be_unenumerable = 1;
+	if(ln != NULL) {
+		ln->invisable = 1; ln->be_unenumerable = 1;
+	}
 
 	/* Spec (ES2015+): a bound function's `name` is "bound " + the target's name
 	 * (re-binding a bound function therefore stacks the prefix, matching Chrome).
@@ -246,7 +254,9 @@ var_t* native_Function_bind(vm_t* vm, var_t* env, void* data) {
 	char nbuf[256];
 	snprintf(nbuf, sizeof(nbuf), "bound %s", tname);
 	node_t* nm = var_add(bound, "name", var_new_str(vm, nbuf));
-	nm->invisable = 1; nm->be_unenumerable = 1;
+	if(nm != NULL) {
+		nm->invisable = 1; nm->be_unenumerable = 1;
+	}
 
 	return bound;   // refs==0 baseline; func_call adopts it
 }
@@ -315,7 +325,7 @@ static var_t* native_Function_constructor(vm_t* vm, var_t* env, void* data) {
 	mstr_append(code, "\n};");
 	extern void js_compile_set_quiet(bool quiet);
 	js_compile_set_quiet(true);
-	bool ok = vm_load_run_native_sloppy(vm, code->cstr);
+	bool ok = vm_load_run_native_sloppy(vm, MSTR_CSTR(code));
 	js_compile_set_quiet(false);
 	mstr_free(code);
 	if(!ok) {

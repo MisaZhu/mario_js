@@ -310,8 +310,8 @@ static void lex_get_reserved_word(lex_t* lex) {
      * 35 libc calls per identifier token; on real sites (Pinterest) strcmp was
      * the #1 leaf function of the whole process while parsing. Switching on the
      * token length and comparing chars inline rejects non-keywords in O(1). */
-    const char* s = lex->tk_str->cstr;
-    switch(lex->tk_str->len) {
+    const char* s = MSTR_CSTR(lex->tk_str);
+    switch(MSTR_LEN(lex->tk_str)) {
     case 2:
         if(s[0] == 'i' && s[1] == 'f') lex->tk = LEX_R_IF;
         else if(s[0] == 'd' && s[1] == 'o') lex->tk = LEX_R_DO;
@@ -646,9 +646,9 @@ static bool skip_func_tail(lex_t* l, mstr_t* name_out) {
          * accessors; any other second token must remain for the '(' check to
          * reject (e.g. `function foo bar(){}` is a syntax error there, and the
          * formal pass must see the same shape). */
-        bool is_acc = (strcmp(l->tk_str->cstr, "get") == 0 ||
-                       strcmp(l->tk_str->cstr, "set") == 0);
-        if (name_out != NULL) mstr_cpy(name_out, l->tk_str->cstr);
+        bool is_acc = (strcmp(MSTR_CSTR(l->tk_str), "get") == 0 ||
+                       strcmp(MSTR_CSTR(l->tk_str), "set") == 0);
+        if (name_out != NULL) mstr_cpy(name_out, MSTR_CSTR(l->tk_str));
         if (!skip_advance(l, &prev)) return false;
         if (is_acc &&
             (l->tk == LEX_ID || (l->tk >= LEX_R_IF && l->tk < LEX_R_LIST_END))) {
@@ -767,7 +767,7 @@ static bool defer_replay_one(lex_t* l, bytecode_t* bc, const defer_func_t* rec) 
         ok = factor_def_func(l, bc, fname);
         g_func_selfname = 0;
         if (ok) {
-            bc_gen_str(bc, INSTR_MEMBERN, fname->cstr);
+            bc_gen_str(bc, INSTR_MEMBERN, MSTR_CSTR(fname));
         }
         mstr_free(fname);
     }
@@ -799,7 +799,7 @@ static bool skip_expr_stmt_scan(lex_t* l, bool stop_top_comma) {
     int depth = 0;
     bool after_op = false; /* false: expecting an operand; true: after one */
     if (g_ses_fb_dbg < 0) g_ses_fb_dbg = (getenv("MARIO_SES_FB") != NULL) ? 1 : 0;
-#define SES_FB() do { if (g_ses_fb_dbg) mario_printf("[SESFB] tk=%u str=%.24s\n", l->tk, l->tk_str->cstr); return false; } while (0)
+#define SES_FB() do { if (g_ses_fb_dbg) mario_printf("[SESFB] tk=%u str=%.24s\n", l->tk, MSTR_CSTR(l->tk_str)); return false; } while (0)
     for (;;) {
         uint32_t tk = l->tk;
         if (tk == LEX_EOF || tk == ';' || tk == '}') {
@@ -877,7 +877,7 @@ static bool skip_expr_stmt_scan(lex_t* l, bool stop_top_comma) {
                  * generator operand expression and the next declaration
                  * (non-generator `yield function f(){}` declares f) - both
                  * bail out so no declaration can be hidden from the scan. */
-                if (strcmp(l->tk_str->cstr, "yield") == 0) {
+                if (strcmp(MSTR_CSTR(l->tk_str), "yield") == 0) {
                     if (!skip_advance(l, &prev)) return false;
                     if (lex_had_newline(l)) return true; /* boundary, not consumed */
                     if (l->tk == LEX_R_FUNCTION) { SES_FB(); }
@@ -999,9 +999,9 @@ static mstr_t* tmp_mstr_borrow_m(const mstr_t* s) {
     mstr_t* m;
     if (g_tmp_mstr_n > 0) {
         m = g_tmp_mstr[--g_tmp_mstr_n];
-        mstr_ncpy(m, s->cstr, s->len);
+        mstr_ncpy(m, MSTR_CSTR(s), MSTR_LEN(s));
     } else {
-        m = mstr_new(s->cstr);
+        m = mstr_new(MSTR_CSTR(s));
     }
     return m;
 }
@@ -1415,7 +1415,7 @@ static void argu_scan_braces(lex_t* l, pslot_frame_t* f, uint32_t* prev) {
             d++;
         } else if (tk == '}') {
             d--;
-        } else if (tk == LEX_ID && strcmp(l->tk_str->cstr, "arguments") == 0) {
+        } else if (tk == LEX_ID && strcmp(MSTR_CSTR(l->tk_str), "arguments") == 0) {
             if (ptk2 != '.' && ptk2 != LEX_OPTCHAIN)
                 f->uses_arguments = true;
         } else if (tk == LEX_R_FUNCTION) {
@@ -1524,7 +1524,7 @@ static void pslot_scan_decl(lex_t* l, pslot_frame_t* f, uint32_t* prev, pslot_fr
         if (tk == ',' && dd == 0) { bind = true; prev_end = false; continue; }
         if (tk == LEX_ID) {
             if (bind || pattern_dd > 0) {
-                pslot_disable(f, l->tk_str->cstr);
+                pslot_disable(f, MSTR_CSTR(l->tk_str));
                 if (!skip_advance(l, prev))
                     return;
                 if (l->tk == ')' || l->tk == ']' || l->tk == '}') {
@@ -1590,10 +1590,10 @@ static void pslot_scan_decl(lex_t* l, pslot_frame_t* f, uint32_t* prev, pslot_fr
                 prev_end = (l->tk != '=');
                 continue;
             }
-            if (strcmp(l->tk_str->cstr, "eval") == 0)
+            if (strcmp(MSTR_CSTR(l->tk_str), "eval") == 0)
                 f->enabled = false; // an eval( inside an initializer still runs
                                     // in this frame's scope - do not swallow it
-            if (strcmp(l->tk_str->cstr, "arguments") == 0 &&
+            if (strcmp(MSTR_CSTR(l->tk_str), "arguments") == 0 &&
                 *prev != '.' && *prev != LEX_OPTCHAIN)
                 af->uses_arguments = true; // initializer reference (this frame)
             if (prev_end && dd == 0)
@@ -1704,7 +1704,7 @@ static void pslot_scan_var(lex_t* l, pslot_frame_t* f, uint32_t* prev, pslot_fra
         if (tk == ',' && dd == 0) { bind = true; prev_end = false; continue; }
         if (tk == LEX_ID) {
             if (bind && pattern_dd == 0) {
-                pslot_add_local(f, l->tk_str->cstr);
+                pslot_add_local(f, MSTR_CSTR(l->tk_str));
                 if (!skip_advance(l, prev))
                     return;
                 if (l->tk == ')' || l->tk == ']' || l->tk == '}') {
@@ -1765,10 +1765,10 @@ static void pslot_scan_var(lex_t* l, pslot_frame_t* f, uint32_t* prev, pslot_fra
                 prev_end = (l->tk != '=');
                 continue;
             }
-            if (strcmp(l->tk_str->cstr, "eval") == 0)
+            if (strcmp(MSTR_CSTR(l->tk_str), "eval") == 0)
                 f->enabled = false; // an eval( inside an initializer still runs
                                     // in this frame's scope - do not swallow it
-            if (strcmp(l->tk_str->cstr, "arguments") == 0 &&
+            if (strcmp(MSTR_CSTR(l->tk_str), "arguments") == 0 &&
                 *prev != '.' && *prev != LEX_OPTCHAIN)
                 af->uses_arguments = true; // initializer reference (this frame)
             if (prev_end && dd == 0)
@@ -1863,7 +1863,7 @@ static void pslot_prescan(lex_t* l, pslot_frame_t* f, pslot_frame_t* af) {
     lex_t saved = *l;
     mstr_t* saved_tk_str = l->tk_str;
     l->tk_str = tmp_mstr_borrow(""); /* pooled lookahead buffer */
-    mstr_cpy(l->tk_str, saved_tk_str->cstr);
+    mstr_cpy(l->tk_str, MSTR_CSTR(saved_tk_str));
 
     uint32_t prev = 0;  // regex context for skip_advance
     int depth = 0;      // { } depth
@@ -1984,7 +1984,7 @@ static void pslot_prescan(lex_t* l, pslot_frame_t* f, pslot_frame_t* af) {
              * ambiguous, so there the frame is simply disabled (always safe). */
             if (!skip_advance(l, &prev)) break;
             if (l->tk == LEX_ID) { // class name (an 'extends' lexed as id would be a harmless extra disable)
-                pslot_disable(f, l->tk_str->cstr);
+                pslot_disable(f, MSTR_CSTR(l->tk_str));
                 if (!skip_advance(l, &prev)) break;
             }
             {
@@ -2027,13 +2027,13 @@ static void pslot_prescan(lex_t* l, pslot_frame_t* f, pslot_frame_t* af) {
                         if (l->tk == '{') { f->enabled = false; break; }
                         continue; // expression-bodied arrow: keep scanning the clause
                     }
-                    else if (t2 == LEX_ID && strcmp(l->tk_str->cstr, "eval") == 0) {
+                    else if (t2 == LEX_ID && strcmp(MSTR_CSTR(l->tk_str), "eval") == 0) {
                         if (!skip_advance(l, &prev)) break;
                         if (l->tk == '(')
                             f->enabled = false; // direct eval in the extends clause
                         continue;
                     }
-                    else if (t2 == LEX_ID && strcmp(l->tk_str->cstr, "arguments") == 0) {
+                    else if (t2 == LEX_ID && strcmp(MSTR_CSTR(l->tk_str), "arguments") == 0) {
                         af->uses_arguments = true; // extends-clause reference (this frame)
                     }
                     if (!skip_advance(l, &prev)) break;
@@ -2061,7 +2061,7 @@ static void pslot_prescan(lex_t* l, pslot_frame_t* f, pslot_frame_t* af) {
                     have_body = true;
                     break;
                 } else if (t2 == LEX_ID && pd == 0) {
-                    pslot_disable(f, l->tk_str->cstr);
+                    pslot_disable(f, MSTR_CSTR(l->tk_str));
                 }
             }
             (void)have_body;
@@ -2086,23 +2086,23 @@ static void pslot_prescan(lex_t* l, pslot_frame_t* f, pslot_frame_t* af) {
                     if (l->tk == '(') pd2++;
                     else if (l->tk == ')') pd2--;
                     else if (l->tk == LEX_ID)
-                        pslot_disable(f, l->tk_str->cstr); // catch binding (incl. patterns)
+                        pslot_disable(f, MSTR_CSTR(l->tk_str)); // catch binding (incl. patterns)
                 }
                 skip_advance(l, &prev); // step past ')'
             }
             ptk = 0;
             continue;
-        } else if (tk == LEX_ID && l->tk_str->cstr[0] == 'a' &&
-                   strcmp(l->tk_str->cstr, "arguments") == 0) {
+        } else if (tk == LEX_ID && MSTR_CSTR(l->tk_str)[0] == 'a' &&
+                   strcmp(MSTR_CSTR(l->tk_str), "arguments") == 0) {
             /* Bare `arguments` reference: this frame must materialize the
              * array at call time (INSTR_FUNCARGU). A `.`/`?.`-member is a
              * property name, not a reference. Nested plain-function/class
              * bodies never reach here (their branches skip them). */
             if (ptk != '.' && ptk != LEX_OPTCHAIN)
                 af->uses_arguments = true;
-        } else if (tk == LEX_ID && strcmp(l->tk_str->cstr, "with") == 0) {
+        } else if (tk == LEX_ID && strcmp(MSTR_CSTR(l->tk_str), "with") == 0) {
             f->enabled = false; // with-scope members shadow dynamically
-        } else if (tk == LEX_ID && strcmp(l->tk_str->cstr, "eval") == 0) {
+        } else if (tk == LEX_ID && strcmp(MSTR_CSTR(l->tk_str), "eval") == 0) {
             if (!skip_advance(l, &prev)) break;
             if (l->tk == '(')
                 f->enabled = false; // direct eval can inject bindings
@@ -2194,7 +2194,7 @@ int call_func(lex_t* l, bytecode_t* bc, bool* has_spread) {
         GSS(call_spread);
         bc->cindex = args_bc_start;
         *l = args_lex_start;
-        mstr_cpy(l->tk_str, args_tk_str->cstr);
+        mstr_cpy(l->tk_str, MSTR_CSTR(args_tk_str));
         tmp_mstr_return(args_tk_str);
 
         bc_gen(bc, INSTR_ARRAY);
@@ -2415,8 +2415,8 @@ static char scan_param_expr(lex_t* l, mstr_t* out) {
              * default value `(a = /\(/)` -- don't corrupt the depth counter and
              * make the terminator (',' or ')') unreachable. */
             char pc = 0;
-            for (int32_t k = (int32_t)out->len - 1; k >= 0; --k) {
-                char d = out->cstr[k];
+            for (int32_t k = (int32_t)MSTR_LEN(out) - 1; k >= 0; --k) {
+                char d = MSTR_CSTR(out)[k];
                 if (d == ' ' || d == '\t' || d == '\n' || d == '\r') continue;
                 pc = d;
                 break;
@@ -2711,6 +2711,8 @@ static bool func_parse_params(lex_t* l, bytecode_t* bc, m_array_t* defaults,
                 snprintf(rtemp, sizeof(rtemp), "__pr%d", g_destr_counter++);
                 *rest_name = mstr_new(rtemp);
                 pd = (param_destr_t*)mario_malloc(sizeof(param_destr_t));
+                if(pd == NULL) /* OOM: drop the destructuring parameter record */
+                    break;
                 memset(pd, 0, sizeof(*pd));
                 snprintf(pd->temp, sizeof(pd->temp), "%s", rtemp);
                 pd->saved = *l;                    // pattern-start lexer state
@@ -2736,7 +2738,7 @@ static bool func_parse_params(lex_t* l, bytecode_t* bc, m_array_t* defaults,
             if (l->tk != LEX_ID) {
                 break;
             }
-            *rest_name = mstr_new(l->tk_str->cstr);
+            *rest_name = mstr_new(MSTR_CSTR(l->tk_str));
             if (!lex_chkread(l, LEX_ID)) {
                 break;
             }
@@ -2748,6 +2750,8 @@ static bool func_parse_params(lex_t* l, bytecode_t* bc, m_array_t* defaults,
         if (l->tk == '{' || l->tk == '[') {
             if (frame != NULL) frame->enabled = false; // destructured params: no slotting (v1)
             param_destr_t* pd = (param_destr_t*)mario_malloc(sizeof(param_destr_t));
+            if(pd == NULL) /* OOM: drop the destructuring parameter record */
+         break;
             memset(pd, 0, sizeof(*pd));
             snprintf(pd->temp, sizeof(pd->temp), "__pn%d", g_destr_counter++);
             bc_gen_str(bc, INSTR_LOAD, pd->temp); // argname slot for func_def
@@ -2787,11 +2791,11 @@ static bool func_parse_params(lex_t* l, bytecode_t* bc, m_array_t* defaults,
              * matches the runtime value of an unpassed parameter. */
             break;
         }
-        mstr_t* pname = mstr_new(l->tk_str->cstr);
-        bc_gen_str(bc, INSTR_LOAD, pname->cstr); // argument name for func_def
+        mstr_t* pname = mstr_new(MSTR_CSTR(l->tk_str));
+        bc_gen_str(bc, INSTR_LOAD, MSTR_CSTR(pname)); // argument name for func_def
         if (frame != NULL && frame->enabled &&
-            *positional < MARIO_PSLOT_MAX && strlen(pname->cstr) < 64) {
-            strcpy(frame->names[*positional], pname->cstr);
+            *positional < MARIO_PSLOT_MAX && strlen(MSTR_CSTR(pname)) < 64) {
+            strcpy(frame->names[*positional], MSTR_CSTR(pname));
             if (*positional >= frame->num)
                 frame->num = *positional + 1;
         }
@@ -2846,13 +2850,13 @@ static bool func_emit_prelude(bytecode_t* bc, m_array_t* defaults,
     uint32_t di;
     for (di = 0; di < defaults->size; di++) {
         param_default_t* pd = (param_default_t*)array_get(defaults, di);
-        bc_gen_str(bc, INSTR_LOAD, pd->name->cstr);
+        bc_gen_str(bc, INSTR_LOAD, MSTR_CSTR(pd->name));
         bc_gen(bc, INSTR_TYPEOF);
         bc_gen_str(bc, INSTR_STR, "undefined");
         bc_gen(bc, INSTR_TEQ);
         PC pj = bc_reserve(bc);
-        bc_gen_str(bc, INSTR_LOAD, pd->name->cstr); // assignment target
-        if (!compile_captured_expr(pd->expr->cstr, bc)) {
+        bc_gen_str(bc, INSTR_LOAD, MSTR_CSTR(pd->name)); // assignment target
+        if (!compile_captured_expr(MSTR_CSTR(pd->expr), bc)) {
             return false;
         }
         bc_gen(bc, INSTR_ASIGN);
@@ -2862,8 +2866,8 @@ static bool func_emit_prelude(bytecode_t* bc, m_array_t* defaults,
 
     // Emit ES6 rest-parameter initialiser: rest = arguments.slice(positional)
     if (rest_name != NULL) {
-        bc_gen_str(bc, INSTR_VAR, rest_name->cstr);
-        bc_gen_str(bc, INSTR_LOAD, rest_name->cstr); // assignment target
+        bc_gen_str(bc, INSTR_VAR, MSTR_CSTR(rest_name));
+        bc_gen_str(bc, INSTR_LOAD, MSTR_CSTR(rest_name)); // assignment target
         bc_gen_str(bc, INSTR_LOAD, "arguments");
         bc_gen_int(bc, INSTR_INT, positional);
         bc_gen_str(bc, INSTR_CALLO, "slice$1");
@@ -2896,7 +2900,7 @@ static bool func_emit_prelude(bytecode_t* bc, m_array_t* defaults,
             bc_gen(bc, INSTR_TEQ);
             PC pj = bc_reserve(bc);
             bc_gen_str(bc, INSTR_LOAD, pd->temp); // assignment target
-            if (!compile_captured_expr(pd->def->cstr, bc)) {
+            if (!compile_captured_expr(MSTR_CSTR(pd->def), bc)) {
                 g_vardecl_bc = saved_vardecl;
                 return false;
             }
@@ -2992,12 +2996,12 @@ bool func_params_and_body(lex_t* l, bytecode_t* bc) {
         uint32_t di;
         for (di = 0; di < defaults.size; di++) {
             param_default_t* pd = (param_default_t*)array_get(&defaults, di);
-            if (pd->expr != NULL && strstr(pd->expr->cstr, "arguments") != NULL)
+            if (pd->expr != NULL && strstr(MSTR_CSTR(pd->expr), "arguments") != NULL)
                 pslot_frame.uses_arguments = true;
         }
         for (di = 0; di < pdestrs.size; di++) {
             param_destr_t* pd = (param_destr_t*)array_get(&pdestrs, di);
-            if (pd->def != NULL && strstr(pd->def->cstr, "arguments") != NULL)
+            if (pd->def != NULL && strstr(MSTR_CSTR(pd->def), "arguments") != NULL)
                 pslot_frame.uses_arguments = true;
         }
     }
@@ -3082,7 +3086,7 @@ bool factor_def_func(lex_t* l, bytecode_t* bc, mstr_t* name) {
 
     /* we can have functions without names */
     if (l->tk == LEX_ID) {
-        mstr_cpy(name, l->tk_str->cstr);
+        mstr_cpy(name, MSTR_CSTR(l->tk_str));
         if (!lex_chkread(l, LEX_ID)) {
             return false;
         }
@@ -3090,25 +3094,25 @@ bool factor_def_func(lex_t* l, bytecode_t* bc, mstr_t* name) {
         /* A reserved word as a method name: classes and object literals may
          * define `delete(e){...}`, `new(){...}`, `default(){...}`. The keyword
          * token keeps its source text in tk_str, so capture it like an ID. */
-        mstr_cpy(name, l->tk_str->cstr);
+        mstr_cpy(name, MSTR_CSTR(l->tk_str));
         int tk = l->tk;
         if (!lex_chkread(l, tk)) {
             return false;
         }
     }
     if (l->tk == LEX_ID || (l->tk >= LEX_R_IF && l->tk < LEX_R_LIST_END &&
-                            (strcmp(name->cstr, "get") == 0 || strcmp(name->cstr, "set") == 0))) {
+                            (strcmp(MSTR_CSTR(name), "get") == 0 || strcmp(MSTR_CSTR(name), "set") == 0))) {
         /* class get/set token; the accessor name may itself be a reserved
          * word (`get class(){}`, `set default(v){}`). */
         int ntk = l->tk;
-        if (strcmp(name->cstr, "get") == 0) {
-            mstr_cpy(name, l->tk_str->cstr);
+        if (strcmp(MSTR_CSTR(name), "get") == 0) {
+            mstr_cpy(name, MSTR_CSTR(l->tk_str));
             if (!lex_chkread(l, ntk)) {
                 return false;
             }
             bc_gen(bc, INSTR_FUNC_GET);
-        } else if (strcmp(name->cstr, "set") == 0) {
-            mstr_cpy(name, l->tk_str->cstr);
+        } else if (strcmp(MSTR_CSTR(name), "set") == 0) {
+            mstr_cpy(name, MSTR_CSTR(l->tk_str));
             if (!lex_chkread(l, ntk)) {
                 return false;
             }
@@ -3129,7 +3133,7 @@ bool factor_def_func(lex_t* l, bytecode_t* bc, mstr_t* name) {
          * such as GitHub's protobuf walker `function* e(t){... yield* e(n) ...}` can
          * self-reference; without the binding `e(n)` resolved to an outer shadowing `e`
          * and yield* threw "target is not iterable". */
-        else if (g_func_selfname && !is_static && name->cstr[0] != 0) {
+        else if (g_func_selfname && !is_static && MSTR_CSTR(name)[0] != 0) {
             /* g_func_selfname==2 marks a DECLARATION: record the name for
              * .name/Error.stack parity but emit the DECLNAME variant, which sets
              * func_t.no_self_bind so func_call does NOT shadow the enclosing
@@ -3137,9 +3141,9 @@ bool factor_def_func(lex_t* l, bytecode_t* bc, mstr_t* name) {
              * must rebind the outer declaration). ==1 is a named function
              * EXPRESSION, which keeps the ES in-body self-binding. */
             if (g_func_selfname == 2)
-                bc_gen_str(bc, is_gen ? INSTR_FUNC_GEN_DECLNAME : INSTR_FUNC_DECLNAME, name->cstr);
+                bc_gen_str(bc, is_gen ? INSTR_FUNC_GEN_DECLNAME : INSTR_FUNC_DECLNAME, MSTR_CSTR(name));
             else
-                bc_gen_str(bc, is_gen ? INSTR_FUNC_GEN_NAMED : INSTR_FUNC_NAMED, name->cstr);
+                bc_gen_str(bc, is_gen ? INSTR_FUNC_GEN_NAMED : INSTR_FUNC_NAMED, MSTR_CSTR(name));
         }
         else
             bc_gen(bc, is_gen ? INSTR_FUNC_GEN : (is_static ? INSTR_FUNC_STC : INSTR_FUNC));
@@ -3274,7 +3278,7 @@ bool factor_def_class(lex_t* l, bytecode_t* bc, bool is_expr) {
     lex_skip_empty(l);
     /* we can have classes without names */
     if (l->tk == LEX_ID) {
-        mstr_cpy(name, l->tk_str->cstr);
+        mstr_cpy(name, MSTR_CSTR(l->tk_str));
         if (!lex_chkread(l, LEX_ID)) {
             mstr_free(name);
             return false;
@@ -3285,10 +3289,10 @@ bool factor_def_class(lex_t* l, bytecode_t* bc, bool is_expr) {
      * distinct opcode so the runtime gives a named expression a fresh, distinct
      * class var instead of reusing (and clobbering) an enclosing binding of the
      * same - often minified - name. Anonymous expressions keep INSTR_CLASS. */
-    if (is_expr && name->cstr[0] != 0)
-        bc_gen_str(bc, INSTR_CLASS_EXPR, name->cstr);
+    if (is_expr && MSTR_CSTR(name)[0] != 0)
+        bc_gen_str(bc, INSTR_CLASS_EXPR, MSTR_CSTR(name));
     else
-        bc_gen_str(bc, INSTR_CLASS, name->cstr);
+        bc_gen_str(bc, INSTR_CLASS, MSTR_CSTR(name));
 
     lex_skip_empty(l);
     /*read extends*/
@@ -3330,7 +3334,7 @@ bool factor_def_class(lex_t* l, bytecode_t* bc, bool is_expr) {
             lex_t sv = *l;
             mstr_t* sv_tk = l->tk_str;
             l->tk_str = tmp_mstr_borrow(""); /* pooled lookahead buffer */
-            mstr_cpy(l->tk_str, sv_tk->cstr);
+            mstr_cpy(l->tk_str, MSTR_CSTR(sv_tk));
             bool is_static_f = false;
             bool is_field = false;
             char fname[128];
@@ -3341,7 +3345,7 @@ bool factor_def_class(lex_t* l, bytecode_t* bc, bool is_expr) {
                 is_static_f = true;
             }
             if (l->tk == LEX_ID) {
-                snprintf(fname, sizeof(fname), "%s", l->tk_str->cstr);
+                snprintf(fname, sizeof(fname), "%s", MSTR_CSTR(l->tk_str));
                 lex_chkread(l, LEX_ID);
                 lex_skip_empty(l);
                 if (l->tk == '=' || l->tk == ';' || l->tk == ',' || l->tk == '}')
@@ -3405,7 +3409,7 @@ bool factor_def_class(lex_t* l, bytecode_t* bc, bool is_expr) {
             }
         }
         if (l->tk == LEX_ID && l->next_ch == '=') {
-            bc_gen_str(bc, INSTR_LOAD, l->tk_str->cstr);
+            bc_gen_str(bc, INSTR_LOAD, MSTR_CSTR(l->tk_str));
             if (!lex_chkread(l, LEX_ID)) {
                 mstr_free(name);
                 return false;
@@ -3496,7 +3500,7 @@ bool factor_def_class(lex_t* l, bytecode_t* bc, bool is_expr) {
                         return false;
                     }
                     lex_skip_empty(l);
-                    bc_gen_str(bc, INSTR_MEMBERN, name->cstr);
+                    bc_gen_str(bc, INSTR_MEMBERN, MSTR_CSTR(name));
                     continue;
                 }
                 async_member = true;
@@ -3519,12 +3523,12 @@ bool factor_def_class(lex_t* l, bytecode_t* bc, bool is_expr) {
              * emits INSTR_FUNC_GET/INSTR_FUNC_SET (carrying the body) after the
              * key push, exactly like the named `get foo(){}` path below. */
             if (l->tk == LEX_ID &&
-                (strcmp(l->tk_str->cstr, "get") == 0 ||
-                 strcmp(l->tk_str->cstr, "set") == 0)) {
+                (strcmp(MSTR_CSTR(l->tk_str), "get") == 0 ||
+                 strcmp(MSTR_CSTR(l->tk_str), "set") == 0)) {
                 lex_t sv = *l;
                 mstr_t* sv_tk = l->tk_str;
                 l->tk_str = tmp_mstr_borrow(""); /* pooled lookahead buffer */
-                mstr_cpy(l->tk_str, sv_tk->cstr);
+                mstr_cpy(l->tk_str, MSTR_CSTR(sv_tk));
                 lex_chkread(l, LEX_ID);
                 lex_skip_empty(l);
                 bool comp_acc = (l->tk == '[');
@@ -3532,7 +3536,7 @@ bool factor_def_class(lex_t* l, bytecode_t* bc, bool is_expr) {
                 *l = sv;
                 l->tk_str = sv_tk;
                 if (comp_acc) {
-                    g_acc_pending = (strcmp(l->tk_str->cstr, "get") == 0) ? 1 : 2;
+                    g_acc_pending = (strcmp(MSTR_CSTR(l->tk_str), "get") == 0) ? 1 : 2;
                     if (!lex_chkread(l, LEX_ID)) {
                         g_acc_pending = 0;
                         mstr_free(name);
@@ -3573,7 +3577,7 @@ bool factor_def_class(lex_t* l, bytecode_t* bc, bool is_expr) {
             if (computed_name) {
                 bc_gen(bc, INSTR_MEMBERV);
             } else {
-                bc_gen_str(bc, INSTR_MEMBERN, name->cstr);
+                bc_gen_str(bc, INSTR_MEMBERN, MSTR_CSTR(name));
             }
         }
     }
@@ -3599,7 +3603,7 @@ bool factor_new(lex_t* l, bytecode_t* bc) {
         if (!lex_chkread(l, '.')) {
             return false;
         }
-        if (l->tk == LEX_ID && strcmp(l->tk_str->cstr, "target") == 0) {
+        if (l->tk == LEX_ID && strcmp(MSTR_CSTR(l->tk_str), "target") == 0) {
             if (!lex_chkread(l, LEX_ID)) {
                 return false;
             }
@@ -3655,13 +3659,13 @@ bool factor_new(lex_t* l, bytecode_t* bc) {
                     !(l->tk >= LEX_R_IF && l->tk < LEX_R_LIST_END)) {
                     return false;
                 }
-                mstr_t* mem = mstr_new(l->tk_str->cstr);
+                mstr_t* mem = mstr_new(MSTR_CSTR(l->tk_str));
                 int tk = l->tk;
                 if (!lex_chkread(l, tk)) {
                     mstr_free(mem);
                     return false;
                 }
-                bc_gen_str(bc, INSTR_GET, mem->cstr);
+                bc_gen_str(bc, INSTR_GET, MSTR_CSTR(mem));
                 mstr_free(mem);
             } else {
                 if (!lex_chkread(l, '[')) {
@@ -3689,7 +3693,7 @@ bool factor_new(lex_t* l, bytecode_t* bc) {
         } else {
             mstr_t* s = mstr_new("");
             gen_func_name("", arg_num, s);
-            bc_gen_str(bc, INSTR_NEWX, s->cstr);
+            bc_gen_str(bc, INSTR_NEWX, MSTR_CSTR(s));
             mstr_free(s);
         }
         return true;
@@ -3722,7 +3726,7 @@ bool factor_new(lex_t* l, bytecode_t* bc) {
         } else {
             mstr_t* s = mstr_new("");
             gen_func_name("", arg_num, s);
-            bc_gen_str(bc, INSTR_NEWX, s->cstr);
+            bc_gen_str(bc, INSTR_NEWX, MSTR_CSTR(s));
             mstr_free(s);
         }
         return true;
@@ -3748,7 +3752,7 @@ bool factor_new(lex_t* l, bytecode_t* bc) {
         } else {
             mstr_t* s = mstr_new("");
             gen_func_name("", arg_num, s);
-            bc_gen_str(bc, INSTR_NEWX, s->cstr);
+            bc_gen_str(bc, INSTR_NEWX, MSTR_CSTR(s));
             mstr_free(s);
         }
         return true;
@@ -3777,11 +3781,11 @@ bool factor_new(lex_t* l, bytecode_t* bc) {
         } else if (ltk == LEX_R_UNDEFINED) {
             bc_gen(bc, INSTR_UNDEF);
         } else if (ltk == LEX_INT) {
-            bc_gen_str(bc, INSTR_INT, l->tk_str->cstr);
+            bc_gen_str(bc, INSTR_INT, MSTR_CSTR(l->tk_str));
         } else if (ltk == LEX_FLOAT) {
-            bc_gen_str(bc, INSTR_FLOAT, l->tk_str->cstr);
+            bc_gen_str(bc, INSTR_FLOAT, MSTR_CSTR(l->tk_str));
         } else {
-            bc_gen_str(bc, INSTR_STR, l->tk_str->cstr);
+            bc_gen_str(bc, INSTR_STR, MSTR_CSTR(l->tk_str));
         }
         if (!lex_chkread(l, ltk)) {
             return false;
@@ -3799,13 +3803,13 @@ bool factor_new(lex_t* l, bytecode_t* bc) {
         } else {
             mstr_t* s = mstr_new("");
             gen_func_name("", arg_num, s);
-            bc_gen_str(bc, INSTR_NEWX, s->cstr);
+            bc_gen_str(bc, INSTR_NEWX, MSTR_CSTR(s));
             mstr_free(s);
         }
         return true;
     }
     mstr_t* class_name = mstr_new("");
-    mstr_cpy(class_name, l->tk_str->cstr);
+    mstr_cpy(class_name, MSTR_CSTR(l->tk_str));
 
     if (!lex_chkread(l, LEX_ID)) {
         mstr_free(class_name);
@@ -3818,7 +3822,7 @@ bool factor_new(lex_t* l, bytecode_t* bc) {
      * code below emitted `new A` and left `.b(args)` to parse as a method
      * call on the fresh object - "can not find function 'b'" on w3.org. */
     if (l->tk == '.' || l->tk == '[') {
-        bc_gen_str(bc, INSTR_LOAD, class_name->cstr);
+        bc_gen_str(bc, INSTR_LOAD, MSTR_CSTR(class_name));
         while (l->tk == '.' || l->tk == '[') {
             if (l->tk == '.') {
                 if (!lex_chkread(l, '.')) {
@@ -3832,14 +3836,14 @@ bool factor_new(lex_t* l, bytecode_t* bc) {
                     mstr_free(class_name);
                     return false;
                 }
-                mstr_t* mem = mstr_new(l->tk_str->cstr);
+                mstr_t* mem = mstr_new(MSTR_CSTR(l->tk_str));
                 int tk = l->tk;
                 if (!lex_chkread(l, tk)) {
                     mstr_free(mem);
                     mstr_free(class_name);
                     return false;
                 }
-                bc_gen_str(bc, INSTR_GET, mem->cstr);
+                bc_gen_str(bc, INSTR_GET, MSTR_CSTR(mem));
                 mstr_free(mem);
             } else {
                 /* computed constructor member: `new mod["default"](...)` */
@@ -3872,7 +3876,7 @@ bool factor_new(lex_t* l, bytecode_t* bc) {
         } else {
             mstr_t* s = mstr_new("");
             gen_func_name("", arg_num, s);
-            bc_gen_str(bc, INSTR_NEWX, s->cstr);
+            bc_gen_str(bc, INSTR_NEWX, MSTR_CSTR(s));
             mstr_free(s);
         }
         mstr_free(class_name);
@@ -3890,13 +3894,13 @@ bool factor_new(lex_t* l, bytecode_t* bc) {
              * gen_func_name); handle_new_spread() takes the runtime arity from
              * the spread array and resolves the ctor by base name. */
             mstr_t* s = mstr_new("");
-            gen_func_name(class_name->cstr, 0, s);
-            bc_gen_str(bc, INSTR_NEW_SPREAD, s->cstr);
+            gen_func_name(MSTR_CSTR(class_name), 0, s);
+            bc_gen_str(bc, INSTR_NEW_SPREAD, MSTR_CSTR(s));
             mstr_free(s);
         } else {
             mstr_t* s = mstr_new("");
-            gen_func_name(class_name->cstr, arg_num, s);
-            bc_gen_str(bc, INSTR_NEW, s->cstr);
+            gen_func_name(MSTR_CSTR(class_name), arg_num, s);
+            bc_gen_str(bc, INSTR_NEW, MSTR_CSTR(s));
             mstr_free(s);
         }
     } else {
@@ -3910,8 +3914,8 @@ bool factor_new(lex_t* l, bytecode_t* bc) {
          * on w3.org. gen_func_name with arg_num 0 yields the bare name, the
          * same payload `new Foo()` produces. */
         mstr_t* s = mstr_new("");
-        gen_func_name(class_name->cstr, 0, s);
-        bc_gen_str(bc, INSTR_NEW, s->cstr);
+        gen_func_name(MSTR_CSTR(class_name), 0, s);
+        bc_gen_str(bc, INSTR_NEW, MSTR_CSTR(s));
         mstr_free(s);
     }
     mstr_free(class_name);
@@ -3940,7 +3944,7 @@ bool factor_json(lex_t* l, bytecode_t* bc) {
             lex_t asv = *l;                 // shallow copy: keeps original tk_str ptr
             mstr_t* asv_tk_str = l->tk_str; // peeking must not clobber caller token
             l->tk_str = tmp_mstr_borrow(""); /* pooled lookahead buffer */
-            mstr_cpy(l->tk_str, asv_tk_str->cstr);
+            mstr_cpy(l->tk_str, MSTR_CSTR(asv_tk_str));
             lex_chkread(l, LEX_R_ASYNC);
             lex_skip_empty(l);
             bool looks_like_method =
@@ -4060,7 +4064,7 @@ bool factor_json(lex_t* l, bytecode_t* bc) {
              * var_to_str renders the resulting value. */
             int tk = l->tk;
             char text[128];
-            snprintf(text, sizeof(text), "%s", id->cstr);
+            snprintf(text, sizeof(text), "%s", MSTR_CSTR(id));
             if (tk == LEX_INT) {
                 if (strstr(text, "0x") != NULL || strstr(text, "0X") != NULL) {
                     errno = 0;
@@ -4104,10 +4108,10 @@ bool factor_json(lex_t* l, bytecode_t* bc) {
          * `set name(v) {...}`. Told apart from a method or property literally
          * named get/set by requiring a property-name token (ID, string,
          * number or reserved word) to follow the keyword. */
-        if ((strcmp(id->cstr, "get") == 0 || strcmp(id->cstr, "set") == 0) &&
+        if ((strcmp(MSTR_CSTR(id), "get") == 0 || strcmp(MSTR_CSTR(id), "set") == 0) &&
             (l->tk == LEX_ID || l->tk == LEX_STR || l->tk == LEX_INT || l->tk == LEX_FLOAT ||
              (l->tk >= LEX_R_IF && l->tk < LEX_R_LIST_END))) {
-            bool is_get = (strcmp(id->cstr, "get") == 0);
+            bool is_get = (strcmp(MSTR_CSTR(id), "get") == 0);
             mstr_t* prop = tmp_mstr_borrow_m(l->tk_str);
             LEX_TYPES kt = (LEX_TYPES)l->tk;
             if (!lex_chkread(l, kt)) {
@@ -4132,7 +4136,7 @@ bool factor_json(lex_t* l, bytecode_t* bc) {
                 return false;
             }
             lex_skip_empty(l);
-            bc_gen_str(bc, INSTR_MEMBERN, prop->cstr);
+            bc_gen_str(bc, INSTR_MEMBERN, MSTR_CSTR(prop));
             tmp_mstr_return(id);
             tmp_mstr_return(prop);
             if (l->tk != '}') {
@@ -4156,7 +4160,7 @@ bool factor_json(lex_t* l, bytecode_t* bc) {
             }
             /* ES6 `__proto__: v` in an object literal sets the object's
              * [[Prototype]] instead of defining an own "__proto__" property. */
-            if (strcmp(id->cstr, "__proto__") == 0) {
+            if (strcmp(MSTR_CSTR(id), "__proto__") == 0) {
                 bc_gen(bc, INSTR_SET_PROTO);
                 tmp_mstr_return(id);
                 lex_skip_empty(l);
@@ -4186,10 +4190,10 @@ bool factor_json(lex_t* l, bytecode_t* bc) {
             if (is_async_method)
                 bc_gen(bc, INSTR_ASYNC);
         } else { // ES6 property shorthand: {x} == {x: x}
-            pslot_emit_load(bc, id->cstr);
+            pslot_emit_load(bc, MSTR_CSTR(id));
         }
         lex_skip_empty(l);
-        bc_gen_str(bc, INSTR_MEMBERN, id->cstr);
+        bc_gen_str(bc, INSTR_MEMBERN, MSTR_CSTR(id));
         if (l->tk != '}') {
             if (!lex_chkread(l, ',')) {
                 tmp_mstr_return(id);
@@ -4265,11 +4269,11 @@ bool factor_call_func(lex_t* l, bytecode_t* bc, mstr_t* name, bool member) {
          * mis-parsed as an empty name. handle_call_spread() strips the arity
          * suffix and resolves by base name; the runtime arity comes from the
          * spread array, so the suffix value itself is irrelevant. */
-        gen_func_name(name->cstr, 0, s);
-        bc_gen_str(bc, member ? INSTR_CALLO_SPREAD : INSTR_CALL_SPREAD, s->cstr);
+        gen_func_name(MSTR_CSTR(name), 0, s);
+        bc_gen_str(bc, member ? INSTR_CALLO_SPREAD : INSTR_CALL_SPREAD, MSTR_CSTR(s));
     } else {
-        gen_func_name(name->cstr, arg_num, s);
-        bc_gen_str(bc, member ? INSTR_CALLO : INSTR_CALL, s->cstr);
+        gen_func_name(MSTR_CSTR(name), arg_num, s);
+        bc_gen_str(bc, member ? INSTR_CALLO : INSTR_CALL, MSTR_CSTR(s));
     }
     tmp_mstr_return(s);
     return true;
@@ -4277,9 +4281,9 @@ bool factor_call_func(lex_t* l, bytecode_t* bc, mstr_t* name, bool member) {
 
 bool factor_array_access(lex_t* l, bytecode_t* bc, mstr_t* name, bool member) {
     if (member)
-        bc_gen_str(bc, INSTR_GET, name->cstr);
+        bc_gen_str(bc, INSTR_GET, MSTR_CSTR(name));
     else
-        pslot_emit_load(bc, name->cstr);
+        pslot_emit_load(bc, MSTR_CSTR(name));
 
     if (!lex_chkread(l, '[')) {
         return false;
@@ -4319,9 +4323,9 @@ bool factor_template(lex_t* l, bytecode_t* bc) {
         }
         if (c == '`') { // closing backtick: flush the trailing chunk
             if (first) {
-                bc_gen_str(bc, INSTR_STR, chunk->cstr);
+                bc_gen_str(bc, INSTR_STR, MSTR_CSTR(chunk));
             } else {
-                bc_gen_str(bc, INSTR_STR, chunk->cstr);
+                bc_gen_str(bc, INSTR_STR, MSTR_CSTR(chunk));
                 bc_gen(bc, INSTR_PLUS);
             }
             lex_get_nextch(l);
@@ -4329,10 +4333,10 @@ bool factor_template(lex_t* l, bytecode_t* bc) {
         }
         if (c == '$' && l->next_ch == '{') { // embedded expression
             if (first) {
-                bc_gen_str(bc, INSTR_STR, chunk->cstr);
+                bc_gen_str(bc, INSTR_STR, MSTR_CSTR(chunk));
                 first = false;
             } else {
-                bc_gen_str(bc, INSTR_STR, chunk->cstr);
+                bc_gen_str(bc, INSTR_STR, MSTR_CSTR(chunk));
                 bc_gen(bc, INSTR_PLUS);
             }
             mstr_reset(chunk);
@@ -4533,7 +4537,7 @@ bool factor_tagged_template(lex_t* l, bytecode_t* bc) {
     // ---- invoke tag(strings, ...values) ----
     mstr_t* s = mstr_new("");
     gen_func_name("", nvals + 1, s);
-    bc_gen_str(bc, INSTR_CALLX, s->cstr);
+    bc_gen_str(bc, INSTR_CALLX, MSTR_CSTR(s));
     mstr_free(s);
     return true;
 }
@@ -4609,7 +4613,7 @@ static bool paren_group_is_arrow(lex_t* l) {
     lex_t saved = *l;                 // shallow copy: keeps original tk_str ptr
     mstr_t* saved_tk_str = l->tk_str; // do not let scanning clobber caller token
     l->tk_str = tmp_mstr_borrow(""); /* pooled lookahead buffer */
-    mstr_cpy(l->tk_str, saved_tk_str->cstr);
+    mstr_cpy(l->tk_str, MSTR_CSTR(saved_tk_str));
 
     bool is_arrow = false;
     uint32_t prev = '('; // regex context: a '/' right after '(' starts a regex
@@ -4659,7 +4663,7 @@ slow:
         mstr_t* borrowed = l->tk_str;
         *l = saved;
         l->tk_str = borrowed;
-        mstr_cpy(l->tk_str, saved_tk_str->cstr);
+        mstr_cpy(l->tk_str, MSTR_CSTR(saved_tk_str));
     }
     {
         int depth = 0;
@@ -4718,7 +4722,7 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
         } else if (l->tk == '[') { // obj.return[...]
             factor_array_access(l, bc, name, member);
         } else {
-            bc_gen_str(bc, INSTR_GET, name->cstr);
+            bc_gen_str(bc, INSTR_GET, MSTR_CSTR(name));
         }
         tmp_mstr_return(name);
     } else if (l->tk == '(') {
@@ -4772,12 +4776,12 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
                 uint32_t di;
                 for (di = 0; di < defaults.size; di++) {
                     param_default_t* pd = (param_default_t*)array_get(&defaults, di);
-                    if (pd->expr != NULL && strstr(pd->expr->cstr, "arguments") != NULL)
+                    if (pd->expr != NULL && strstr(MSTR_CSTR(pd->expr), "arguments") != NULL)
                         pslot_frame.uses_arguments = true;
                 }
                 for (di = 0; di < pdestrs.size; di++) {
                     param_destr_t* pd = (param_destr_t*)array_get(&pdestrs, di);
-                    if (pd->def != NULL && strstr(pd->def->cstr, "arguments") != NULL)
+                    if (pd->def != NULL && strstr(MSTR_CSTR(pd->def), "arguments") != NULL)
                         pslot_frame.uses_arguments = true;
                 }
             }
@@ -4841,24 +4845,24 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
         }
         bc_gen(bc, INSTR_UNDEF);
     } else if (l->tk == LEX_INT) {
-        bc_gen_str(bc, INSTR_INT, l->tk_str->cstr);
+        bc_gen_str(bc, INSTR_INT, MSTR_CSTR(l->tk_str));
         if (!lex_chkread(l, LEX_INT)) {
             return false;
         }
     } else if (l->tk == LEX_FLOAT) {
-        bc_gen_str(bc, INSTR_FLOAT, l->tk_str->cstr);
+        bc_gen_str(bc, INSTR_FLOAT, MSTR_CSTR(l->tk_str));
         if (!lex_chkread(l, LEX_FLOAT)) {
             return false;
         }
     } else if (l->tk == LEX_BIGINT) {
         /* BigInt literal: pool the digit string (with any 0x/0b/0o prefix) as the
          * INSTR_BIGINT payload; handle_bigint parses it into a bignum at run time. */
-        bc_gen_str(bc, INSTR_BIGINT, l->tk_str->cstr);
+        bc_gen_str(bc, INSTR_BIGINT, MSTR_CSTR(l->tk_str));
         if (!lex_chkread(l, LEX_BIGINT)) {
             return false;
         }
     } else if (l->tk == LEX_STR) {
-        bc_gen_str(bc, INSTR_STR, l->tk_str->cstr);
+        bc_gen_str(bc, INSTR_STR, MSTR_CSTR(l->tk_str));
         if (!lex_chkread(l, LEX_STR)) {
             return false;
         }
@@ -4876,8 +4880,8 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
             tmp_mstr_return(flags);
             return false;
         }
-        bc_gen_str(bc, INSTR_STR, pat->cstr);
-        bc_gen_str(bc, INSTR_STR, flags->cstr);
+        bc_gen_str(bc, INSTR_STR, MSTR_CSTR(pat));
+        bc_gen_str(bc, INSTR_STR, MSTR_CSTR(flags));
         bc_gen_str(bc, INSTR_NEW, "RegExp$2");
         tmp_mstr_return(pat);
         tmp_mstr_return(flags);
@@ -4964,7 +4968,7 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
             if (!lex_chkread(l, '.')) {
                 return false;
             }
-            if (l->tk != LEX_ID || strcmp(l->tk_str->cstr, "meta") != 0) {
+            if (l->tk != LEX_ID || strcmp(MSTR_CSTR(l->tk_str), "meta") != 0) {
                 if (!g_hoist_quiet) {
                     mario_printf("import: expected 'meta' or '('! ");
                     compile_error_pos(l, -1);
@@ -4999,7 +5003,7 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
         factor_json(l, bc);
     } else if (l->tk == '[') { // JSON-style array 
         factor_array(l, bc);
-    } else if (l->tk == LEX_ID && !member && strcmp(l->tk_str->cstr, "yield") == 0) {
+    } else if (l->tk == LEX_ID && !member && strcmp(MSTR_CSTR(l->tk_str), "yield") == 0) {
         /* ES6 generator `yield [expr]` / `yield* expr`. `yield` is not lexed as
          * a reserved word, so match it by name (and never as a member `.yield`).
          * The operand is an assignment-level expression; a bare `yield` with no
@@ -5042,16 +5046,16 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
             factor_array_access(l, bc, name, member);
         } else {
             if (member) {
-                bc_gen_str(bc, INSTR_GET, name->cstr);
+                bc_gen_str(bc, INSTR_GET, MSTR_CSTR(name));
             } else if (l->tk == '.') {
-                pslot_emit_load(bc, name->cstr);
+                pslot_emit_load(bc, MSTR_CSTR(name));
             } else if (l->tk == LEX_R_AFUNCTION) {
                 if (!lex_chkread(l, LEX_R_AFUNCTION)) {
                     tmp_mstr_return(name);
                     return false;
                 }
                 bc_gen(bc, INSTR_FUNC_ARROW);
-                bc_gen_str(bc, INSTR_LOAD, name->cstr);
+                bc_gen_str(bc, INSTR_LOAD, MSTR_CSTR(name));
                 /* Single-parameter arrow: slot 0 for the identifier (a ""
                  * hole when over-long - the runtime still fills it, the
                  * compiler just never emits LOADP 0). The frame must be live
@@ -5061,8 +5065,8 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
                 pslot_frame_t aframe;
                 memset(&aframe, 0, sizeof(aframe));
                 aframe.enabled = !pslot_off();
-                if (strlen(name->cstr) < 64)
-                    strcpy(aframe.names[0], name->cstr);
+                if (strlen(MSTR_CSTR(name)) < 64)
+                    strcpy(aframe.names[0], MSTR_CSTR(name));
                 aframe.num = 1;
                 aframe.local_base = 1;
                 pslot_prescan(l, &aframe, &g_pslot_argu_sink);
@@ -5075,7 +5079,7 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
                  * VALUE (a snapshot) so the operand is not aliased by a later
                  * reassignment of the same binding while it sits on the value
                  * stack (e.g. the first `m` in `f(m, m++, m)`). */
-                pslot_emit_loadv(bc, name->cstr);
+                pslot_emit_loadv(bc, MSTR_CSTR(name));
             }
         }
         tmp_mstr_return(name);
@@ -5146,7 +5150,7 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
                     bc_gen(bc, INSTR_UNDEF);
                     PC og_skip = bc_reserve(bc);
                     PC og_body = bc->cindex;
-                    bc_gen_str(bc, INSTR_GET, name->cstr);
+                    bc_gen_str(bc, INSTR_GET, MSTR_CSTR(name));
                     bc_set_instr(bc, og_skip, INSTR_JMP, ILLEGAL_PC);
                     bc_set_instr(bc, og_guard, INSTR_NULLISH, og_body);
                     if (g_optjmp_n < OPT_JMP_MAX) g_optjmp[g_optjmp_n++] = og_skip;
@@ -5180,7 +5184,7 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
                     } else {
                         mstr_t* s = tmp_mstr_borrow("");
                         gen_func_name("", arg_num, s);
-                        bc_gen_str(bc, recv ? INSTR_CALLXO : INSTR_CALLX, s->cstr);
+                        bc_gen_str(bc, recv ? INSTR_CALLXO : INSTR_CALLX, MSTR_CSTR(s));
                         tmp_mstr_return(s);
                     }
                 } else {
@@ -5238,7 +5242,7 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
             } else {
                 mstr_t* s = tmp_mstr_borrow("");
                 gen_func_name("", arg_num, s);
-                bc_gen_str(bc, recv ? INSTR_CALLXO : INSTR_CALLX, s->cstr);
+                bc_gen_str(bc, recv ? INSTR_CALLXO : INSTR_CALLX, MSTR_CSTR(s));
                 tmp_mstr_return(s);
             }
         } else if (l->tk == '`') {
@@ -5792,7 +5796,7 @@ static bool scan_member_target(lex_t* l, mstr_t* out) {
     if (l->curr_ch != '.' && l->curr_ch != '[' && !(l->curr_ch == '?' && l->next_ch == '.')) {
         return false;
     }
-    mstr_cpy(out, l->tk_str->cstr);
+    mstr_cpy(out, MSTR_CSTR(l->tk_str));
     int depth = 0;
     while (l->curr_ch) {
         char c = l->curr_ch;
@@ -5821,8 +5825,8 @@ static bool scan_member_target(lex_t* l, mstr_t* out) {
              * whole regex body so a structural char inside a computed member key
              * of a destructure target -- `o[/\[/] = v` -- does not corrupt depth. */
             char pc = 0;
-            for (int32_t k = (int32_t)out->len - 1; k >= 0; --k) {
-                char d = out->cstr[k];
+            for (int32_t k = (int32_t)MSTR_LEN(out) - 1; k >= 0; --k) {
+                char d = MSTR_CSTR(out)[k];
                 if (d == ' ' || d == '\t' || d == '\n' || d == '\r') continue;
                 pc = d;
                 break;
@@ -5878,11 +5882,11 @@ static bool scan_member_target(lex_t* l, mstr_t* out) {
  * the regular WANCHOR/WTARGET (setter-aware) path instead of a raw GET+ASIGN,
  * which does not resolve a fetched member as a write target. */
 static bool destr_assign_member(bytecode_t* bc, mstr_t* target_ex, const char* rhs_src) {
-    mstr_t* asg = mstr_new(target_ex->cstr);
+    mstr_t* asg = mstr_new(MSTR_CSTR(target_ex));
     mstr_append(asg, "=(");
     mstr_append(asg, rhs_src);
     mstr_append(asg, ")");
-    bool ok = compile_captured_expr(asg->cstr, bc);
+    bool ok = compile_captured_expr(MSTR_CSTR(asg), bc);
     mstr_free(asg);
     if (ok) {
         bc_gen(bc, INSTR_POP);
@@ -5977,7 +5981,7 @@ static bool destructure_pattern(lex_t* l, bytecode_t* bc, opr_code_t decl_op, co
                 return false;
             }
             char target[64];
-            strncpy(target, l->tk_str->cstr, sizeof(target) - 1);
+            strncpy(target, MSTR_CSTR(l->tk_str), sizeof(target) - 1);
             target[sizeof(target) - 1] = 0;
             if (!lex_chkread(l, LEX_ID)) {
                 return false;
@@ -6029,13 +6033,13 @@ static bool destructure_pattern(lex_t* l, bytecode_t* bc, opr_code_t decl_op, co
             idx++;
         } else {
             if (l->tk == LEX_ID) {
-                strncpy(keyname, l->tk_str->cstr, sizeof(keyname) - 1);
+                strncpy(keyname, MSTR_CSTR(l->tk_str), sizeof(keyname) - 1);
                 keyname[sizeof(keyname) - 1] = 0;
                 if (!lex_chkread(l, LEX_ID)) {
                     return false;
                 }
             } else if (l->tk == LEX_STR) {
-                strncpy(keyname, l->tk_str->cstr, sizeof(keyname) - 1);
+                strncpy(keyname, MSTR_CSTR(l->tk_str), sizeof(keyname) - 1);
                 keyname[sizeof(keyname) - 1] = 0;
                 if (!lex_chkread(l, LEX_STR)) {
                     return false;
@@ -6046,7 +6050,7 @@ static bool destructure_pattern(lex_t* l, bytecode_t* bc, opr_code_t decl_op, co
                  * keywords as property names; a reserved-word token keeps its source
                  * text in tk_str (lex_get_reserved_word only retags tk), so capture
                  * the name and consume the token exactly like an identifier. */
-                strncpy(keyname, l->tk_str->cstr, sizeof(keyname) - 1);
+                strncpy(keyname, MSTR_CSTR(l->tk_str), sizeof(keyname) - 1);
                 keyname[sizeof(keyname) - 1] = 0;
                 int tk = l->tk;
                 if (!lex_chkread(l, tk)) {
@@ -6099,7 +6103,7 @@ static bool destructure_pattern(lex_t* l, bytecode_t* bc, opr_code_t decl_op, co
             if (l->tk == '{' || l->tk == '[') {
                 nested = true;
             } else if (l->tk == LEX_ID) {
-                strncpy(target, l->tk_str->cstr, sizeof(target) - 1);
+                strncpy(target, MSTR_CSTR(l->tk_str), sizeof(target) - 1);
                 target[sizeof(target) - 1] = 0;
                 if (decl_op == 0) {
                     target_ex = mstr_new("");
@@ -6123,7 +6127,7 @@ static bool destructure_pattern(lex_t* l, bytecode_t* bc, opr_code_t decl_op, co
             if (l->tk == '{' || l->tk == '[') {
                 nested = true;
             } else if (l->tk == LEX_ID) {
-                strncpy(target, l->tk_str->cstr, sizeof(target) - 1);
+                strncpy(target, MSTR_CSTR(l->tk_str), sizeof(target) - 1);
                 target[sizeof(target) - 1] = 0;
                 if (decl_op == 0) {
                     target_ex = mstr_new("");
@@ -6173,7 +6177,7 @@ static bool destructure_pattern(lex_t* l, bytecode_t* bc, opr_code_t decl_op, co
                 lex_t sv = *l;
                 mstr_t* sv_tk = l->tk_str;
                 l->tk_str = tmp_mstr_borrow(""); /* pooled lookahead buffer */
-                mstr_cpy(l->tk_str, sv_tk->cstr);
+                mstr_cpy(l->tk_str, MSTR_CSTR(sv_tk));
                 if (skip_balanced_pattern(l)) {
                     lex_skip_empty(l);
                     if (l->tk == '=') {
@@ -6197,7 +6201,7 @@ static bool destructure_pattern(lex_t* l, bytecode_t* bc, opr_code_t decl_op, co
                 bc_gen(bc, INSTR_TEQ);
                 PC pj = bc_reserve(bc);
                 bc_gen_str(bc, INSTR_LOAD, tmpn);
-                if (!compile_captured_expr(defex->cstr, bc)) {
+                if (!compile_captured_expr(MSTR_CSTR(defex), bc)) {
                     mstr_free(defex);
                     return false;
                 }
@@ -6225,7 +6229,7 @@ static bool destructure_pattern(lex_t* l, bytecode_t* bc, opr_code_t decl_op, co
             /* member-expression target (assignment form only) */
             mstr_t* rhs = mstr_new("");
             destr_rhs_text(rhs, src, is_array, my_idx, comp_var, keyname);
-            bool ok = destr_assign_member(bc, target_ex, rhs->cstr);
+            bool ok = destr_assign_member(bc, target_ex, MSTR_CSTR(rhs));
             mstr_free(rhs);
             if (!ok) {
                 mstr_free(target_ex);
@@ -6242,12 +6246,12 @@ static bool destructure_pattern(lex_t* l, bytecode_t* bc, opr_code_t decl_op, co
                     return false;
                 }
                 lex_get_next_token(l);
-                ok = compile_captured_expr(target_ex->cstr, bc);
+                ok = compile_captured_expr(MSTR_CSTR(target_ex), bc);
                 bc_gen(bc, INSTR_TYPEOF);
                 bc_gen_str(bc, INSTR_STR, "undefined");
                 bc_gen(bc, INSTR_TEQ);
                 PC pj = bc_reserve(bc);
-                ok = ok && destr_assign_member(bc, target_ex, ex->cstr);
+                ok = ok && destr_assign_member(bc, target_ex, MSTR_CSTR(ex));
                 mstr_free(ex);
                 if (!ok) {
                     mstr_free(target_ex);
@@ -6293,7 +6297,7 @@ static bool destructure_pattern(lex_t* l, bytecode_t* bc, opr_code_t decl_op, co
                 bc_gen(bc, INSTR_TEQ);
                 PC pj = bc_reserve(bc);
                 bc_gen_str(bc, INSTR_LOAD, target);
-                if (!compile_captured_expr(ex->cstr, bc)) {
+                if (!compile_captured_expr(MSTR_CSTR(ex), bc)) {
                     mstr_free(ex);
                     return false;
                 }
@@ -6336,7 +6340,7 @@ static bool destructure_assign_ex(lex_t* l, bytecode_t* bc, opr_code_t op, bool 
 
     mstr_t* tmpm = mstr_new("__ds");
     mstr_append(tmpm, mstr_from_int(g_destr_counter++, 10));
-    const char* tmp = tmpm->cstr;
+    const char* tmp = MSTR_CSTR(tmpm);
 
     bc_gen_str(bc, INSTR_VAR, tmp);
     bc_gen_str(bc, INSTR_LOAD, tmp);
@@ -6350,7 +6354,7 @@ static bool destructure_assign_ex(lex_t* l, bytecode_t* bc, opr_code_t op, bool 
     /* Emit bindings by re-parsing the pattern on a private lexer copy. */
     lex_t pl = saved;
     pl.tk_str = tmp_mstr_borrow(""); /* pooled lookahead buffer */
-    mstr_cpy(pl.tk_str, saved_tk->cstr);
+    mstr_cpy(pl.tk_str, MSTR_CSTR(saved_tk));
     bool ok = destructure_pattern(&pl, bc, op, tmp, true);
     tmp_mstr_return(pl.tk_str);
 
@@ -6404,7 +6408,7 @@ static bool stmt_var_scan(lex_t* l) {
         if (l->tk == '[' || l->tk == '{') return false; /* destructuring: full parse */
         if (l->tk != LEX_ID) return false;
         if (op == INSTR_VAR && g_vardecl_bc != NULL) {
-            bc_gen_str(g_vardecl_bc, INSTR_VAR, l->tk_str->cstr);
+            bc_gen_str(g_vardecl_bc, INSTR_VAR, MSTR_CSTR(l->tk_str));
         }
         lex_get_next_token(l);
         if (l->tk == '=') {
@@ -6435,7 +6439,7 @@ bool stmt_var(lex_t* l, bytecode_t* bc) {
             return true;
         }
         *l = sv;
-        mstr_cpy(l->tk_str, svstr->cstr);
+        mstr_cpy(l->tk_str, MSTR_CSTR(svstr));
         tmp_mstr_return(svstr);
     }
     opr_code_t op;
@@ -6470,16 +6474,16 @@ bool stmt_var(lex_t* l, bytecode_t* bc) {
             }
             continue;
         }
-        mstr_t* vname = mstr_new(l->tk_str->cstr);
+        mstr_t* vname = mstr_new(MSTR_CSTR(l->tk_str));
         if (!lex_chkread(l, LEX_ID)) {
 			mstr_free(vname);
             return false;
         }
-        bc_gen_str(bc, op, vname->cstr);
+        bc_gen_str(bc, op, MSTR_CSTR(vname));
         if (g_vardecl_bc != NULL && op == INSTR_VAR) {
             /* ES5 var hoisting: the scan pass also declares the name at the
              * enclosing function/script top; the initializer stays in place. */
-            bc_gen_str(g_vardecl_bc, INSTR_VAR, vname->cstr);
+            bc_gen_str(g_vardecl_bc, INSTR_VAR, MSTR_CSTR(vname));
         }
         // sort out initialiser
         if (l->tk == '=') {
@@ -6487,7 +6491,7 @@ bool stmt_var(lex_t* l, bytecode_t* bc) {
 				mstr_free(vname);
                 return false;
             }
-            bc_gen_str(bc, INSTR_LOAD, vname->cstr);
+            bc_gen_str(bc, INSTR_LOAD, MSTR_CSTR(vname));
             if (!base(l, bc)) {
                 mstr_free(vname);
                 return false;
@@ -6772,12 +6776,12 @@ bool stmt_for_in(lex_t* l, bytecode_t* bc,
      * closure lookups) would hit while slotted body reads use the env node -
      * splitting one variable into two bindings (the webpack chunk-registration
      * loop regression). */
-    int lv_slot = (loop_var != NULL) ? pslot_find(loop_var->cstr) : -1;
+    int lv_slot = (loop_var != NULL) ? pslot_find(MSTR_CSTR(loop_var)) : -1;
     if (loop_var) {
         if (lv_slot < 0)
-            bc_gen_str(bc, var_op, loop_var->cstr);
+            bc_gen_str(bc, var_op, MSTR_CSTR(loop_var));
         if (g_vardecl_bc != NULL && var_op == INSTR_VAR) {
-            bc_gen_str(g_vardecl_bc, INSTR_VAR, loop_var->cstr); // ES5 var hoisting
+            bc_gen_str(g_vardecl_bc, INSTR_VAR, MSTR_CSTR(loop_var)); // ES5 var hoisting
         }
     }
     
@@ -6804,7 +6808,7 @@ bool stmt_for_in(lex_t* l, bytecode_t* bc,
         if (lv_slot >= 0)
             bc_gen_imm(bc, INSTR_LOADP, (uint32_t)lv_slot); // slot node: matches slotted body reads
         else
-            bc_gen_str(bc, INSTR_LOAD, loop_var->cstr);
+            bc_gen_str(bc, INSTR_LOAD, MSTR_CSTR(loop_var));
         bc_gen_str(bc, INSTR_LOAD, "__for_in_keys");
         bc_gen_str(bc, INSTR_LOAD, "__for_in_idx");
         bc_gen(bc, INSTR_ARRAY_AT);
@@ -6874,12 +6878,12 @@ bool stmt_for_of(lex_t* l, bytecode_t* bc,
     // declare the loop variable
     /* Same slot rule as stmt_for_in: a slotted loop variable is declared by
      * the function-env pre-creation; an in-loop SAFE_VAR would shadow it. */
-    int lv_slot = (loop_var != NULL) ? pslot_find(loop_var->cstr) : -1;
+    int lv_slot = (loop_var != NULL) ? pslot_find(MSTR_CSTR(loop_var)) : -1;
     if (loop_var) {
         if (lv_slot < 0)
-            bc_gen_str(bc, var_op, loop_var->cstr);
+            bc_gen_str(bc, var_op, MSTR_CSTR(loop_var));
         if (g_vardecl_bc != NULL && var_op == INSTR_VAR) {
-            bc_gen_str(g_vardecl_bc, INSTR_VAR, loop_var->cstr); // ES5 var hoisting
+            bc_gen_str(g_vardecl_bc, INSTR_VAR, MSTR_CSTR(loop_var)); // ES5 var hoisting
         }
     }
 
@@ -6890,7 +6894,7 @@ bool stmt_for_of(lex_t* l, bytecode_t* bc,
     if (destr_pat != NULL) {
         lex_t pl = *destr_pat;
         pl.tk_str = tmp_mstr_borrow(""); /* pooled lookahead buffer */
-        bool dok = destructure_pattern(&pl, bc, destr_op, loop_var->cstr, false);
+        bool dok = destructure_pattern(&pl, bc, destr_op, MSTR_CSTR(loop_var), false);
         tmp_mstr_return(pl.tk_str);
         if (!dok) {
             if (loop_var) mstr_free(loop_var);
@@ -6929,7 +6933,7 @@ bool stmt_for_of(lex_t* l, bytecode_t* bc,
         if (lv_slot >= 0)
             bc_gen_imm(bc, INSTR_LOADP, (uint32_t)lv_slot); // slot node: matches slotted body reads
         else
-            bc_gen_str(bc, INSTR_LOAD, loop_var->cstr);
+            bc_gen_str(bc, INSTR_LOAD, MSTR_CSTR(loop_var));
         bc_gen_str(bc, INSTR_LOAD, "__for_of_step");
         bc_gen_str(bc, INSTR_GET, "value");
         bc_gen(bc, INSTR_ASIGN);
@@ -6942,7 +6946,7 @@ bool stmt_for_of(lex_t* l, bytecode_t* bc,
     if (destr_pat != NULL) {
         lex_t pl = *destr_pat;
         pl.tk_str = tmp_mstr_borrow(""); /* pooled lookahead buffer */
-        bool dok = destructure_pattern(&pl, bc, 0, loop_var->cstr, true);
+        bool dok = destructure_pattern(&pl, bc, 0, MSTR_CSTR(loop_var), true);
         tmp_mstr_return(pl.tk_str);
         if (!dok) {
             if (loop_var) mstr_free(loop_var);
@@ -7002,7 +7006,7 @@ static bool for_scan_var_init(lex_t* l) {
         if (l->tk == '[' || l->tk == '{') return false; /* destructuring */
         if (l->tk != LEX_ID) return false;
         if (op == INSTR_VAR && g_vardecl_bc != NULL) {
-            bc_gen_str(g_vardecl_bc, INSTR_VAR, l->tk_str->cstr);
+            bc_gen_str(g_vardecl_bc, INSTR_VAR, MSTR_CSTR(l->tk_str));
         }
         lex_get_next_token(l);
         if (l->tk == '=') {
@@ -7042,7 +7046,7 @@ static bool stmt_for_scan(lex_t* l, bytecode_t* bc) {
              * is already registered; the iterable carries no declarations, so
              * skip it lexically up to ')' and scan the body normally. */
             if (l->tk == LEX_R_IN ||
-                (l->tk == LEX_ID && strcmp(l->tk_str->cstr, "of") == 0)) {
+                (l->tk == LEX_ID && strcmp(MSTR_CSTR(l->tk_str), "of") == 0)) {
                 lex_get_next_token(l); /* past in/of */
                 if (!skip_expr_stmt_scan(l, false)) {
                     return false; /* stops at the depth-0 ')' */
@@ -7062,7 +7066,7 @@ static bool stmt_for_scan(lex_t* l, bytecode_t* bc) {
             mstr_t* svs2 = tmp_mstr_borrow_m(l->tk_str);
             if (!skip_expr_stmt_scan(l, false)) {
                 *l = sv2;
-                mstr_cpy(l->tk_str, svs2->cstr);
+                mstr_cpy(l->tk_str, MSTR_CSTR(svs2));
                 tmp_mstr_return(svs2);
                 return false;
             }
@@ -7090,7 +7094,7 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
         }
         GSS(for_fb);
         *l = sv;
-        mstr_cpy(l->tk_str, svstr->cstr);
+        mstr_cpy(l->tk_str, MSTR_CSTR(svstr));
         tmp_mstr_return(svstr);
     }
     if (!lex_chkread(l, LEX_R_FOR)) {
@@ -7155,7 +7159,7 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
             if (l->tk != LEX_ID) {
                 return false;
             }
-            loop_var = mstr_new(l->tk_str->cstr);
+            loop_var = mstr_new(MSTR_CSTR(l->tk_str));
             lex_chkread(l, LEX_ID);
             lex_skip_empty(l);
         }
@@ -7166,7 +7170,7 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
             is_for_in = true;
             lex_chkread(l, LEX_R_IN); // consume "in"
             lex_skip_empty(l);
-        } else if (l->tk == LEX_ID && strcmp(l->tk_str->cstr, "of") == 0) {
+        } else if (l->tk == LEX_ID && strcmp(MSTR_CSTR(l->tk_str), "of") == 0) {
             is_for_of = true;
             lex_chkread(l, LEX_ID); // consume "of"
             lex_skip_empty(l);
@@ -7203,15 +7207,15 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
                 if (l->tk != LEX_ID) {
                     return false;
                 }
-                mstr_t* extra = mstr_new(l->tk_str->cstr);
+                mstr_t* extra = mstr_new(MSTR_CSTR(l->tk_str));
                 lex_chkread(l, LEX_ID);
-                bc_gen_str(bc, destr_op, extra->cstr);
+                bc_gen_str(bc, destr_op, MSTR_CSTR(extra));
                 if (g_vardecl_bc != NULL && destr_op == INSTR_VAR) {
-                    bc_gen_str(g_vardecl_bc, INSTR_VAR, extra->cstr); // ES5 var hoisting
+                    bc_gen_str(g_vardecl_bc, INSTR_VAR, MSTR_CSTR(extra)); // ES5 var hoisting
                 }
                 if (l->tk == '=') {
                     lex_chkread(l, '=');
-                    bc_gen_str(bc, INSTR_LOAD, extra->cstr);
+                    bc_gen_str(bc, INSTR_LOAD, MSTR_CSTR(extra));
                     if (!base(l, bc)) {
                         mstr_free(extra);
                         return false;
@@ -7231,11 +7235,11 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
             // Standard for loop variable initialization
             // Generate variable declaration bytecode
             if (loop_var) {
-                bc_gen_str(bc, var_op, loop_var->cstr);
+                bc_gen_str(bc, var_op, MSTR_CSTR(loop_var));
                 if (g_vardecl_bc != NULL && var_op == INSTR_VAR) {
                     /* ES5 var hoisting: `for(var i=...)` declares i at the
                      * enclosing function/script top too. */
-                    bc_gen_str(g_vardecl_bc, INSTR_VAR, loop_var->cstr);
+                    bc_gen_str(g_vardecl_bc, INSTR_VAR, MSTR_CSTR(loop_var));
                 }
                 /* ES6 for-let/const: declare the loop-scope temp that shuttles
                  * the loop variable in/out of the per-iteration block below. */
@@ -7245,7 +7249,7 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
             }
             if (l->tk == '=') {
                 lex_chkread(l, '=');
-                bc_gen_str(bc, INSTR_LOAD, loop_var->cstr);
+                bc_gen_str(bc, INSTR_LOAD, MSTR_CSTR(loop_var));
                 if (!base(l, bc)) {
                     mstr_free(loop_var);
                     return false;
@@ -7266,7 +7270,7 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
                 lex_t pd = *l;                    // shallow copy: keeps original tk_str ptr
                 mstr_t* pd_tk_str = l->tk_str;
                 l->tk_str = tmp_mstr_borrow(""); /* pooled lookahead buffer */
-                mstr_cpy(l->tk_str, pd_tk_str->cstr);
+                mstr_cpy(l->tk_str, MSTR_CSTR(pd_tk_str));
                 lex_get_next_token(l);            // move past the ','
                 lex_skip_empty(l);
                 bool is_decl;
@@ -7316,15 +7320,15 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
                     mstr_free(loop_var);
                     return false;
                 }
-                mstr_t* extra = mstr_new(l->tk_str->cstr);
+                mstr_t* extra = mstr_new(MSTR_CSTR(l->tk_str));
                 lex_chkread(l, LEX_ID);
-                bc_gen_str(bc, var_op, extra->cstr);
+                bc_gen_str(bc, var_op, MSTR_CSTR(extra));
                 if (g_vardecl_bc != NULL && var_op == INSTR_VAR) {
-                    bc_gen_str(g_vardecl_bc, INSTR_VAR, extra->cstr); // ES5 var hoisting
+                    bc_gen_str(g_vardecl_bc, INSTR_VAR, MSTR_CSTR(extra)); // ES5 var hoisting
                 }
                 if (l->tk == '=') {
                     lex_chkread(l, '=');
-                    bc_gen_str(bc, INSTR_LOAD, extra->cstr);
+                    bc_gen_str(bc, INSTR_LOAD, MSTR_CSTR(extra));
                     if (!base(l, bc)) {
                         mstr_free(extra);
                         mstr_free(loop_var);
@@ -7356,12 +7360,12 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
             lex_t saved = *l;                 // shallow copy: keeps original tk_str ptr
             mstr_t* saved_tk_str = l->tk_str; // do not let scanning clobber caller token
             l->tk_str = tmp_mstr_borrow(""); /* pooled lookahead buffer */
-            mstr_cpy(l->tk_str, saved_tk_str->cstr);
-            mstr_t* bare = mstr_new(saved_tk_str->cstr); // capture the loop-variable name
+            mstr_cpy(l->tk_str, MSTR_CSTR(saved_tk_str));
+            mstr_t* bare = mstr_new(MSTR_CSTR(saved_tk_str)); // capture the loop-variable name
             lex_get_next_token(l);            // move past the identifier
             lex_skip_empty(l);
             bool bare_in = (l->tk == LEX_R_IN);
-            bool bare_of = (!bare_in && l->tk == LEX_ID && strcmp(l->tk_str->cstr, "of") == 0);
+            bool bare_of = (!bare_in && l->tk == LEX_ID && strcmp(MSTR_CSTR(l->tk_str), "of") == 0);
             if (bare_in || bare_of) {
                 if (bare_in) lex_chkread(l, LEX_R_IN);
                 else         lex_chkread(l, LEX_ID);
@@ -7370,7 +7374,7 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
                  * buffer. Copy its text into the caller's buffer and keep the
                  * advanced position, so base() parses the iterable (not the stale
                  * loop-variable name). */
-                mstr_cpy(saved_tk_str, l->tk_str->cstr);
+                mstr_cpy(saved_tk_str, MSTR_CSTR(l->tk_str));
                 tmp_mstr_return(l->tk_str);       // drop the temp scan buffer
                 l->tk_str = saved_tk_str;   // caller buffer now holds the live token
                 /* The bare variable already exists (or is a global); declare it
@@ -7487,13 +7491,13 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
     if (per_iter) {
         // __for_let_tmp = i
         bc_gen_str(bc, INSTR_LOAD, "__for_let_tmp");
-        bc_gen_str(bc, INSTR_LOAD, loop_var->cstr);
+        bc_gen_str(bc, INSTR_LOAD, MSTR_CSTR(loop_var));
         bc_gen(bc, INSTR_ASIGN);
         bc_gen(bc, INSTR_POP);
         bc_gen(bc, INSTR_BLOCK);
         // let i(block) = __for_let_tmp
-        bc_gen_str(bc, INSTR_SAFE_VAR, loop_var->cstr);
-        bc_gen_str(bc, INSTR_LOAD, loop_var->cstr);
+        bc_gen_str(bc, INSTR_SAFE_VAR, MSTR_CSTR(loop_var));
+        bc_gen_str(bc, INSTR_LOAD, MSTR_CSTR(loop_var));
         bc_gen_str(bc, INSTR_LOAD, "__for_let_tmp");
         bc_gen(bc, INSTR_ASIGN);
         bc_gen(bc, INSTR_POP);
@@ -7518,13 +7522,13 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
          * changed and re-assigning a const loop variable would throw. */
         if (var_op == INSTR_SAFE_VAR) {
             bc_gen_str(bc, INSTR_LOAD, "__for_let_tmp");
-            bc_gen_str(bc, INSTR_LOAD, loop_var->cstr);
+            bc_gen_str(bc, INSTR_LOAD, MSTR_CSTR(loop_var));
             bc_gen(bc, INSTR_ASIGN);
             bc_gen(bc, INSTR_POP);
         }
         bc_gen(bc, INSTR_BLOCK_END);
         if (var_op == INSTR_SAFE_VAR) {
-            bc_gen_str(bc, INSTR_LOAD, loop_var->cstr);
+            bc_gen_str(bc, INSTR_LOAD, MSTR_CSTR(loop_var));
             bc_gen_str(bc, INSTR_LOAD, "__for_let_tmp");
             bc_gen(bc, INSTR_ASIGN);
             bc_gen(bc, INSTR_POP);
@@ -7559,8 +7563,8 @@ bool stmt_break(lex_t* l, bytecode_t* bc) {
         lex_t saved = *l;
         mstr_t* saved_tk_str = l->tk_str;
         l->tk_str = tmp_mstr_borrow(""); /* pooled lookahead buffer */
-        mstr_cpy(l->tk_str, saved_tk_str->cstr);
-        strncpy(label, l->tk_str->cstr, sizeof(label) - 1);
+        mstr_cpy(l->tk_str, MSTR_CSTR(saved_tk_str));
+        strncpy(label, MSTR_CSTR(l->tk_str), sizeof(label) - 1);
         label[sizeof(label) - 1] = 0;
         lex_get_next_token(l); // token right after the identifier
         bool is_label = (l->tk == ';' || l->tk == '}' || l->tk == LEX_EOF);
@@ -7602,8 +7606,8 @@ bool stmt_continue(lex_t* l, bytecode_t* bc) {
         lex_t saved = *l;
         mstr_t* saved_tk_str = l->tk_str;
         l->tk_str = tmp_mstr_borrow(""); /* pooled lookahead buffer */
-        mstr_cpy(l->tk_str, saved_tk_str->cstr);
-        strncpy(label, l->tk_str->cstr, sizeof(label) - 1);
+        mstr_cpy(l->tk_str, MSTR_CSTR(saved_tk_str));
+        strncpy(label, MSTR_CSTR(l->tk_str), sizeof(label) - 1);
         label[sizeof(label) - 1] = 0;
         lex_get_next_token(l); // token right after the identifier
         bool is_label = (l->tk == ';' || l->tk == '}' || l->tk == LEX_EOF);
@@ -7642,7 +7646,7 @@ bool stmt_function(lex_t* l, bytecode_t* bc) {
     g_func_selfname = 2; /* DECLARATION: record .name for Error.stack parity, but NO in-body self-binding so a body `fname = ...` rebinds this declaration (see defer_replay_one) */
     factor_def_func(l, bc, fname);
     g_func_selfname = 0;
-    bc_gen_str(bc, INSTR_MEMBERN, fname->cstr);
+    bc_gen_str(bc, INSTR_MEMBERN, MSTR_CSTR(fname));
     mstr_free(fname);
     return true;
 }
@@ -7672,7 +7676,7 @@ bool stmt_include(lex_t* l, bytecode_t* bc) {
 /* `from` and `as` are contextual keywords in module syntax: ordinary
  * identifiers the grammar gives meaning to. Match without consuming. */
 static bool lex_is_word(lex_t* l, const char* word) {
-    return (l->tk == LEX_ID && strcmp(l->tk_str->cstr, word) == 0);
+    return (l->tk == LEX_ID && strcmp(MSTR_CSTR(l->tk_str), word) == 0);
 }
 
 /* Read a module binding name: an identifier, or a reserved word JS permits as
@@ -7685,7 +7689,7 @@ static bool lex_read_binding_name(lex_t* l, mstr_t* out) {
         }
         return false;
     }
-    mstr_cpy(out, l->tk_str->cstr);
+    mstr_cpy(out, MSTR_CSTR(l->tk_str));
     lex_get_next_token(l);
     return true;
 }
@@ -7708,7 +7712,7 @@ static bool module_read_from(lex_t* l, mstr_t* spec) {
         }
         return false;
     }
-    mstr_cpy(spec, l->tk_str->cstr);
+    mstr_cpy(spec, MSTR_CSTR(l->tk_str));
     lex_get_next_token(l); // consume the string
     return true;
 }
@@ -7721,10 +7725,10 @@ static void export_peek_class_name(lex_t* l, mstr_t* out) {
     lex_get_next_token(l); // consume 'class' (l->tk is LEX_R_CLASS on entry)
     lex_skip_empty(l);
     if (l->tk == LEX_ID) {
-        mstr_cpy(out, l->tk_str->cstr);
+        mstr_cpy(out, MSTR_CSTR(l->tk_str));
     }
     *l = saved;
-    mstr_cpy(l->tk_str, saved_str->cstr);
+    mstr_cpy(l->tk_str, MSTR_CSTR(saved_str));
     tmp_mstr_return(saved_str);
 }
 
@@ -7750,7 +7754,7 @@ static bool import_is_expression(lex_t* l) {
     lex_get_next_token(l); // consume 'import'
     bool expr = (l->tk == '(' || l->tk == '.');
     *l = saved;
-    mstr_cpy(l->tk_str, saved_str->cstr);
+    mstr_cpy(l->tk_str, MSTR_CSTR(saved_str));
     tmp_mstr_return(saved_str);
     return expr;
 }
@@ -7764,12 +7768,12 @@ bool stmt_import(lex_t* l, bytecode_t* bc) {
 
     /* import 'mod' : evaluate for side effects only. */
     if (l->tk == LEX_STR) {
-        mstr_t* spec = mstr_new(l->tk_str->cstr);
+        mstr_t* spec = mstr_new(MSTR_CSTR(l->tk_str));
         if (!lex_chkread(l, LEX_STR)) {
             mstr_free(spec);
             return false;
         }
-        bc_gen_str(bc, INSTR_MODULE, spec->cstr);
+        bc_gen_str(bc, INSTR_MODULE, MSTR_CSTR(spec));
         bc_gen(bc, INSTR_POP);
         mstr_free(spec);
         if (is_stmt_end(l->tk)) {
@@ -7781,7 +7785,7 @@ bool stmt_import(lex_t* l, bytecode_t* bc) {
     /* Optional default binding: `import d from 'm'` / `import d, {..} from 'm'`. */
     mstr_t* def_name = mstr_new("");
     if (l->tk == LEX_ID) {
-        mstr_cpy(def_name, l->tk_str->cstr);
+        mstr_cpy(def_name, MSTR_CSTR(l->tk_str));
         if (!lex_chkread(l, LEX_ID)) {
             mstr_free(def_name);
             return false;
@@ -7825,7 +7829,7 @@ bool stmt_import(lex_t* l, bytecode_t* bc) {
             mstr_free(ns_name);
             return false;
         }
-        mstr_cpy(ns_name, l->tk_str->cstr);
+        mstr_cpy(ns_name, MSTR_CSTR(l->tk_str));
         if (!lex_chkread(l, LEX_ID)) {
             mstr_free(def_name);
             mstr_free(ns_name);
@@ -7852,7 +7856,7 @@ bool stmt_import(lex_t* l, bytecode_t* bc) {
                 ok = false;
                 break;
             }
-            mstr_cpy(d, s->cstr);
+            mstr_cpy(d, MSTR_CSTR(s));
             lex_skip_empty(l);
             if (lex_is_word(l, "as")) {
                 lex_get_next_token(l); // consume 'as'
@@ -7887,16 +7891,16 @@ bool stmt_import(lex_t* l, bytecode_t* bc) {
     }
 
     if (ok) {
-        if (def_name->len > 0) {
-            emit_import_binding(bc, spec->cstr, "default", def_name->cstr);
+        if (MSTR_LEN(def_name) > 0) {
+            emit_import_binding(bc, MSTR_CSTR(spec), "default", MSTR_CSTR(def_name));
         }
-        if (ns_name->len > 0) {
-            emit_import_binding(bc, spec->cstr, NULL, ns_name->cstr);
+        if (MSTR_LEN(ns_name) > 0) {
+            emit_import_binding(bc, MSTR_CSTR(spec), NULL, MSTR_CSTR(ns_name));
         }
         for (uint32_t i = 0; i < srcs->size; i++) {
             mstr_t* s = (mstr_t*)array_get(srcs, i);
             mstr_t* d = (mstr_t*)array_get(dsts, i);
-            emit_import_binding(bc, spec->cstr, s->cstr, d->cstr);
+            emit_import_binding(bc, MSTR_CSTR(spec), MSTR_CSTR(s), MSTR_CSTR(d));
         }
         if (is_stmt_end(l->tk)) {
             lex_chkread_stmt_end(l);
@@ -7936,18 +7940,18 @@ static bool stmt_export_var(lex_t* l, bytecode_t* bc) {
             }
             return false;
         }
-        mstr_t* vname = mstr_new(l->tk_str->cstr);
+        mstr_t* vname = mstr_new(MSTR_CSTR(l->tk_str));
         if (!lex_chkread(l, LEX_ID)) {
             mstr_free(vname);
             return false;
         }
-        bc_gen_str(bc, op, vname->cstr);
+        bc_gen_str(bc, op, MSTR_CSTR(vname));
         if (l->tk == '=') {
             if (!lex_chkread(l, '=')) {
                 mstr_free(vname);
                 return false;
             }
-            bc_gen_str(bc, INSTR_LOAD, vname->cstr);
+            bc_gen_str(bc, INSTR_LOAD, MSTR_CSTR(vname));
             if (!base(l, bc)) {
                 mstr_free(vname);
                 return false;
@@ -7955,7 +7959,7 @@ static bool stmt_export_var(lex_t* l, bytecode_t* bc) {
             bc_gen(bc, INSTR_ASIGN);
             bc_gen(bc, INSTR_POP);
         }
-        bc_gen_str(bc, INSTR_EXPORT, vname->cstr);
+        bc_gen_str(bc, INSTR_EXPORT, MSTR_CSTR(vname));
         mstr_free(vname);
         if (!is_stmt_end(l->tk)) {
             if (l->tk == ',') {
@@ -7997,7 +8001,7 @@ bool stmt_export(lex_t* l, bytecode_t* bc) {
         /* Deferred at scan time / already hoisted by the replay: skip the
          * definition but still publish the binding. */
         if (func_decl_defer_or_skip(l, dbc, false, fname)) {
-            bc_gen_str(bc, INSTR_EXPORT, fname->cstr);
+            bc_gen_str(bc, INSTR_EXPORT, MSTR_CSTR(fname));
             mstr_free(fname);
             return true;
         }
@@ -8013,8 +8017,8 @@ bool stmt_export(lex_t* l, bytecode_t* bc) {
             return false;
         }
         g_func_selfname = 0;
-        bc_gen_str(dbc, INSTR_MEMBERN, fname->cstr);
-        bc_gen_str(bc, INSTR_EXPORT, fname->cstr);
+        bc_gen_str(dbc, INSTR_MEMBERN, MSTR_CSTR(fname));
+        bc_gen_str(bc, INSTR_EXPORT, MSTR_CSTR(fname));
         mstr_free(fname);
         return true;
     }
@@ -8037,7 +8041,7 @@ bool stmt_export(lex_t* l, bytecode_t* bc) {
         /* Deferred at scan time / already hoisted by the replay: skip the
          * definition but still publish the binding. */
         if (func_decl_defer_or_skip(l, dbc, true, fname)) {
-            bc_gen_str(bc, INSTR_EXPORT, fname->cstr);
+            bc_gen_str(bc, INSTR_EXPORT, MSTR_CSTR(fname));
             mstr_free(fname);
             return true;
         }
@@ -8055,8 +8059,8 @@ bool stmt_export(lex_t* l, bytecode_t* bc) {
             return false;
         }
         g_func_selfname = 0;
-        bc_gen_str(dbc, INSTR_MEMBERN, fname->cstr);
-        bc_gen_str(bc, INSTR_EXPORT, fname->cstr);
+        bc_gen_str(dbc, INSTR_MEMBERN, MSTR_CSTR(fname));
+        bc_gen_str(bc, INSTR_EXPORT, MSTR_CSTR(fname));
         mstr_free(fname);
         return true;
     }
@@ -8071,8 +8075,8 @@ bool stmt_export(lex_t* l, bytecode_t* bc) {
             return false;
         }
         bc_gen(bc, INSTR_POP);
-        if (cname->len > 0) {
-            bc_gen_str(bc, INSTR_EXPORT, cname->cstr);
+        if (MSTR_LEN(cname) > 0) {
+            bc_gen_str(bc, INSTR_EXPORT, MSTR_CSTR(cname));
         }
         mstr_free(cname);
         if (is_stmt_end(l->tk)) lex_chkread_stmt_end(l);
@@ -8100,7 +8104,7 @@ bool stmt_export(lex_t* l, bytecode_t* bc) {
                 mstr_free(ns_name);
                 return false;
             }
-            mstr_cpy(ns_name, l->tk_str->cstr);
+            mstr_cpy(ns_name, MSTR_CSTR(l->tk_str));
             if (!lex_chkread(l, LEX_ID)) {
                 mstr_free(ns_name);
                 return false;
@@ -8113,9 +8117,9 @@ bool stmt_export(lex_t* l, bytecode_t* bc) {
             mstr_free(spec);
             return false;
         }
-        bc_gen_str(bc, INSTR_MODULE, spec->cstr);
-        if (ns_name->len > 0) {
-            bc_gen_str(bc, INSTR_EXPORT_VALUE, ns_name->cstr);
+        bc_gen_str(bc, INSTR_MODULE, MSTR_CSTR(spec));
+        if (MSTR_LEN(ns_name) > 0) {
+            bc_gen_str(bc, INSTR_EXPORT_VALUE, MSTR_CSTR(ns_name));
         } else {
             bc_gen(bc, INSTR_EXPORT_STAR);
         }
@@ -8141,7 +8145,7 @@ bool stmt_export(lex_t* l, bytecode_t* bc) {
                 ok = false;
                 break;
             }
-            mstr_cpy(d, s->cstr);
+            mstr_cpy(d, MSTR_CSTR(s));
             lex_skip_empty(l);
             if (lex_is_word(l, "as")) {
                 lex_get_next_token(l); // consume 'as'
@@ -8179,9 +8183,9 @@ bool stmt_export(lex_t* l, bytecode_t* bc) {
                 for (uint32_t i = 0; i < srcs->size; i++) {
                     mstr_t* s = (mstr_t*)array_get(srcs, i);
                     mstr_t* d = (mstr_t*)array_get(dsts, i);
-                    bc_gen_str(bc, INSTR_MODULE, spec->cstr);
-                    bc_gen_str(bc, INSTR_GET, s->cstr);
-                    bc_gen_str(bc, INSTR_EXPORT_VALUE, d->cstr);
+                    bc_gen_str(bc, INSTR_MODULE, MSTR_CSTR(spec));
+                    bc_gen_str(bc, INSTR_GET, MSTR_CSTR(s));
+                    bc_gen_str(bc, INSTR_EXPORT_VALUE, MSTR_CSTR(d));
                 }
                 mstr_free(spec);
             }
@@ -8190,8 +8194,8 @@ bool stmt_export(lex_t* l, bytecode_t* bc) {
             for (uint32_t i = 0; i < srcs->size; i++) {
                 mstr_t* s = (mstr_t*)array_get(srcs, i);
                 mstr_t* d = (mstr_t*)array_get(dsts, i);
-                bc_gen_str(bc, INSTR_LOAD, s->cstr);
-                bc_gen_str(bc, INSTR_EXPORT_VALUE, d->cstr);
+                bc_gen_str(bc, INSTR_LOAD, MSTR_CSTR(s));
+                bc_gen_str(bc, INSTR_EXPORT_VALUE, MSTR_CSTR(d));
             }
         }
 
@@ -8221,7 +8225,7 @@ bool stmt_return(lex_t* l, bytecode_t* bc) {
             if (ses) { GSS(expr_skip_ok); } else { GSS(expr_skip_fb); }
             if (!ses) {
                 *l = sv;
-                mstr_cpy(l->tk_str, svstr->cstr);
+                mstr_cpy(l->tk_str, MSTR_CSTR(svstr));
                 tmp_mstr_return(svstr);
                 if (!expr_seq(l, bc)) {
                     return false;
@@ -8271,7 +8275,7 @@ bool stmt_throw(lex_t* l, bytecode_t* bc) {
         if (ses) { GSS(expr_skip_ok); } else { GSS(expr_skip_fb); }
         if (!ses) {
             *l = sv;
-            mstr_cpy(l->tk_str, svstr->cstr);
+            mstr_cpy(l->tk_str, MSTR_CSTR(svstr));
             tmp_mstr_return(svstr);
             if (!expr_seq(l, bc)) {
                 return false;
@@ -8325,7 +8329,7 @@ bool stmt_try(lex_t* l, bytecode_t* bc) {
             if (!lex_chkread(l, '(')) {
                 return false;
             }
-            bc_gen_str(bc, INSTR_CATCH, l->tk_str->cstr);
+            bc_gen_str(bc, INSTR_CATCH, MSTR_CSTR(l->tk_str));
             if (!lex_chkread(l, LEX_ID)) {
                 return false;
             }
@@ -8366,7 +8370,7 @@ bool stmt_try(lex_t* l, bytecode_t* bc) {
      * sequentially after TRY_END. It runs on the normal path and on the
      * catch-completes-normally path, matching JS for the common cases. */
     lex_skip_empty(l);
-    if (l->tk == LEX_ID && strcmp(l->tk_str->cstr, "finally") == 0) {
+    if (l->tk == LEX_ID && strcmp(MSTR_CSTR(l->tk_str), "finally") == 0) {
         if (!lex_chkread(l, LEX_ID)) {
             return false;
         }
@@ -8591,7 +8595,7 @@ bool stmt_switch(lex_t* l, bytecode_t* bc) {
         lex_t sv = *l;
         mstr_t* svstr = tmp_mstr_borrow_m(l->tk_str);
         if (stmt_switch_scan(l, bc)) { tmp_mstr_return(svstr); return true; }
-        *l = sv; mstr_cpy(l->tk_str, svstr->cstr); tmp_mstr_return(svstr);
+        *l = sv; mstr_cpy(l->tk_str, MSTR_CSTR(svstr)); tmp_mstr_return(svstr);
         /* fall through: the formal path re-parses and reports */
     }
     if (!lex_chkread(l, '(')) return false;
@@ -8626,7 +8630,7 @@ bool stmt_switch(lex_t* l, bytecode_t* bc) {
     lex_t saved = *l;
     mstr_t* saved_tk_str = l->tk_str;
     l->tk_str = tmp_mstr_borrow(""); /* pooled lookahead buffer */
-    mstr_cpy(l->tk_str, saved_tk_str->cstr);
+    mstr_cpy(l->tk_str, MSTR_CSTR(saved_tk_str));
 
     PC pc_switch = bc_gen(bc, INSTR_SWITCH);
     bc_add_instr(bc, pc_switch, INSTR_JMP, pc_switch + 2); // normal flow -> dispatch
@@ -8746,7 +8750,7 @@ bool stmt_strict(lex_t* l, bytecode_t* bc) {
         return false;
     }
 
-    const char* s = l->tk_str->cstr;
+    const char* s = MSTR_CSTR(l->tk_str);
     if (strcmp(s, "use strict") != 0) {
         return false;
     }
@@ -8773,7 +8777,7 @@ static bool statement_is_label(lex_t* l) {
     lex_t saved = *l;
     mstr_t* saved_tk_str = l->tk_str;
     l->tk_str = tmp_mstr_borrow(""); /* pooled lookahead buffer */
-    mstr_cpy(l->tk_str, saved_tk_str->cstr);
+    mstr_cpy(l->tk_str, MSTR_CSTR(saved_tk_str));
     lex_get_next_token(l); // move past the identifier
     bool is_label = (l->tk == ':');
     tmp_mstr_return(l->tk_str);
@@ -8793,7 +8797,7 @@ static bool statement_is_label(lex_t* l) {
  * the scope stack stays balanced on both the normal and the break path. */
 static bool stmt_label(lex_t* l, bytecode_t* bc) {
     char name[64];
-    strncpy(name, l->tk_str->cstr, sizeof(name) - 1);
+    strncpy(name, MSTR_CSTR(l->tk_str), sizeof(name) - 1);
     name[sizeof(name) - 1] = 0;
     if (!lex_chkread(l, LEX_ID)) { // consume the label identifier
         return false;
@@ -8860,7 +8864,7 @@ bool statement(lex_t* l, bytecode_t* bc) {
 
     /* `with (obj) stmt` (see stmt_with): checked before the expression path,
      * which would otherwise compile it as a call to a function `with`. */
-    if (l->tk == LEX_ID && strcmp(l->tk_str->cstr, "with") == 0) {
+    if (l->tk == LEX_ID && strcmp(MSTR_CSTR(l->tk_str), "with") == 0) {
         return stmt_with(l, bc);
     }
 
@@ -8890,7 +8894,7 @@ bool statement(lex_t* l, bytecode_t* bc) {
             }
         }
         *l = saved;
-        mstr_cpy(l->tk_str, saved_str->cstr);
+        mstr_cpy(l->tk_str, MSTR_CSTR(saved_str));
         tmp_mstr_return(saved_str);
 
         if (is_destr) {
@@ -8924,7 +8928,7 @@ bool statement(lex_t* l, bytecode_t* bc) {
                 if (ses) { GSS(expr_skip_ok); } else { GSS(expr_skip_fb); }
                 if (!ses) {
                     *l = sv;
-                    mstr_cpy(l->tk_str, svstr->cstr);
+                    mstr_cpy(l->tk_str, MSTR_CSTR(svstr));
                     if (!expr_seq(l, bc)) {
                         tmp_mstr_return(svstr);
                         return false;
@@ -8969,7 +8973,7 @@ bool statement(lex_t* l, bytecode_t* bc) {
                 if (ses) { GSS(expr_skip_ok); } else { GSS(expr_skip_fb); }
                 if (!ses) {
                     *l = sv;
-                    mstr_cpy(l->tk_str, svstr->cstr);
+                    mstr_cpy(l->tk_str, MSTR_CSTR(svstr));
                     if (!expr_seq(l, bc)) {
                         tmp_mstr_return(svstr);
                         return false;
@@ -9023,7 +9027,7 @@ bool statement(lex_t* l, bytecode_t* bc) {
                 g_func_selfname = 2; /* async DECLARATION: record .name, no in-body self-binding (see defer_replay_one) */
                 factor_def_func(l, dbc, fname);
                 g_func_selfname = 0;
-                bc_gen_str(dbc, INSTR_MEMBERN, fname->cstr);
+                bc_gen_str(dbc, INSTR_MEMBERN, MSTR_CSTR(fname));
                 mstr_free(fname);
             }
         } else {
@@ -9034,7 +9038,7 @@ bool statement(lex_t* l, bytecode_t* bc) {
                 if (ses) { GSS(expr_skip_ok); } else { GSS(expr_skip_fb); }
                 if (!ses) {
                     *l = sv;
-                    mstr_cpy(l->tk_str, svstr->cstr);
+                    mstr_cpy(l->tk_str, MSTR_CSTR(svstr));
                     g_async_pending = 1;
                     if (!base(l, bc)) {
                         g_async_pending = 0;
@@ -9071,7 +9075,7 @@ bool statement(lex_t* l, bytecode_t* bc) {
                 if (ses) { GSS(expr_skip_ok); } else { GSS(expr_skip_fb); }
                 if (!ses) {
                     *l = sv;
-                    mstr_cpy(l->tk_str, svstr->cstr);
+                    mstr_cpy(l->tk_str, MSTR_CSTR(svstr));
                     if (!expr_seq(l, bc)) {
                         tmp_mstr_return(svstr);
                         return false;

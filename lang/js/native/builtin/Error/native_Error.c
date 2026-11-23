@@ -224,7 +224,7 @@ var_t* native_ErrorConstructor(vm_t* vm, var_t* env, void* data) {
 			mstr_append(head, ": ");
 			mstr_append(head, s);
 		}
-		var_t* stackv = error_stack_value(vm, thisV, head->cstr);
+		var_t* stackv = error_stack_value(vm, thisV, MSTR_CSTR(head));
 		mstr_free(head);
 		if(stackv != NULL) {
 			if(stackv->type == V_STRING) {
@@ -260,7 +260,7 @@ var_t* native_ErrorToString(vm_t* vm, var_t* env, void* data) {
 		mstr_append(s, ": ");
 		mstr_append(s, msg);
 	}
-	var_t* ret = var_new_str(vm, s->cstr);
+	var_t* ret = var_new_str(vm, MSTR_CSTR(s));
 	mstr_free(s);
 	return ret;
 }

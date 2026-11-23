@@ -50,7 +50,7 @@ var_t* native_Symbol_toString(vm_t* vm, var_t* env, void* data) {
     mstr_t* s = mstr_new("Symbol(");
     if (desc != NULL) mstr_append(s, desc);
     mstr_add(s, ')');
-    var_t* r = var_new_str(vm, s->cstr);
+    var_t* r = var_new_str(vm, MSTR_CSTR(s));
     mstr_free(s);
     return r;
 }

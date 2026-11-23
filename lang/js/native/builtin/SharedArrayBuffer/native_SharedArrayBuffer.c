@@ -30,11 +30,15 @@ static void sab_setup(vm_t* vm, var_t* obj, uint8_t* bytes, uint32_t len) {
 	obj->free_func = sab_buffer_free;
 
 	node_t* mn = var_add(obj, EXOTIC_MARKER, var_new_str(vm, EXOTIC_SHARED));
-	mn->invisable = 1;
-	mn->be_unenumerable = 1;
+	if(mn != NULL) {
+		mn->invisable = 1;
+		mn->be_unenumerable = 1;
+	}
 
 	node_t* bn = var_add(obj, "byteLength", var_new_int(vm, (int)len));
-	bn->be_unenumerable = 1;
+	if(bn != NULL) {
+		bn->be_unenumerable = 1;
+	}
 }
 
 /* Zero-filled byte block; NULL for len==0 (a zero-length buffer is legal and must
@@ -43,6 +47,8 @@ static uint8_t* sab_alloc(uint32_t len) {
 	if(len == 0)
 		return NULL;
 	uint8_t* p = (uint8_t*)mario_malloc(len);
+	if(p == NULL) /* OOM: degrade to the zero-length shape */
+		return NULL;
 	memset(p, 0, len);
 	return p;
 }

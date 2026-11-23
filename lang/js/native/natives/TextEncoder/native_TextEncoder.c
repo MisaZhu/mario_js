@@ -42,7 +42,7 @@ static var_t* te_encode(vm_t* vm, var_t* env, void* data) {
 	else if(in != NULL && in->type != V_UNDEF && in->type != V_NULL) {
 		mstr_t* tmp = mstr_new("");
 		var_to_str(in, tmp);
-		s = tmp->cstr;
+		s = MSTR_CSTR(tmp);
 		var_t* out = native_TypedArray_from_bytes(vm, TA_UINT8,
 			(const uint8_t*)(s != NULL ? s : ""), (int64_t)(s != NULL ? strlen(s) : 0));
 		mstr_free(tmp);

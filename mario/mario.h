@@ -88,7 +88,7 @@ void        hash_map_free(hash_map_t* map, free_func_t free_key, free_func_t fre
 void        hash_map_init(hash_map_t* map);
 void        hash_map_add(hash_map_t* map, const char* key, void* value);
 void        mario_mapdbg(const char* tag, uint32_t a, uint32_t b); /* env MARIO_MAPDBG */
-void        hash_map_add_fresh(hash_map_t* map, const char* key, void* value); /* key verified absent by caller */
+bool        hash_map_add_fresh(hash_map_t* map, const char* key, void* value); /* key verified absent by caller; false = OOM dropped the insert */
 void*       hash_map_get(hash_map_t* map, const char* key);
 void*       hash_map_remove(hash_map_t* map, const char* key);
 uint32_t    hash_map_size(hash_map_t* map);
@@ -105,6 +105,11 @@ typedef struct st_mstr {
 	uint32_t            max;
 	uint32_t            len;
 } mstr_t;
+
+/* OOM-safe mstr reads: a builder that failed to allocate reads as an empty
+ * string / zero length instead of faulting on a NULL dereference. */
+#define MSTR_CSTR(s) (((s) != NULL && (s)->cstr != NULL) ? (s)->cstr : "")
+#define MSTR_LEN(s)  (((s) != NULL) ? (s)->len : 0)
 
 void        mstr_reset(mstr_t* str);
 /* Inlinable fast path for the per-token reset in lex_get_next_token: the
@@ -1171,6 +1176,14 @@ typedef struct st_vm {
 	// GC structure
 	struct {
 		bool            is_doing_gc;
+		/* Set once an allocation fails (heap can not expand). While clear, the
+		 * collector marks the never_gc chain as roots so refcount-live vars'
+		 * subtrees are never swept (correctness). Once set, the collector
+		 * switches to bounded mode: never_gc is NOT marked, its dead children
+		 * are swept as before AND the parents' dangling edges are cut, so peak
+		 * heap stays bounded on memory-constrained guests instead of retaining
+		 * C-held garbage until vm_close (OOM). */
+		bool            mem_pressure;
 		uint32_t        gc_defer; //>0 while the object graph is temporarily unrooted (var_clean teardown / func_call arg setup); defer opportunistic gc.
 		bool            gc_pending; //opportunistic gc requested but deferred to the next vm_run instruction boundary (a safe point where all live vars are rooted).
 		uint32_t        gc_trig_var_num; //trigger gc when var num reach this value.
@@ -1190,6 +1203,8 @@ typedef struct st_vm {
 		 * otherwise retained ~430MB per cycle). */
 		var_t*          never_gc;
 		var_t*          never_gc_tail;
+		uint32_t        never_gc_num; //population of the never_gc list (cycle-collector trigger)
+		uint32_t        cycle_trig_num; //run the never_gc cycle pass when never_gc_num passes this
 		/* C-side roots: vars a running native holds only in C locals. The collector
 		 * walks the var graph, the value stack, the scope stack and the caches - it
 		 * can NOT see the C stack - so such a var looks unreachable and gets swept in
@@ -1200,6 +1215,10 @@ typedef struct st_vm {
 		var_t**         c_roots;
 		int32_t         c_roots_top;
 		int32_t         c_roots_cap;
+		/* Refcount-dead bodies still anchored in c_roots: kept READABLE (and out
+		 * of the reuse pool) until their frame pops the anchor; gc() frees the
+		 * unanchored ones at the end of every collection. */
+		var_t*          c_dead;
 	} gc;
 
 	/* Phase 6: weak references & finalization. Cells live in these C-side lists,
@@ -1581,7 +1600,7 @@ void        vm_gc_collect(vm_t* vm); // forced full gc + drain pending finalizer
  * drop the last `n` parked entries again. Nesting is a plain LIFO stack, so a
  * native that runs arbitrary JS between the two calls (a promise drain, a
  * finalizer, an event dispatch) keeps its bare pointers valid across any gc. */
-void        vm_push_c_root(vm_t* vm, var_t* v);
+bool        vm_push_c_root(vm_t* vm, var_t* v);
 void        vm_pop_c_roots(vm_t* vm, int32_t n);
 
 var_t*      get_obj(var_t* obj, const char* name);

@@ -101,8 +101,10 @@ var_t* native_DataView_constructor(vm_t* vm, var_t* env, void* data) {
 	var_t* this_v = get_obj(env, THIS);
 
 	node_t* mn = var_add(this_v, EXOTIC_MARKER, var_new_str(vm, EXOTIC_DATAVIEW));
-	mn->invisable = 1;
-	mn->be_unenumerable = 1;
+	if(mn != NULL) {
+		mn->invisable = 1;
+		mn->be_unenumerable = 1;
+	}
 
 	var_t* buf = get_obj(env, "buffer");
 	if(buf == NULL || !var_is_arraybuffer(buf)) {

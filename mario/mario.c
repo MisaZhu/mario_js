@@ -36,6 +36,11 @@ void  free_none(void* p) { }
 
 void *mario_realloc(void* p, uint32_t old_size, uint32_t new_size) {
 	void *np = mario_malloc(new_size);
+	/* OOM: keep the old block intact and report failure - the old code
+	 * memcpy'd into NULL (and leaked p) when the heap could not expand.
+	 * Callers must NULL-check and degrade (mstr keeps its current content). */
+	if(np == NULL)
+		return NULL;
 	if(p != NULL) {
 		memcpy(np, p, old_size);
 		mario_free(p);
@@ -130,7 +135,14 @@ static inline hash_entry_t* hentry_alloc(hash_map_t* map) {
 		vm->hentry_pool_num--;
 		return p;
 	}
-	return (hash_entry_t*)mario_malloc(sizeof(hash_entry_t));
+	hash_entry_t* e = (hash_entry_t*)mario_malloc(sizeof(hash_entry_t));
+	if(e == NULL && vm != NULL) {
+		/* Container-only churn can exhaust the heap without any var_new
+		 * failure: flag pressure here too so the next bounded sweep runs. */
+		vm->gc.mem_pressure = true;
+		vm->gc.gc_pending = true;
+	}
+	return e;
 }
 
 static inline void hentry_release(hash_map_t* map, hash_entry_t* e) {
@@ -170,6 +182,9 @@ static inline void scope_pool_release(vm_t* vm, scope_t* sc) {
 // Create a new hash map
 hash_map_t* hash_map_new(void) {
     hash_map_t* map = (hash_map_t*)mario_malloc(sizeof(hash_map_t));
+    /* OOM: callers NULL-check; a half-initialized map must not escape. */
+    if(map == NULL)
+        return NULL;
     hash_map_init(map);
     return map;
 }
@@ -183,6 +198,13 @@ void hash_map_init(hash_map_t* map) {
     map->owner = NULL;
     map->keys_borrowed = 0;
     map->buckets = (hash_entry_t**)mario_malloc(sizeof(hash_entry_t*) * map->capacity);
+    /* OOM: leave the map empty (capacity 0, buckets NULL). Every reader bails
+     * on that state and the add paths re-try materialization; writing through
+     * the NULL array faulted instead of degrading. */
+    if(map->buckets == NULL) {
+        map->capacity = 0;
+        return;
+    }
     uint32_t i;
     for (i = 0; i < map->capacity; i++) {
         map->buckets[i] = NULL;
@@ -237,6 +259,12 @@ static inline void hash_map_ensure_buckets(hash_map_t* map) {
     }
     map->owner = owner;
     map->keys_borrowed = borrowed;
+    /* OOM: init could not materialize buckets (capacity 0). Flag pressure so
+     * the next bounded sweep reclaims; the add paths drop inserts meanwhile. */
+    if(map->buckets == NULL && vm != NULL) {
+        vm->gc.mem_pressure = true;
+        vm->gc.gc_pending = true;
+    }
 }
 
 // Add a key-value pair to the hash map
@@ -260,9 +288,15 @@ void mario_mapdbg(const char* tag, uint32_t a, uint32_t b) {
 #define HASH_MAP_MAX_CAPACITY (1u << 26)
 
 void hash_map_add(hash_map_t* map, const char* key, void* value) {
+    /* OOM: hash_map_new() may have failed - a NULL map drops the insert. */
+    if (map == NULL)
+        return;
     // A cleaned map has no bucket array; re-initialize so the insert below is
     // valid (pool-backed for VM-owned maps; see hash_map_ensure_buckets).
     hash_map_ensure_buckets(map);
+    /* OOM: materialization failed - drop the insert instead of faulting. */
+    if (map->buckets == NULL || map->capacity == 0)
+        return;
     // Check if we need to resize
     if (map->capacity < HASH_MAP_MAX_CAPACITY &&
         map->size * map->load_factor_den > map->capacity * map->load_factor_num) {
@@ -270,27 +304,31 @@ void hash_map_add(hash_map_t* map, const char* key, void* value) {
         uint32_t new_capacity = map->capacity * 2;
         if (new_capacity >= (1u << 20)) mario_mapdbg("map resize add", map->size, new_capacity);
         hash_entry_t** new_buckets = (hash_entry_t**)mario_malloc(sizeof(hash_entry_t*) * new_capacity);
-        uint32_t i;
-        for (i = 0; i < new_capacity; i++) {
-            new_buckets[i] = NULL;
-        }
-        
-        // Rehash all entries
-        for (i = 0; i < map->capacity; i++) {
-            hash_entry_t* entry = map->buckets[i];
-            while (entry) {
-                hash_entry_t* next = entry->next;
-                uint32_t hash = hash_string(entry->key) % new_capacity;
-                entry->next = new_buckets[hash];
-                new_buckets[hash] = entry;
-                entry = next;
+        /* OOM on resize: keep the old buckets - chains just grow longer,
+         * correctness is preserved (same policy as the capacity ceiling). */
+        if (new_buckets != NULL) {
+            uint32_t i;
+            for (i = 0; i < new_capacity; i++) {
+                new_buckets[i] = NULL;
             }
+
+            // Rehash all entries
+            for (i = 0; i < map->capacity; i++) {
+                hash_entry_t* entry = map->buckets[i];
+                while (entry) {
+                    hash_entry_t* next = entry->next;
+                    uint32_t hash = hash_string(entry->key) % new_capacity;
+                    entry->next = new_buckets[hash];
+                    new_buckets[hash] = entry;
+                    entry = next;
+                }
+            }
+
+            // Free old buckets (the initial-size array recycles through the VM pool)
+            buckets_release(map, map->buckets, map->capacity);
+            map->buckets = new_buckets;
+            map->capacity = new_capacity;
         }
-        
-        // Free old buckets (the initial-size array recycles through the VM pool)
-        buckets_release(map, map->buckets, map->capacity);
-        map->buckets = new_buckets;
-        map->capacity = new_capacity;
     }
     
     // Calculate hash
@@ -309,12 +347,18 @@ void hash_map_add(hash_map_t* map, const char* key, void* value) {
     
     // Key doesn't exist, create new entry
     entry = hentry_alloc(map);
+    if (entry == NULL) /* OOM: drop the insert */
+        return;
     if (map->keys_borrowed) {
         /* Caller guarantees key storage outlives the entry (children maps pass
          * node->name). No copy: kills one strdup per member add. */
         entry->key = (char*)key;
     } else {
         entry->key = (char*)mario_malloc(strlen(key) + 1);
+        if (entry->key == NULL) { /* OOM: recycle the entry, drop the insert */
+            hentry_release(map, entry);
+            return;
+        }
         strcpy(entry->key, key);
     }
     entry->value = value;
@@ -325,49 +369,65 @@ void hash_map_add(hash_map_t* map, const char* key, void* value) {
 
 /* Insert a key the caller has ALREADY verified is absent (var_add does its own
  * single existence walk): skips hash_map_add's duplicate-check walk so a fresh
- * member costs one hash + one bucket scan instead of two. */
-void hash_map_add_fresh(hash_map_t* map, const char* key, void* value) {
+ * member costs one hash + one bucket scan instead of two. Returns false when
+ * OOM dropped the insert so the caller can recycle the value it built. */
+bool hash_map_add_fresh(hash_map_t* map, const char* key, void* value) {
+    if (map == NULL) /* OOM: the map itself could not be allocated */
+        return false;
     hash_map_ensure_buckets(map);
+    /* OOM: materialization failed - drop the insert instead of faulting. */
+    if (map->buckets == NULL || map->capacity == 0)
+        return false;
     if (map->capacity < HASH_MAP_MAX_CAPACITY &&
         map->size * map->load_factor_den > map->capacity * map->load_factor_num) {
         uint32_t new_capacity = map->capacity * 2;
         if (new_capacity >= (1u << 20)) mario_mapdbg("map resize fresh", map->size, new_capacity);
         hash_entry_t** new_buckets = (hash_entry_t**)mario_malloc(sizeof(hash_entry_t*) * new_capacity);
-        uint32_t i;
-        for (i = 0; i < new_capacity; i++) {
-            new_buckets[i] = NULL;
-        }
-        for (i = 0; i < map->capacity; i++) {
-            hash_entry_t* entry = map->buckets[i];
-            while (entry) {
-                hash_entry_t* next = entry->next;
-                uint32_t rhash = hash_string(entry->key) % new_capacity;
-                entry->next = new_buckets[rhash];
-                new_buckets[rhash] = entry;
-                entry = next;
+        /* OOM on resize: keep the old buckets, chains grow longer. */
+        if (new_buckets != NULL) {
+            uint32_t i;
+            for (i = 0; i < new_capacity; i++) {
+                new_buckets[i] = NULL;
             }
+            for (i = 0; i < map->capacity; i++) {
+                hash_entry_t* entry = map->buckets[i];
+                while (entry) {
+                    hash_entry_t* next = entry->next;
+                    uint32_t rhash = hash_string(entry->key) % new_capacity;
+                    entry->next = new_buckets[rhash];
+                    new_buckets[rhash] = entry;
+                    entry = next;
+                }
+            }
+            buckets_release(map, map->buckets, map->capacity);
+            map->buckets = new_buckets;
+            map->capacity = new_capacity;
         }
-        buckets_release(map, map->buckets, map->capacity);
-        map->buckets = new_buckets;
-        map->capacity = new_capacity;
     }
     uint32_t hash = hash_string(key) % map->capacity;
     hash_entry_t* entry = hentry_alloc(map);
+    if (entry == NULL) /* OOM: drop the insert */
+        return false;
     if (map->keys_borrowed) {
         entry->key = (char*)key;
     } else {
         entry->key = (char*)mario_malloc(strlen(key) + 1);
+        if (entry->key == NULL) { /* OOM: recycle the entry, drop the insert */
+            hentry_release(map, entry);
+            return false;
+        }
         strcpy(entry->key, key);
     }
     entry->value = value;
     entry->next = map->buckets[hash];
     map->buckets[hash] = entry;
     map->size++;
+    return true;
 }
 
 // Get a value from the hash map
 void* hash_map_get(hash_map_t* map, const char* key) {
-    if (map->buckets == NULL || map->capacity == 0) return NULL;
+    if (map == NULL || map->buckets == NULL || map->capacity == 0) return NULL;
     uint32_t hash = hash_string(key) % map->capacity;
     hash_entry_t* entry = map->buckets[hash];
     while (entry) {
@@ -381,7 +441,7 @@ void* hash_map_get(hash_map_t* map, const char* key) {
 
 // Remove a key-value pair from the hash map
 void* hash_map_remove(hash_map_t* map, const char* key) {
-    if (map->buckets == NULL || map->capacity == 0) return NULL;
+    if (map == NULL || map->buckets == NULL || map->capacity == 0) return NULL;
     uint32_t hash = hash_string(key) % map->capacity;
     hash_entry_t* entry = map->buckets[hash];
     hash_entry_t* prev = NULL;
@@ -415,11 +475,14 @@ void* hash_map_remove(hash_map_t* map, const char* key) {
 
 // Get the size of the hash map
 uint32_t hash_map_size(hash_map_t* map) {
-    return map->size;
+    return (map != NULL) ? map->size : 0;
 }
 
 // Clean the hash map
 void hash_map_clean(hash_map_t* map, free_func_t free_key, free_func_t free_value) {
+    /* OOM: hash_map_new() may have failed; hash_map_free forwards NULL here. */
+    if(map == NULL)
+        return;
     /* Lazy-map fast path: a var that never grew members keeps buckets==NULL
      * (see var_new); nothing to walk and nothing to free. This is the common
      * case for the numeric temporaries var_clean tears down per expression. */
@@ -461,6 +524,8 @@ void hash_map_free(hash_map_t* map, free_func_t free_key, free_func_t free_value
 
 // Iterate over the hash map
 void hash_map_iterate(hash_map_t* map, void (*callback)(const char* key, void* value, void* user_data), void* user_data) {
+    if(map == NULL || map->buckets == NULL) /* OOM / lazy map: nothing to walk */
+        return;
     uint32_t i;
     for (i = 0; i < map->capacity; i++) {
         hash_entry_t* entry = map->buckets[i];
@@ -483,6 +548,8 @@ inline void array_init(m_array_t* array) {
 
 m_array_t* array_new() {
 	m_array_t* ret = (m_array_t*)mario_malloc(sizeof(m_array_t));
+	if(ret == NULL) /* OOM: callers NULL-check */
+		return NULL;
 	array_init(ret);
 	return ret;
 }
@@ -491,7 +558,10 @@ inline void array_add(m_array_t* array, void* item) {
 	uint32_t new_size = array->size + 1; 
 	if(array->max <= new_size) { 
 		new_size = array->size + ARRAY_BUF;
-		array->items = (void**)mario_realloc(array->items, array->max*sizeof(void*), new_size*sizeof(void*)); 
+		void** ni = (void**)mario_realloc(array->items, array->max*sizeof(void*), new_size*sizeof(void*));
+		if(ni == NULL) /* OOM: keep the old array, drop the insert */
+			return;
+		array->items = ni;
 		array->max = new_size; 
 	} 
 	array->items[array->size] = item; 
@@ -503,7 +573,10 @@ inline void array_add_head(m_array_t* array, void* item) {
 	uint32_t new_size = array->size + 1; 
 	if(array->max <= new_size) { 
 		new_size = array->size + ARRAY_BUF;
-		array->items = (void**)mario_realloc(array->items, array->max*sizeof(void*), new_size*sizeof(void*)); 
+		void** ni = (void**)mario_realloc(array->items, array->max*sizeof(void*), new_size*sizeof(void*));
+		if(ni == NULL) /* OOM: keep the old array, drop the insert */
+			return;
+		array->items = ni;
 		array->max = new_size; 
 	} 
 	int32_t i;
@@ -517,6 +590,8 @@ inline void array_add_head(m_array_t* array, void* item) {
 
 void* array_add_buf(m_array_t* array, void* s, uint32_t sz) {
 	void* item = mario_malloc(sz);
+	if(item == NULL) /* OOM: nothing to copy into */
+		return NULL;
 	if(s != NULL)
 		memcpy(item, s, sz);
 	array_add(array, item);
@@ -603,8 +678,17 @@ inline void array_clean(m_array_t* array, free_func_t fr) { //remove all items a
 #define mstr_BUF 16
 
 void mstr_reset(mstr_t* str) {
+	if(str == NULL) /* OOM: the builder itself could not be allocated */
+		return;
 	if(str->cstr == NULL) {
 		str->cstr = (char*)mario_malloc(mstr_BUF);
+		/* OOM: leave the builder empty (cstr NULL, max 0); every writer
+		 * below re-tries growth and degrades to a no-op on failure. */
+		if(str->cstr == NULL) {
+			str->max = 0;
+			str->len = 0;
+			return;
+		}
 		str->max = mstr_BUF;
 	}
 
@@ -613,6 +697,8 @@ void mstr_reset(mstr_t* str) {
 }
 
 char* mstr_ncpy(mstr_t* str, const char* src, uint32_t l) {
+	if(str == NULL) /* OOM builder */
+		return NULL;
 	if(src == NULL || src[0] == 0 || l == 0) {
 		mstr_reset(str);
 		return str->cstr;
@@ -625,7 +711,10 @@ char* mstr_ncpy(mstr_t* str, const char* src, uint32_t l) {
 	uint32_t new_size = len;
 	if(str->max <= new_size) {
 		new_size = len + mstr_BUF; /*STR BUF for buffer*/
-		str->cstr = (char*)mario_realloc(str->cstr, str->max, new_size);
+		char* nb = (char*)mario_realloc(str->cstr, str->max, new_size);
+		if(nb == NULL) /* OOM: keep the old content, drop the copy */
+			return str->cstr;
+		str->cstr = nb;
 		str->max = new_size;
 	}
 
@@ -651,6 +740,8 @@ char* mstr_cpy(mstr_t* str, const char* src) {
 
 mstr_t* mstr_new(const char* s) {
 	mstr_t* ret = (mstr_t*)mario_malloc(sizeof(mstr_t));
+	if(ret == NULL) /* OOM: callers NULL-check */
+		return NULL;
 	ret->cstr = NULL;
 	ret->max = 0;
 	ret->len = 0;
@@ -660,7 +751,14 @@ mstr_t* mstr_new(const char* s) {
 
 mstr_t* mstr_new_by_size(uint32_t sz) {
 	mstr_t* ret = (mstr_t*)mario_malloc(sizeof(mstr_t));
+	if(ret == NULL) /* OOM */
+		return NULL;
 	ret->cstr = (char*)mario_malloc(sz);
+	if(ret->cstr == NULL) { /* OOM: empty builder, writers degrade */
+		ret->max = 0;
+		ret->len = 0;
+		return ret;
+	}
 	ret->max = sz;
 	ret->cstr[0] = 0;
 	ret->len = 0;
@@ -668,6 +766,8 @@ mstr_t* mstr_new_by_size(uint32_t sz) {
 }
 
 char* mstr_append(mstr_t* str, const char* src) {
+	if(str == NULL) /* OOM builder */
+		return NULL;
 	if(src == NULL || src[0] == 0) {
 		return str->cstr;
 	}
@@ -676,7 +776,10 @@ char* mstr_append(mstr_t* str, const char* src) {
 	uint32_t new_size = str->len + len;
 	if(str->max <= new_size) {
 		new_size = str->len + len + mstr_BUF; /*STR BUF for buffer*/
-		str->cstr = (char*)mario_realloc(str->cstr, str->max, new_size);
+		char* nb = (char*)mario_realloc(str->cstr, str->max, new_size);
+		if(nb == NULL) /* OOM: keep the old content, drop the append */
+			return str->cstr;
+		str->cstr = nb;
 		str->max = new_size;
 	}
 
@@ -689,12 +792,17 @@ char* mstr_append(mstr_t* str, const char* src) {
 char* mstr_append_n(mstr_t* str, const char* src, uint32_t len) {
 	/* Bulk append for the lexer's fast-scan lanes (identifier/string
 	 * bodies): one realloc + one memcpy instead of len mstr_add calls. */
+	if(str == NULL) /* OOM builder */
+		return NULL;
 	if(src == NULL || len == 0)
 		return str->cstr;
 	uint32_t new_size = str->len + len;
 	if(str->max <= new_size) {
 		new_size = str->len + len + mstr_BUF;
-		str->cstr = (char*)mario_realloc(str->cstr, str->max, new_size);
+		char* nb = (char*)mario_realloc(str->cstr, str->max, new_size);
+		if(nb == NULL) /* OOM: keep the old content, drop the append */
+			return str->cstr;
+		str->cstr = nb;
 		str->max = new_size;
 	}
 	/* Short spans (identifiers, most string chunks) skip the memcpy call. */
@@ -712,6 +820,8 @@ char* mstr_append_n(mstr_t* str, const char* src, uint32_t len) {
 }
 
 char* mstr_add(mstr_t* str, char c) {
+	if(str == NULL) /* OOM builder */
+		return NULL;
 	uint32_t new_size = str->len + 1;
 	if(str->max <= new_size) {
 		/* Geometric growth: mario_realloc is a full malloc+memcpy+free, so
@@ -719,7 +829,10 @@ char* mstr_add(mstr_t* str, char c) {
 		 * (Pinterest's 150KB minified lines: memmove dominated the parse
 		 * profile). ~1.5x growth keeps the copy total O(n). */
 		new_size = str->max + (str->max >> 1) + mstr_BUF;
-		str->cstr = (char*)mario_realloc(str->cstr, str->max, new_size);
+		char* nb = (char*)mario_realloc(str->cstr, str->max, new_size);
+		if(nb == NULL) /* OOM: keep the old content, drop the char */
+			return str->cstr;
+		str->cstr = nb;
 		str->max = new_size;
 	}
 
@@ -737,8 +850,13 @@ char* mstr_add_float(mstr_t* str, float f) {
 	return mstr_append(str, mstr_from_float(f));
 }
 
+/* OOM fallback for call/new name parsing: a static, read-only empty name.
+ * mstr_free skips it; writers must never receive it (callers pass NULL to
+ * parse_func_name instead, which still yields the arity). */
+static mstr_t s_empty_name = { "", 1, 0 };
+
 void mstr_free(mstr_t* str) {
-	if(str == NULL)
+	if(str == NULL || str == &s_empty_name)
 		return;
 
 	if(str->cstr != NULL) {
@@ -933,9 +1051,11 @@ void mstr_split(const char* str, char c, m_array_t* array) {
 	while(true) {
 		if(offc == c || offc == 0) {
 			char* p = (char*)mario_malloc(i+1);
-			memcpy(p, str, i+1);
-			p[i] = 0;
-			array_add(array, p);
+			if(p != NULL) { /* OOM: drop this token */
+				memcpy(p, str, i+1);
+				p[i] = 0;
+				array_add(array, p);
+			}
 			if(offc == 0)
 				break;
 
@@ -1009,6 +1129,8 @@ static inline void bn_grow(bignum_t* b, uint32_t n) {
 	while(cap < n)
 		cap *= 2;
 	uint32_t* p = (uint32_t*)mario_malloc(cap * sizeof(uint32_t));
+	if(p == NULL) /* OOM: keep the old limbs (callers stay within the old cap) */
+		return;
 	if(b->limbs != NULL) {
 		memcpy(p, b->limbs, b->cap * sizeof(uint32_t));
 		mario_free(b->limbs);
@@ -1710,6 +1832,8 @@ uint32_t bc_getstrindex(bytecode_t* bc, const char* str) {
 
 	uint32_t len = (uint32_t)strlen(str);
 	char* p = (char*)mario_malloc(len + 1);
+	if(p == NULL) /* OOM: intern the empty string instead of faulting */
+		return bc_addstr(bc, "");
 	memcpy(p, str, len+1);
 	return bc_addstr(bc, p);
 }
@@ -1782,7 +1906,8 @@ void mario_set_script_url(const char* url) {
 	if(url != NULL && url[0] != 0) {
 		size_t n = strlen(url);
 		g_cur_script_url = (char*)mario_malloc(n + 1);
-		memcpy(g_cur_script_url, url, n + 1);
+		if(g_cur_script_url != NULL) /* OOM: stay URL-less (diagnostics only) */
+			memcpy(g_cur_script_url, url, n + 1);
 	}
 }
 void bc_srcmap_begin(bytecode_t* bc, const char* src) {
@@ -1790,6 +1915,8 @@ void bc_srcmap_begin(bytecode_t* bc, const char* src) {
 		return;
 	size_t n = strlen(src);
 	char* copy = (char*)mario_malloc(n + 1);
+	if(copy == NULL) /* OOM: skip source mapping for this script (diagnostics only) */
+		return;
 	memcpy(copy, src, n + 1);
 	array_add(&bc->srcs, copy);
 	bc->srcmap_cur = bc->srcs.size - 1;
@@ -1798,8 +1925,10 @@ void bc_srcmap_begin(bytecode_t* bc, const char* src) {
 	const char* u = (g_cur_script_url != NULL) ? g_cur_script_url : "";
 	size_t un = strlen(u);
 	char* ucopy = (char*)mario_malloc(un + 1);
-	memcpy(ucopy, u, un + 1);
-	array_add(&bc->src_urls, ucopy);
+	if(ucopy != NULL) { /* OOM: no URL slot - locate_v8 falls back to <anonymous> */
+		memcpy(ucopy, u, un + 1);
+		array_add(&bc->src_urls, ucopy);
+	}
 }
 
 /* Record a function source span for Function.prototype.toString parity.
@@ -1808,6 +1937,8 @@ void bc_fspan_add(bytecode_t* bc, PC entry_pc, uint32_t src, uint32_t start, uin
 	if(bc->fspans_size >= bc->fspans_max) {
 		uint32_t nmax = bc->fspans_max == 0 ? 256 : bc->fspans_max * 2;
 		struct st_bc_fspan_ent* ne = (struct st_bc_fspan_ent*)mario_malloc(nmax * sizeof(*ne));
+		if(ne == NULL) /* OOM: keep the old spans, drop this record */
+			return;
 		if(bc->fspans != NULL) {
 			memcpy(ne, bc->fspans, bc->fspans_size * sizeof(*ne));
 			mario_free(bc->fspans);
@@ -1832,6 +1963,8 @@ void bc_srcmap_add(bytecode_t* bc, PC pc, uint32_t pos) {
 	if(bc->srcmap_size >= bc->srcmap_max) {
 		uint32_t nmax = bc->srcmap_max == 0 ? 4096 : bc->srcmap_max * 2;
 		struct st_bc_srcmap_ent* ne = (struct st_bc_srcmap_ent*)mario_malloc(nmax * sizeof(*ne));
+		if(ne == NULL) /* OOM: keep the old map, drop this record (diagnostics only) */
+			return;
 		if(bc->srcmap != NULL) {
 			memcpy(ne, bc->srcmap, bc->srcmap_size * sizeof(*ne));
 			mario_free(bc->srcmap);
@@ -1846,6 +1979,10 @@ void bc_srcmap_add(bytecode_t* bc, PC pc, uint32_t pos) {
 }
 
 bool bc_srcmap_locate(bytecode_t* bc, PC pc, mstr_t* out) {
+	/* OOM: the caller's builder could not be allocated - report "no location"
+	 * so it skips the trace line instead of dereferencing a NULL cstr. */
+	if(out == NULL)
+		return false;
 	if(!bc->srcmap_on || bc->srcmap_size == 0 || pc == ILLEGAL_PC)
 		return false;
 	/* Function bodies compiled while hoisting interleave with the top-level
@@ -1927,6 +2064,13 @@ void bc_add(bytecode_t* bc, PC ins) {
 		 * script_29 profile). ~1.5x keeps the copy total O(n). */
 		bc->buf_size = bc->cindex + (bc->cindex >> 1) + BC_BUF_SIZE;
 		PC *new_buf = (PC*)mario_malloc(bc->buf_size*sizeof(PC));
+		/* OOM: keep the old buffer and drop this instruction - the compiled
+		 * body degrades instead of memcpy'ing into NULL. buf_size must match
+		 * the buffer actually held, so restore it. */
+		if(new_buf == NULL) {
+			bc->buf_size = bc->cindex;
+			return;
+		}
 
 		if(bc->cindex > 0 && bc->code_buf != NULL) {
 			memcpy(new_buf, bc->code_buf, bc->cindex*sizeof(PC));
@@ -2333,6 +2477,14 @@ static var_t* var_clone(var_t* v) {
 
 node_t* node_new(vm_t* vm, const char* name, var_t* var) {
 	node_t* node = node_pool_alloc(vm);
+	/* OOM: no body - callers NULL-check (var_add drops the member write). */
+	if(node == NULL) {
+		if(vm != NULL) {
+			vm->gc.mem_pressure = true;
+			vm->gc.gc_pending = true;
+		}
+		return NULL;
+	}
 	memset(node, 0, sizeof(node_t));
 
 	node->magic = 1;
@@ -2346,6 +2498,14 @@ node_t* node_new(vm_t* vm, const char* name, var_t* var) {
 	}
 	else {
 		node->name = (char*)mario_malloc(len+1);
+		if(node->name == NULL) { /* OOM: recycle the body, drop the member */
+			node_pool_release(vm, node);
+			if(vm != NULL) {
+				vm->gc.mem_pressure = true;
+				vm->gc.gc_pending = true;
+			}
+			return NULL;
+		}
 		memcpy(node->name, name, len+1);
 	}
 	if(var != NULL) {
@@ -2353,7 +2513,14 @@ node_t* node_new(vm_t* vm, const char* name, var_t* var) {
 		node->var = var_ref(var);
 	}
 	else {
-		node->var = var_ref(var_new(vm));
+		var_t* fresh = var_new(vm);
+		if(fresh == NULL) { /* OOM: var_new already flagged pressure */
+			if(node->name != node->name_inline)
+				mario_free(node->name);
+			node_pool_release(vm, node);
+			return NULL;
+		}
+		node->var = var_ref(fresh);
 	}
 
 	if(strcmp(name, CONSTRUCTOR) == 0)
@@ -2721,6 +2888,10 @@ static inline node_t* var_find_raw(var_t* var, const char*name) {
 node_t* var_add(var_t* var, const char* name, var_t* add) {
 	node_t* node = NULL;
 
+	/* OOM: the owner var (or a key builder) may not exist - drop the insert. */
+	if(var == NULL || name == NULL)
+		return NULL;
+
 	/* Single-walk lookup: the old var_find_raw + hash_map_add pair hashed the
 	 * key twice and walked the bucket twice. Do the existence check inline
 	 * and hand verified-fresh inserts to hash_map_add_fresh. */
@@ -2739,9 +2910,18 @@ node_t* var_add(var_t* var, const char* name, var_t* add) {
 
 	if(node == NULL) {
 		node = node_new(var->vm, name, add);
+		/* OOM: node_new flagged pressure; drop the member write (the JS store
+		 * degrades to a no-op) instead of dereferencing a NULL node. */
+		if(node == NULL)
+			return NULL;
 		/* keys_borrowed map: the stored key MUST be node->name (node-owned
 		 * storage outliving the entry), never the caller's transient buffer. */
-		hash_map_add_fresh(map, node->name, node);
+		if(!hash_map_add_fresh(map, node->name, node)) {
+			/* OOM dropped the insert: the node would leak (and its ref on
+			 * `add` with it). Recycle it; the member write is a no-op. */
+			node_free(node);
+			return NULL;
+		}
 		/* A NEW own node can shadow an inherited member another var's mic
 		 * entry resolved through the chain, and fills a previously-absent
 		 * slot - so the shape changes and the epoch must bump. The initial
@@ -3364,6 +3544,18 @@ static inline void* nbox_alloc(vm_t* vm) {
 	return mario_malloc(8);
 }
 
+/* OOM-aware variant for the scalar ctors: a NULL box flags pressure (so the
+ * next bounded sweep reclaims) and the caller degrades the var to undefined
+ * instead of writing through NULL. */
+static inline void* nbox_alloc_pressure(vm_t* vm) {
+	void* p = nbox_alloc(vm);
+	if(p == NULL && vm != NULL) {
+		vm->gc.mem_pressure = true;
+		vm->gc.gc_pending = true;
+	}
+	return p;
+}
+
 static inline void nbox_release(vm_t* vm, void* p) {
 	if(vm != NULL && vm->nbox_free_num < NBOX_POOL_MAX) {
 		*(void**)p = vm->nbox_free;
@@ -3472,6 +3664,12 @@ static inline void add_to_never_gc(var_t* var) {
 		vm->gc.never_gc = var;
 	var->next = NULL;
 	vm->gc.never_gc_tail = var;
+	vm->gc.never_gc_num++;
+	/* Cycle-garbage trigger: vars riding never_gc never inflate gc_vars_num,
+	 * so a cycle-only page needs its own gc_pending source (consumed at the
+	 * next vm_run safe point, same contract as add_to_gc). */
+	if(vm->gc.never_gc_num > vm->gc.cycle_trig_num && vm->gc.gc_defer == 0)
+		vm->gc.gc_pending = true;
 }
 
 static inline void remove_from_never_gc(var_t* var) {
@@ -3487,6 +3685,8 @@ static inline void remove_from_never_gc(var_t* var) {
 	else
 		vm->gc.never_gc_tail = var->prev;
 	var->prev = var->next = NULL;
+	if(vm->gc.never_gc_num > 0)
+		vm->gc.never_gc_num--;
 }
 
 static inline void add_to_gc(var_t* var) {
@@ -3818,20 +4018,21 @@ static inline void gc_mark_scopes(vm_t* vm, bool mark) {
  * stack, the scope stack and the caches, none of which contain a C frame's
  * locals, so those vars are swept mid-call and the native then reads freed
  * memory. Parking them here makes them roots for the duration. */
-void vm_push_c_root(vm_t* vm, var_t* v) {
+bool vm_push_c_root(vm_t* vm, var_t* v) {
 	if(vm == NULL || var_empty(v))
-		return;
+		return false;
 	if(vm->gc.c_roots_top >= vm->gc.c_roots_cap) {
 		int32_t cap = (vm->gc.c_roots_cap == 0) ? 16 : vm->gc.c_roots_cap * 2;
 		var_t** nr = (var_t**)mario_realloc(vm->gc.c_roots,
 				(uint32_t)(sizeof(var_t*) * (size_t)vm->gc.c_roots_cap),
 				(uint32_t)(sizeof(var_t*) * (size_t)cap));
 		if(nr == NULL)
-			return; /* allocation failure: skip this anchor, never corrupt the list */
+			return false; /* allocation failure: skip this anchor, never corrupt the list */
 		vm->gc.c_roots = nr;
 		vm->gc.c_roots_cap = cap;
 	}
 	vm->gc.c_roots[vm->gc.c_roots_top++] = v;
+	return true;
 }
 
 void vm_pop_c_roots(vm_t* vm, int32_t n) {
@@ -4106,6 +4307,207 @@ static inline void gc_mark_wanchor_pool(vm_t* vm, bool mark) {
 		gc_mark(vm->wanchor_nil, mark);
 }
 
+/* The never_gc list is a GC root set too: every var riding it is alive by
+ * refcount (refs > 0), including objects a C side holds in a bare var_ref'd
+ * slot with no registered gc root (timer hops, xhr/promise delivery records,
+ * native static pending slots, Map/Set iterators) and refcount-held cycles.
+ * Such a var can be unreachable from vm->root / the value & scope stacks, so
+ * the walks above never mark it - and an opportunistic sweep then reclaimed
+ * its CHILDREN (which do ride gc_vars once their own refs drop to 0) while the
+ * parent stayed alive in never_gc. The parent's children map / native C-side
+ * storage kept a dangling node; its later teardown (vm_close drains never_gc
+ * -> var_clean -> node_free / map_free) dereferenced the freed child body:
+ * heap-use-after-free on the host, and on EwokOS the recycled trunk block holds
+ * JS string bytes so node_free read an ASCII pointer -> data abort. Marking the
+ * whole never_gc chain keeps every refcount-live var's subtree alive for the
+ * reachability pass; it does NOT join them to gc_vars, so the sweep still can
+ * not reclaim them, and the cycle garbage they form is still reclaimed only by
+ * the vm_close final sweep (unchanged). gc_mark's visited guard makes
+ * re-marking root-reachable members cheap. NOTE: this retains C-held garbage
+ * subtrees until vm_close, raising peak heap; memory-constrained guests need
+ * adequate RAM (see QEMU_MEM) and a future mid-run never_gc cycle collector. */
+static inline void gc_mark_never_gc(vm_t* vm, bool mark) {
+	for(var_t* v = vm->gc.never_gc; v != NULL; v = v->next)
+		gc_mark(v, mark);
+}
+
+/* Bounded-mode companion (vm->gc.mem_pressure): never_gc is NOT marked, so its
+ * reachability-garbage children are flagged dead and swept exactly as before
+ * (old memory profile). Before any dead body is freed or recycled, null out
+ * every never_gc parent's children node that points at a flagged-dead var so
+ * the surviving parent's later teardown (vm_close -> var_clean -> node_free)
+ * bails on var_empty(NULL) instead of dereferencing the freed child. Runs after
+ * the flag-dead pass while every dead body is still intact. */
+static void gc_null_dead_node_cb(const char* key, void* value, void* user_data) {
+	(void)key; (void)user_data;
+	node_t* node = (node_t*)value;
+	if(node == NULL || node->var == NULL)
+		return;
+	if(node->var->status == V_ST_GC_FREE)
+		node->var = NULL;
+}
+
+static inline void gc_cut_never_gc_dead_edges(vm_t* vm) {
+	for(var_t* v = vm->gc.never_gc; v != NULL; v = v->next)
+		hash_map_iterate(&v->children, gc_null_dead_node_cb, NULL);
+}
+
+/* ---- Mid-run never_gc cycle collector (trial deletion) ---------------------
+ * Object vars with refs>0 ride never_gc and never join gc_vars, so reference
+ * cycles (closure<->env, object<->method, self-referencing objects) survive
+ * every opportunistic sweep and pile up until vm_close - the monotonic heap
+ * growth seen on long-lived pages (xBrowser ~1.5GB). This pass reclaims them
+ * mid-run with the classic trial-deletion algorithm:
+ *   1. Subtract every INTERNAL ref edge (an edge whose target is also a
+ *      never_gc candidate). The edge set mirrors exactly what var_free/var_clean
+ *      releases: each children node's var, plus a func's closure.var /
+ *      closure_func_ref / owner_ref pins. Proto links are ordinary children
+ *      (FPROTO/PROTOTYPE), so the children walk covers them. Raw pointers
+ *      (func->owner, closure.func) carry no ref and are NOT subtracted; the
+ *      matching pins above are. C-side opaque storage (Map/Set entries, timer
+ *      hops, ...) is not enumerated: its targets keep their refs and survive
+ *      as externally rooted - a missed edge can only over-retain, never
+ *      over-subtract, so the pass can not free a live var.
+ *   2. A candidate left with refs>0 is held from OUTSIDE the candidate set
+ *      (root/stack/scope/cache/c_roots, a gc_vars member, or C storage) - seed
+ *      the mark from it and propagate through the full graph.
+ *   3. Unmarked candidates are cycle garbage: flag them V_ST_GC_FREE on
+ *      gc_vars and let the existing cut + teardown drain reclaim them.
+ * Runs only in normal mode at a vm_run safe point (is_doing_gc, gc_defer==0),
+ * after the regular sweep's flag-dead pass and before its cut/teardown, so
+ * both garbage sets share one teardown drain. */
+#define GC_CYCLE_TRIG_DEF 4096
+
+typedef struct st_cycle_edge_ctx {
+	bool subtract; //true: trial-decrement; false: restore every source's borrow
+} cycle_edge_ctx_t;
+
+static void gc_cycle_child_cb(const char* key, void* value, void* user_data) {
+	(void)key;
+	cycle_edge_ctx_t* ctx = (cycle_edge_ctx_t*)user_data;
+	node_t* node = (node_t*)value;
+	if(node == NULL || node->var == NULL)
+		return;
+	var_t* t = node->var;
+	/* Only internal edges (target still riding never_gc) participate. */
+	if(t->status != V_ST_REF || t->vm == NULL)
+		return;
+	if(ctx->subtract) {
+		if(t->refs > 0)
+			t->refs--;
+	}
+	else {
+		t->refs++;
+	}
+}
+
+static inline void gc_cycle_func_edges(var_t* v, bool subtract) {
+	func_t* func = var_get_func(v);
+	if(func == NULL)
+		return;
+	var_t* pins[3];
+	pins[0] = func->closure.var;
+	pins[1] = func->closure_func_ref;
+	pins[2] = func->owner_ref;
+	for(int i = 0; i < 3; ++i) {
+		var_t* t = pins[i];
+		if(t == NULL || t->status != V_ST_REF || t->vm == NULL)
+			continue;
+		if(subtract) {
+			if(t->refs > 0)
+				t->refs--;
+		}
+		else {
+			t->refs++;
+		}
+	}
+}
+
+/* Trial walk: visit each candidate once (gc_marked as the visited guard - it
+ * is false everywhere after the regular sweep's unmark phase), subtracting
+ * its internal out-edges. No var_unref/var_free here: refs may hit 0 mid-walk
+ * and nothing may die before classification. */
+static void gc_cycle_trial(var_t* v) {
+	if(v == NULL || v->status != V_ST_REF || v->gc_marked)
+		return;
+	v->gc_marked = true;
+	cycle_edge_ctx_t ctx = { true };
+	hash_map_iterate(&v->children, gc_cycle_child_cb, &ctx);
+	if(v->is_func)
+		gc_cycle_func_edges(v, true);
+}
+
+static inline void gc_collect_never_gc_cycles(vm_t* vm) {
+	uint32_t n = vm->gc.never_gc_num;
+	if(n == 0)
+		return;
+	var_t** roots = (var_t**)mario_malloc((uint32_t)(sizeof(var_t*) * (size_t)n));
+	if(roots == NULL)
+		return; /* OOM: skip this pass, never corrupt the lists */
+
+	/* Phase 1: trial subtraction of internal edges. */
+	for(var_t* v = vm->gc.never_gc; v != NULL; v = v->next)
+		gc_cycle_trial(v);
+
+	/* Phase 2: candidates still referenced are externally held - mark them
+	 * and everything reachable from them. Reset the trial visited flags
+	 * first so gc_mark's own guard starts clean. */
+	uint32_t rn = 0;
+	for(var_t* v = vm->gc.never_gc; v != NULL; v = v->next) {
+		v->gc_marked = false;
+		if(v->refs > 0)
+			roots[rn++] = v;
+	}
+	for(uint32_t i = 0; i < rn; ++i)
+		gc_mark(roots[i], true);
+
+	/* Phase 3: give back EVERY trial borrow, from all candidate sources.
+	 * The trial decrement is only a loan for classification; the real
+	 * release happens later and exactly once per edge: a garbage source's
+	 * teardown unrefs its edges to surviving targets, while edges to
+	 * flagged-dead targets are nulled by the cut pass first (no unref).
+	 * Restoring only surviving sources would double-subtract every
+	 * garbage->live edge (borrow stands + teardown unref) and free live
+	 * vars such as vm->root. Must run BEFORE phase 4 flips garbage status:
+	 * the restore callback skips non-V_ST_REF targets. Each source is
+	 * walked exactly once via the list - no visited guard needed. */
+	cycle_edge_ctx_t ctx_restore = { false };
+	for(var_t* v = vm->gc.never_gc; v != NULL; v = v->next) {
+		hash_map_iterate(&v->children, gc_cycle_child_cb, &ctx_restore);
+		if(v->is_func)
+			gc_cycle_func_edges(v, false);
+	}
+
+	/* Phase 4: unmarked candidates are cycle garbage. Park them flagged-dead
+	 * on gc_vars; the shared cut + teardown drain below reclaims them.
+	 * add_to_gc() itself unlinks from never_gc - do NOT call
+	 * remove_from_never_gc first: the double unlink (prev/next already NULL)
+	 * would null the never_gc head/tail and orphan every surviving var. */
+	var_t* v = vm->gc.never_gc;
+	while(v != NULL) {
+		var_t* next = v->next;
+		if(!v->gc_marked) {
+			add_to_gc(v);
+			v->status = V_ST_GC_FREE;
+		}
+		v = next;
+	}
+	/* Symmetric unmark of everything phase 2 touched (candidates AND any
+	 * non-candidate vars the propagation reached). */
+	for(uint32_t i = 0; i < rn; ++i)
+		gc_mark(roots[i], false);
+	mario_free(roots);
+
+	/* Adaptive trigger: require the never_gc population to grow ~1.5x past
+	 * the surviving live count before the next cycle pass (same amortization
+	 * as gc_trig_var_num), so a large all-live structure is not re-walked on
+	 * every collection. */
+	uint32_t live = vm->gc.never_gc_num;
+	uint32_t trig = live + (live >> 1);
+	vm->gc.cycle_trig_num = (trig < GC_CYCLE_TRIG_DEF) ? GC_CYCLE_TRIG_DEF : trig;
+}
+
+
 static inline void gc_vars(vm_t* vm) {
 	//mario_debug("gc marking root\n");
 	gc_mark(vm->root, true); //mark all rooted vars
@@ -4114,9 +4516,14 @@ static inline void gc_vars(vm_t* vm) {
 	//mario_debug("gc marking cache\n");
 	gc_mark_cache(vm, true); //mark all cached vars
 	gc_mark_scopes(vm, true); //mark all vars owned by a live scope
-	/* C-side roots: vars a running native holds only in C locals. */
+	/* C-side roots: vars a running native holds only in C locals. A slot can
+	 * hold a var that died since the push (a refs==0-on-entry args the caller
+	 * released mid-call, or an anchor whose push silently failed on OOM while
+	 * the matching pop still ran): var_empty skips the dead body instead of
+	 * dereferencing freed memory. */
 	for(int32_t ci = 0; ci < vm->gc.c_roots_top; ++ci)
-		gc_mark(vm->gc.c_roots[ci], true);
+		if(!var_empty(vm->gc.c_roots[ci]))
+			gc_mark(vm->gc.c_roots[ci], true);
 	/* A return value parked in pending_value while its `finally` block runs is
 	 * reachable only from that C field, so mark it or the sweep frees it mid-finally
 	 * (the classic C-held-var hazard). NULL when no transfer is deferred. */
@@ -4150,6 +4557,12 @@ static inline void gc_vars(vm_t* vm) {
 	 * weak TARGET is deliberately not marked - that is what makes it collectable. */
 	gc_mark_weak(vm, true);
 	gc_mark_wanchor_pool(vm, true);
+	/* Normal mode: never_gc is a root set (correctness). Bounded mode
+	 * (mem_pressure): skip it so C-held garbage subtrees stay collectable and
+	 * the heap returns to the old memory profile; the cut pass below keeps the
+	 * surviving parents' teardown safe. */
+	if(!vm->gc.mem_pressure)
+		gc_mark_never_gc(vm, true);
 
 	//mario_debug("free all unmarked var\n");
 	var_t* v = vm->gc.gc_vars;
@@ -4169,6 +4582,13 @@ static inline void gc_vars(vm_t* vm) {
 		v = next;
 	}
 
+	/* Bounded mode only: cut every never_gc parent's edge to a flagged-dead
+	 * child NOW, while all dead bodies are still intact. The sweep below frees
+	 * those children (old memory profile); the parents survive on never_gc
+	 * until vm_close, whose teardown must not dereference the freed blocks. */
+	if(vm->gc.mem_pressure)
+		gc_cut_never_gc_dead_edges(vm);
+
 	//mario_debug("gc unmarking root\n");
 	gc_mark(vm->root, false); //unmark all rooted vars
 	//mario_debug("gc unmarking stack\n");
@@ -4186,6 +4606,20 @@ static inline void gc_vars(vm_t* vm) {
 	 * gc_mark_weak() walks both lists in both phases to keep marking symmetric. */
 	gc_mark_weak(vm, false);
 	gc_mark_wanchor_pool(vm, false);
+	/* Symmetric with the mark phase: only unmark what was marked. */
+	if(!vm->gc.mem_pressure)
+		gc_mark_never_gc(vm, false);
+
+	/* Mid-run cycle collection over never_gc (normal mode only - bounded mode
+	 * already reclaims unreachable subtrees). Runs AFTER the unmark phase so
+	 * every gc_marked flag is clean for the trial walk's visited guard, and
+	 * BEFORE the teardown drain so the cycle garbage it flags shares the same
+	 * drain. The cut pass then nulls surviving parents' edges to BOTH garbage
+	 * sets while all dead bodies are still intact. */
+	if(!vm->gc.mem_pressure && vm->gc.never_gc_num > vm->gc.cycle_trig_num) {
+		gc_collect_never_gc_cycles(vm);
+		gc_cut_never_gc_dead_edges(vm);
+	}
 
 	/* Third step: tear down every dead var. var_free() bails on var_empty()
 	 * (true for V_ST_GC_FREE), so flip the status back to a live value for the
@@ -4235,13 +4669,64 @@ static inline void gc_free_free_vars(vm_t* vm, uint32_t buffer_num) {
 	var_t* v = vm->free_var_buffer;
 	while(v != NULL) {
 		var_t* vtmp = v->next;
-		mario_free(v);
-		v = vtmp;
-		vm->free_var_buffer = v;
+		/* A body still anchored in c_roots must stay READABLE and UNRECYCLED
+		 * until its frame pops it: the var may have died by refcount mid-call
+		 * (pool body, vm==NULL), and handing the block back to the platform -
+		 * or recycling it via get_from_free - would turn the anchor slot into
+		 * a dangling/misowned pointer the next mark phase dereferences. Park
+		 * it on gc.c_dead (out of the reuse pool); the mark loop's var_empty
+		 * guard skips it, and gc()'s tail frees it once the anchor is gone. */
+		bool anchored = false;
+		for(int32_t ci = 0; ci < vm->gc.c_roots_top; ++ci) {
+			if(vm->gc.c_roots[ci] == v) {
+				anchored = true;
+				break;
+			}
+		}
+		if(anchored) {
+			v->next = vm->gc.c_dead;
+			v->prev = NULL;
+			vm->gc.c_dead = v;
+		}
+		else {
+			mario_free(v);
+		}
+		vm->free_var_buffer = vtmp;
 		vm->free_var_buffer_num--;
+		v = vtmp;
 		if(vm->free_var_buffer_num <= buffer_num)
 			break;
 	}
+	if(vm->free_var_buffer != NULL)
+		vm->free_var_buffer->prev = NULL;
+}
+
+/* Free the parked refcount-dead bodies whose c_root anchor has been popped.
+ * Runs at the end of every collection (all nested C frames that could hold an
+ * anchor have either popped it or are still above us on the C stack - in the
+ * latter case the body simply stays parked one more round). */
+static inline void gc_free_c_dead(vm_t* vm) {
+	var_t* v = vm->gc.c_dead;
+	var_t* keep = NULL;
+	while(v != NULL) {
+		var_t* vtmp = v->next;
+		bool anchored = false;
+		for(int32_t ci = 0; ci < vm->gc.c_roots_top; ++ci) {
+			if(vm->gc.c_roots[ci] == v) {
+				anchored = true;
+				break;
+			}
+		}
+		if(anchored) {
+			v->next = keep;
+			keep = v;
+		}
+		else {
+			mario_free(v);
+		}
+		v = vtmp;
+	}
+	vm->gc.c_dead = keep;
 }
 
 static inline void gc(vm_t* vm, bool force) {
@@ -4249,12 +4734,19 @@ static inline void gc(vm_t* vm, bool force) {
 		return;
 	if(!force && vm->gc.gc_defer > 0) //a C frame holds bare var pointers right now
 		return;
-	if(!force && vm->gc.gc_vars_num < vm->gc.gc_trig_var_num)
+	/* Two independent triggers: the gc_vars population (regular sweep) and the
+	 * never_gc population (mid-run cycle pass). Cycle garbage rides never_gc
+	 * with refs>0 and never inflates gc_vars_num, so a page that only builds
+	 * closure/object cycles would otherwise never collect (xBrowser heap
+	 * growth). Either threshold crossing runs a collection. */
+	if(!force && vm->gc.gc_vars_num < vm->gc.gc_trig_var_num &&
+			vm->gc.never_gc_num < vm->gc.cycle_trig_num)
 		return;
 	mario_debug("gc ...... ");
 	vm->gc.is_doing_gc = true;
 	gc_vars(vm);
 	gc_free_free_vars(vm, force ? 0:vm->gc.free_var_buffer_num);
+	gc_free_c_dead(vm);
 	vm->gc.is_doing_gc = false;
 	/* Adaptive trigger: gc_vars_num is now the surviving live count. Require the
 	 * heap to grow ~1.5x past it before the next opportunistic collection, so
@@ -4309,6 +4801,8 @@ typedef struct st_weak_cell {
 
 static weak_cell_t* weak_cell_new(var_t* target, bool is_fr) {
 	weak_cell_t* c = (weak_cell_t*)mario_malloc(sizeof(weak_cell_t));
+	if(c == NULL) /* OOM: callers skip the registration */
+		return NULL;
 	memset(c, 0, sizeof(weak_cell_t));
 	c->target = target;
 	c->is_fr = is_fr;
@@ -4346,6 +4840,8 @@ void vm_weak_add_ref(vm_t* vm, var_t* target, var_t* weakref) {
 	if(vm == NULL || target == NULL || weakref == NULL)
 		return;
 	weak_cell_t* c = weak_cell_new(target, false);
+	if(c == NULL) /* OOM: the WeakRef simply observes nothing */
+		return;
 	c->weakref = weakref;
 	c->next = vm->weak_cells;
 	vm->weak_cells = c;
@@ -4375,6 +4871,8 @@ void vm_weak_add_finalizer(vm_t* vm, var_t* registry, var_t* target, var_t* call
 	if(vm == NULL || target == NULL || callback == NULL)
 		return;
 	weak_cell_t* c = weak_cell_new(target, true);
+	if(c == NULL) /* OOM: the finalizer registration is dropped */
+		return;
 	c->registry = registry;                 // raw ptr: only compared against a live registry
 	c->callback = var_ref(callback);        // keep the cleanup alive until it runs
 	c->held = (held != NULL) ? var_ref(held) : NULL;
@@ -4663,6 +5161,10 @@ void var_set_prototype(var_t* var, var_t* proto) {
 	 * object: the hidden FPROTO slot is [[Prototype]], leaving "prototype" free as
 	 * a data property (see var_get_prototype). */
 	node_t* ret = var_add(var, (var->is_func || var->is_class) ? PROTOTYPE : FPROTO, proto);
+	/* OOM: var_add dropped the link - the object stays chainless (degraded)
+	 * instead of faulting on a NULL node. */
+	if(ret == NULL)
+		return;
 	ret->invisable = 1;
 	//ret->be_inherited = 1;
 	ret->be_unenumerable = 1;
@@ -4701,6 +5203,20 @@ inline var_t* var_new(vm_t* vm) {
 	if(var == NULL) {
         uint32_t sz = sizeof(var_t);
 		var = (var_t*)mario_malloc(sz);
+		/* OOM: the heap can not expand. Flip the collector to bounded mode so
+		 * the next sweep reclaims C-held garbage instead of retaining it, and
+		 * return NULL - memset'ing a NULL body faulted at a small offset
+		 * (data abort) on memory-constrained guests. Callers must NULL-check. */
+		if(var == NULL) {
+			if(vm != NULL) {
+				vm->gc.mem_pressure = true;
+				/* Reclaim at the next instruction boundary, not whenever the
+				 * var-count threshold happens to trip: the bounded sweep frees
+				 * the C-held garbage that caused the pressure. */
+				vm->gc.gc_pending = true;
+			}
+			return NULL;
+		}
 		memset(var, 0, sizeof(var_t));
 	}
 	/* A pool-recycled var needs NO memset: every death path leaves it in a
@@ -4744,18 +5260,30 @@ inline var_t* var_new_block(vm_t* vm) {
 
 inline var_t* var_new_array(vm_t* vm) {
 	var_t* var = var_new_obj(vm, var_get_prototype(vm->builtin_vars.var_Array), NULL, NULL);
+	if(var == NULL) /* OOM (var_new flagged pressure) */
+		return NULL;
 	var->is_array = 1;
 	var_t* members = var_new_obj_no_proto(vm, NULL, NULL);
 	node_t* n = var_add(var, "_ARRAY_", members);
-	n->be_unenumerable = 1;
-	n->invisable = 1;
+	/* OOM: the _ARRAY_ store may be missing - array ops degrade to empty
+	 * (var_array_* all bail on an absent store) instead of faulting. */
+	if(n != NULL) {
+		n->be_unenumerable = 1;
+		n->invisable = 1;
+	}
 	return var;
 }
 
 inline var_t* var_new_int(vm_t* vm, int i) {
 	var_t* var = var_new(vm);
+	if(var == NULL) /* OOM */
+		return NULL;
 	var->type = V_INT;
-	var->value = nbox_alloc(vm); /* 8B pool block; only the first 4B are used */
+	var->value = nbox_alloc_pressure(vm); /* 8B pool block; only the first 4B are used */
+	if(var->value == NULL) { /* OOM: degrade to undefined */
+		var->type = V_UNDEF;
+		return var;
+	}
 	*((int*)var->value) = i;
 	/* No explicit prototype link: var_get_prototype resolves Number.prototype
 	 * implicitly by type (saves a node_new + name copy + epoch bump per var). */
@@ -4764,8 +5292,14 @@ inline var_t* var_new_int(vm_t* vm, int i) {
 
 inline var_t* var_new_int64(vm_t* vm, int64_t i) {
 	var_t* var = var_new(vm);
+	if(var == NULL) /* OOM */
+		return NULL;
 	var->type = V_INT64;
-	var->value = nbox_alloc(vm);
+	var->value = nbox_alloc_pressure(vm);
+	if(var->value == NULL) { /* OOM: degrade to undefined */
+		var->type = V_UNDEF;
+		return var;
+	}
 	*((int64_t*)var->value) = i;
 	/* Implicit Number.prototype via var_get_prototype's type fallback. */
 	return var;
@@ -4773,14 +5307,22 @@ inline var_t* var_new_int64(vm_t* vm, int64_t i) {
 
 inline var_t* var_new_null(vm_t* vm) {
 	var_t* var = var_new(vm);
+	if(var == NULL) /* OOM */
+		return NULL;
 	var->type = V_NULL;
 	return var;
 }
 
 inline var_t* var_new_bool(vm_t* vm, bool b) {
 	var_t* var = var_new(vm);
+	if(var == NULL) /* OOM */
+		return NULL;
 	var->type = V_BOOL;
-	var->value = nbox_alloc(vm);
+	var->value = nbox_alloc_pressure(vm);
+	if(var->value == NULL) { /* OOM: degrade to undefined */
+		var->type = V_UNDEF;
+		return var;
+	}
 	*((int*)var->value) = b;
 	/* Boolean.prototype resolves implicitly via var_get_prototype's type
 	 * fallback, so `false.toString()` / `x.valueOf()` still resolve (github's
@@ -4792,6 +5334,8 @@ inline var_t* var_new_bool(vm_t* vm, bool b) {
 
 inline var_t* var_new_obj_no_proto(vm_t* vm, void*p, free_func_t fr) {
 	var_t* var = var_new(vm);
+	if(var == NULL) /* OOM: payload ownership stays with the caller */
+		return NULL;
 	var->type = V_OBJECT;
 	var->value = p;
 	var->free_func = fr;
@@ -4800,14 +5344,22 @@ inline var_t* var_new_obj_no_proto(vm_t* vm, void*p, free_func_t fr) {
 
 inline var_t* var_new_obj(vm_t* vm, var_t* proto, void*p, free_func_t fr) {
 	var_t* var = var_new_obj_no_proto(vm, p, fr);
+	if(var == NULL) /* OOM */
+		return NULL;
 	var_set_prototype(var, proto);
 	return var;
 }
 
 inline var_t* var_new_float(vm_t* vm, float i) {
 	var_t* var = var_new(vm);
+	if(var == NULL) /* OOM */
+		return NULL;
 	var->type = V_FLOAT;
-	var->value = nbox_alloc(vm);
+	var->value = nbox_alloc_pressure(vm);
+	if(var->value == NULL) { /* OOM: degrade to undefined */
+		var->type = V_UNDEF;
+		return var;
+	}
 	*((float*)var->value) = i;
 	/* Implicit Number.prototype via var_get_prototype's type fallback. */
 	return var;
@@ -4815,8 +5367,14 @@ inline var_t* var_new_float(vm_t* vm, float i) {
 
 inline var_t* var_new_float64(vm_t* vm, double d) {
 	var_t* var = var_new(vm);
+	if(var == NULL) /* OOM */
+		return NULL;
 	var->type = V_FLOAT64;
-	var->value = nbox_alloc(vm);
+	var->value = nbox_alloc_pressure(vm);
+	if(var->value == NULL) { /* OOM: degrade to undefined */
+		var->type = V_UNDEF;
+		return var;
+	}
 	*((double*)var->value) = d;
 	/* Implicit Number.prototype via var_get_prototype's type fallback. */
 	return var;
@@ -4828,6 +5386,11 @@ inline var_t* var_new_float64(vm_t* vm, double d) {
  * before the BigInt native is registered. */
 inline var_t* var_new_bigint(vm_t* vm, bignum_t* b) {
 	var_t* var = var_new(vm);
+	if(var == NULL) { /* OOM: ownership never transferred - free the payload */
+		if(b != NULL)
+			bn_free(b);
+		return NULL;
+	}
 	var->type = V_BIGINT;
 	var->value = b;
 	var->free_func = bn_free;
@@ -4841,10 +5404,27 @@ inline bignum_t* var_get_bigint(var_t* var) {
 }
 
 inline var_t* var_new_str(vm_t* vm, const char* s) {
+	if(s == NULL) /* OOM upstream: degrade to an empty string */
+		s = "";
 	var_t* var = var_new(vm);
+	/* OOM guard: var_new / mario_malloc can return NULL when the heap can not
+	 * expand; writing var->type or memcpy'ing into a NULL value faulted at a
+	 * small offset (data abort) instead of degrading to a JS error. */
+	if(var == NULL)
+		return NULL;
 	var->type = V_STRING;
 	var->size = (uint32_t)strlen(s);
 	var->value = mario_malloc(var->size + 1);
+	if(var->value == NULL) {
+		/* String payload OOM: degrade to an empty string and flag pressure so
+		 * the next bounded sweep reclaims memory (see var_new). */
+		var->size = 0;
+		if(vm != NULL) {
+			vm->gc.mem_pressure = true;
+			vm->gc.gc_pending = true;
+		}
+		return var;
+	}
 	memcpy(var->value, s, var->size + 1);
 	/* Implicit String.prototype via var_get_prototype's type fallback. */
 	return var;
@@ -4852,6 +5432,9 @@ inline var_t* var_new_str(vm_t* vm, const char* s) {
 
 inline var_t* var_new_str2(vm_t* vm, const char* s, uint32_t len) {
 	var_t* var = var_new(vm);
+	/* OOM guard (see var_new_str): a NULL body must not be written through. */
+	if(var == NULL)
+		return NULL;
 	var->type = V_STRING;
 	/* Bound the length scan to `len` bytes: callers may pass a buffer that is NOT
 	 * null-terminated within len (a Buffer / ArrayBuffer / TypedArray byte slice),
@@ -4863,6 +5446,14 @@ inline var_t* var_new_str2(vm_t* vm, const char* s, uint32_t len) {
 	while(n < len && s[n] != 0) n++;
 	var->size = n;
 	var->value = mario_malloc(var->size + 1);
+	if(var->value == NULL) {
+		var->size = 0;
+		if(vm != NULL) {
+			vm->gc.mem_pressure = true;
+			vm->gc.gc_pending = true;
+		}
+		return var;
+	}
 	memcpy(var->value, s, var->size);
 	((char*)(var->value))[var->size] = 0;
 	/* Implicit String.prototype via var_get_prototype's type fallback. */
@@ -4871,6 +5462,9 @@ inline var_t* var_new_str2(vm_t* vm, const char* s, uint32_t len) {
 
 inline var_t* var_new_str_bin(vm_t* vm, const char* s, uint32_t len) {
 	var_t* var = var_new(vm);
+	/* OOM guard (see var_new_str): a NULL body must not be written through. */
+	if(var == NULL)
+		return NULL;
 	var->type = V_STRING;
 	/* Copy exactly `len` bytes WITHOUT stopping at NUL: U+0000 is a valid code
 	 * unit and byte buffers (String.fromCharCode / atob / base64 payloads) carry
@@ -4878,6 +5472,14 @@ inline var_t* var_new_str_bin(vm_t* vm, const char* s, uint32_t len) {
 	 * the buffer (the taobao AWSC VMP builds its tables this way). */
 	var->size = len;
 	var->value = mario_malloc(len + 1);
+	if(var->value == NULL) {
+		var->size = 0;
+		if(vm != NULL) {
+			vm->gc.mem_pressure = true;
+			vm->gc.gc_pending = true;
+		}
+		return var;
+	}
 	memcpy(var->value, s, len);
 	((char*)(var->value))[len] = 0;
 	return var;
@@ -5313,6 +5915,8 @@ double vm_to_number(vm_t* vm, var_t* v) {
 }
 
 void var_to_str(var_t* var, mstr_t* ret) {
+	if(ret == NULL) /* OOM: the caller's builder could not be allocated */
+		return;
 	mstr_reset(ret);
 	if(var == NULL) {
 		mstr_cpy(ret, "undefined");
@@ -5406,10 +6010,12 @@ static void get_parsable_str(var_t* var, mstr_t* ret) {
 
 	mstr_t* s = mstr_new("");
 	var_to_str(var, s);
-	if(var->type == V_STRING)
-		get_m_str(s->cstr, ret);
-	else
-		mstr_cpy(ret, s->cstr);
+	if(s != NULL) { /* OOM: leave ret empty */
+		if(var->type == V_STRING)
+			get_m_str(s->cstr, ret);
+		else
+			mstr_cpy(ret, s->cstr);
+	}
 
 	mstr_free(s);
 }
@@ -5543,6 +6149,8 @@ static bool _done_arr_inited = false;
  * indented form used for console/debug object rendering. `level` still drives the
  * cycle-detection reset (level==0) and, when not compact, the indentation depth. */
 void var_to_json_str(var_t* var, mstr_t* ret, int level, bool compact) {
+	if(ret == NULL) /* OOM: the caller's builder could not be allocated */
+		return;
 	mstr_reset(ret);
 
 	uint32_t i;
@@ -5593,7 +6201,8 @@ void var_to_json_str(var_t* var, mstr_t* ret, int level, bool compact) {
 			else {
 				mstr_t* s = mstr_new("");
 				var_to_json_str(n->var, s, level, compact);
-				mstr_append(ret, s->cstr);
+				if(s != NULL) /* OOM: drop this element's text */
+					mstr_append(ret, s->cstr);
 				mstr_free(s);
 			}
 
@@ -5691,7 +6300,8 @@ void var_to_json_str(var_t* var, mstr_t* ret, int level, bool compact) {
 				var_to_json_str(valvar, value_str, level + 1, compact);
 			else
 				mstr_append(value_str, "null");
-			mstr_append(ret, value_str->cstr);
+			if(value_str != NULL) /* OOM: drop this value's text */
+				mstr_append(ret, value_str->cstr);
 			mstr_free(value_str);
 			if(ta_el != NULL) var_unref(ta_el);
 		}
@@ -5723,7 +6333,8 @@ void var_to_json_str(var_t* var, mstr_t* ret, int level, bool compact) {
 			// no children or a function... just write value directly
 			mstr_t* s = mstr_new("");
 			get_parsable_str(var, s);
-			mstr_append(ret, s->cstr);
+			if(s != NULL) /* OOM: drop the value text */
+				mstr_append(ret, s->cstr);
 			mstr_free(s);
 		}
 	}
@@ -5999,6 +6610,13 @@ static inline var_t* vm_get_scope_var(vm_t* vm) {
 
 static scope_t* scope_new(vm_t* vm, var_t* var) {
 	scope_t* sc = scope_pool_alloc(vm);
+	if(sc == NULL) { /* OOM: flag pressure, callers NULL-check */
+		if(vm != NULL) {
+			vm->gc.mem_pressure = true;
+			vm->gc.gc_pending = true;
+		}
+		return NULL;
+	}
 	/* Clear only up to (not including) the inline pslots[] array plus the
 	 * trailing pslot_num: slot contents are read exclusively under
 	 * slot < pslot_num, and pslot_num==0 disables the cache - so zeroing
@@ -6273,7 +6891,8 @@ static node_t* find_in_proto_chain_ex(var_t* var, var_t* start, const char* name
 					if(noclone)
 						return ret;
 					ret = var_add(var, name, var_clone(ret->var));
-					ret->be_inherited = 1;
+					if(ret != NULL) /* OOM: the inherited copy is dropped */
+						ret->be_inherited = 1;
 					return ret;
 				}
 			} else {
@@ -6646,6 +7265,8 @@ static void vm_capture_throw_loc(vm_t* vm) {
 		s_throw_loc = mstr_new("");
 	mstr_reset(s_throw_loc);
 	mstr_t* one = mstr_new("");
+	/* OOM: no builder - bc_srcmap_locate bails on NULL out, so every trace
+	 * line below is skipped; propagation itself is unaffected. */
 	if(bc_srcmap_locate(&vm->bc, vm->pc, one)) {
 		mstr_append(s_throw_loc, "  at ");
 		mstr_append(s_throw_loc, one->cstr);
@@ -6682,6 +7303,8 @@ const char* mario_last_throw_loc(void) {
  * script through its pc_range table. malloc'd; the caller frees. */
 char* mario_format_stack(vm_t* vm, const char* msg) {
 	mstr_t* s = mstr_new("");
+	if(s == NULL) /* OOM: degrade to the message alone (or empty) */
+		return strdup((msg != NULL) ? msg : "");
 	if(msg != NULL)
 		mstr_append(s, msg);
 	int shown = 0;
@@ -6780,6 +7403,8 @@ static void vm_propagate(vm_t* vm, var_t* err) {
 	vm_capture_throw_loc(vm);
 	{
 		mstr_t* ds = mstr_new("");
+		if(ds == NULL) /* OOM: skip the diagnostics, propagation still works */
+			return;
 		var_to_str(err, ds);
 		if(getenv("MARIO_DIAGX"))
 			mario_printf("[DIAGX] propagate err=%s scope_top=%d base=%d\n", ds->cstr, vm->scope_stack_top, vm->run_scope_base);
@@ -6791,7 +7416,7 @@ static void vm_propagate(vm_t* vm, var_t* err) {
 			if(mv != NULL) {
 				mstr_t* ms = mstr_new("");
 				var_to_str(mv, ms);
-				if(ms->cstr != NULL) {
+				if(ms != NULL && ms->cstr != NULL) {
 					size_t cl = strlen(matchbuf);
 					snprintf(matchbuf+cl, sizeof(matchbuf)-cl-1, "|%s", ms->cstr);
 				}
@@ -6844,13 +7469,14 @@ void vm_report_uncaught(vm_t* vm) {
 	var_to_str(err, es);
 	char tagsfx[160] = {0};
 	if(vm->dbg_tag != NULL) snprintf(tagsfx, sizeof(tagsfx)-1, "  [%s]", vm->dbg_tag);
-	mario_printf("Uncaught %s%s\n", es->cstr, tagsfx);
+	/* OOM: no builder - still report the uncaught error, just without its text */
+	mario_printf("Uncaught %s%s\n", (es != NULL && es->cstr != NULL) ? es->cstr : "<error>", tagsfx);
 	if(getenv("MARIO_ERRSTACK") != NULL) {
 		var_t* stv = var_find_member_var(err, "stack");
 		if(stv != NULL) {
 			mstr_t* ss = mstr_new("");
 			var_to_str(stv, ss);
-			if(ss->cstr != NULL && ss->cstr[0] != '\0')
+			if(ss != NULL && ss->cstr != NULL && ss->cstr[0] != '\0')
 				mario_printf("[errstack] %.1200s\n", ss->cstr);
 			mstr_free(ss);
 		}
@@ -6977,6 +7603,8 @@ static var_t* vm_make_type_error(vm_t* vm, const char* type_name, const char* me
 		proto = vm->builtin_vars.var_Error;
 
 	var_t* err = var_new_obj(vm, proto, NULL, NULL);
+	if(err == NULL) /* OOM: even the error object can not be built */
+		return NULL;
 	node_t* nm = var_find_member(err, "message");
 	if(nm != NULL && nm->var != NULL)
 		var_set_str(nm->var, message);
@@ -6995,15 +7623,17 @@ static var_t* vm_make_type_error(vm_t* vm, const char* type_name, const char* me
 	 * native_ErrorConstructor; own member via var_add (refs the fresh var). */
 	{
 		mstr_t* head = mstr_new("");
-		mstr_append(head, type_name);
-		if(message != NULL && message[0] != 0) {
-			mstr_append(head, ": ");
-			mstr_append(head, message);
+		if(head != NULL) { /* OOM: skip the stack member, keep name/message */
+			mstr_append(head, type_name);
+			if(message != NULL && message[0] != 0) {
+				mstr_append(head, ": ");
+				mstr_append(head, message);
+			}
+			char* stk = mario_format_stack(vm, head->cstr);
+			mstr_free(head);
+			var_add(err, "stack", var_new_str(vm, (stk != NULL) ? stk : ""));
+			free(stk);
 		}
-		char* stk = mario_format_stack(vm, head->cstr);
-		mstr_free(head);
-		var_add(err, "stack", var_new_str(vm, (stk != NULL) ? stk : ""));
-		free(stk);
 	}
 	return err;
 }
@@ -7089,6 +7719,8 @@ static inline var_t* vm_super_in_scopes(vm_t* vm) {
 }
 
 inline node_t* vm_load_node(vm_t* vm, const char* name, bool create) {
+	if(name == NULL) /* OOM: constant-pool string unavailable - resolve nothing */
+		name = "";
 	scope_t* sc = vm_get_scope(vm);
 	/* An object/array-literal construction scope (handle_obj) is a MEMBERN/ARRE
 	 * write target, NOT a lexical env. Its var is the literal being built, whose
@@ -7264,6 +7896,8 @@ static void func_free(void* p) {
 
 static var_t* var_new_func(vm_t* vm, func_t* func) {
 	var_t* var = var_new_obj_no_proto(vm, NULL, NULL);
+	if(var == NULL) /* OOM: callers NULL-check and degrade to undefined */
+		return NULL;
 	var->is_func = 1;
 	var->free_func = func_free;
 	var->value = func;
@@ -7957,6 +8591,11 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num, bool i
 			func->jit_calls++;
 #endif
 		scope_t* sc = scope_new(vm, env);
+		if(sc == NULL) { /* OOM: no call frame - pop env, hand back undefined */
+			vm_pop(vm);
+			vm_push(vm, NULL);
+			return true;
+		}
 		sc->pc = vm->pc;
 		sc->is_func = true;
 		sc->default_this = default_this;
@@ -8129,6 +8768,14 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num, bool i
 
 	if(ret == NULL)
 		ret = var_new(vm);
+	if(ret == NULL) {
+		/* OOM: not even an undefined placeholder body can be allocated. Pop
+		 * the env and hand the caller a NULL slot (reads degrade to
+		 * undefined) instead of faulting on ret->refs below. */
+		vm_pop(vm);
+		vm_push(vm, NULL);
+		return true;
+	}
 	var_ref(ret);
 	/* Between popping env and pushing ret the return value's object graph is
 	 * unreachable; an opportunistic gc here would sweep its children. */
@@ -8174,14 +8821,17 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num, bool i
 
 static var_t* func_def(vm_t* vm, int regular, bool is_static) {
 	func_t* func = func_new();
-	func->regular = regular;
-	func->is_static = is_static;
+	if(func != NULL) {
+		func->regular = regular;
+		func->is_static = is_static;
+	}
 	while(true) {
 		PC ins = vm->bc.code_buf[vm->pc++];
 		opr_code_t instr = OP(ins);
 		uint32_t offset = OFF(ins);
 		if(instr == INSTR_JMP) {
-			func->pc = vm->pc;
+			if(func != NULL)
+				func->pc = vm->pc;
 			vm->pc = vm->pc + offset - 1;
 			break;
 		}
@@ -8189,6 +8839,10 @@ static var_t* func_def(vm_t* vm, int regular, bool is_static) {
 		const char* s = bc_getstr(&vm->bc, offset);
 		if(s == NULL)
 			break;
+		/* OOM: no func_t - still consume the header instructions so vm->pc
+		 * stays aligned with the bytecode stream, then report failure. */
+		if(func == NULL)
+			continue;
 		if(instr == INSTR_FUNCLOC) {
 			/* Header metadata: a hoisted `var` local of the body. These come
 			 * after all parameter-name instructions (compiler emits them
@@ -8206,6 +8860,9 @@ static var_t* func_def(vm_t* vm, int regular, bool is_static) {
 		}
 		array_add_buf(&func->args, (void*)s, (uint32_t)strlen(s) + 1);
 	}
+
+	if(func == NULL) /* OOM: header consumed above, nothing to build */
+		return NULL;
 
 	/* Function.toString source span lookup: materialize the source slice so
 	 * native_Function_toString can return it verbatim (browser parity). */
@@ -8240,6 +8897,8 @@ static var_t* func_def(vm_t* vm, int regular, bool is_static) {
 	}
 
 	var_t* ret = var_new_func(vm, func);
+	if(ret == NULL) /* OOM: the var shell failed - release the orphan func_t */
+		func_free(func);
 	return ret;
 }
 
@@ -8473,8 +9132,10 @@ static bool wslot_write(vm_t* vm, node_t* n, var_t* val) {
 		else {
 			mstr_t* ks = mstr_new("");
 			var_to_str(key, ks);
-			tn = var_find_own_member(obj, ks->cstr);
-			if(tn == NULL) tn = var_add(obj, ks->cstr, NULL);
+			if(ks != NULL) { /* OOM: skip the write instead of naming a NULL key */
+				tn = var_find_own_member(obj, ks->cstr);
+				if(tn == NULL) tn = var_add(obj, ks->cstr, NULL);
+			}
 			mstr_free(ks);
 		}
 		if(tn != NULL)
@@ -8758,9 +9419,10 @@ return;
 				var_to_str(v1, s);
 				mstr_t* s2 = mstr_new("");
 				var_to_str(v2, s2);
-				mstr_append(s, s2->cstr);
+				if(s2 != NULL) /* OOM: keep the left side only */
+					mstr_append(s, s2->cstr);
 				mstr_free(s2);
-				var_t* v = var_new_str(vm, s->cstr);
+				var_t* v = var_new_str(vm, (s != NULL && s->cstr != NULL) ? s->cstr : "");
 				mstr_free(s);
 				math_result(vm, op, n, v);
 				return;
@@ -8933,15 +9595,22 @@ return;
 			uint32_t l1 = (v1->value != NULL) ? v1->size : 0;
 			uint32_t l2 = (v2->value != NULL) ? v2->size : 0;
 			char* buf = (char*)mario_malloc(l1 + l2 + 1);
-			if(l1 > 0) memcpy(buf, v1->value, l1);
-			if(l2 > 0) memcpy(buf + l1, v2->value, l2);
-			buf[l1 + l2] = 0;
-			var_t* v = var_new(vm);
-			v->type = V_STRING;
-			v->size = l1 + l2;
-			v->value = buf;
-			math_result(vm, op, n, v);
-			return;
+			/* OOM: fall through to the generic concat lane (which degrades to
+			 * an empty string) instead of memcpy'ing into NULL. */
+			if(buf != NULL) {
+				if(l1 > 0) memcpy(buf, v1->value, l1);
+				if(l2 > 0) memcpy(buf + l1, v2->value, l2);
+				buf[l1 + l2] = 0;
+				var_t* v = var_new(vm);
+				if(v != NULL) {
+					v->type = V_STRING;
+					v->size = l1 + l2;
+					v->value = buf;
+					math_result(vm, op, n, v);
+					return;
+				}
+				mario_free(buf);
+			}
 		}
 		/* Convert the left operand to a string properly. Casting v1->value to
 		 * char* directly produced garbage when v1 was a non-string, e.g.
@@ -8950,10 +9619,11 @@ return;
 		var_to_str(v1, s);
 		mstr_t* json = mstr_new("");
 		var_to_str(v2, json);
-		mstr_append_n(s, json->cstr, json->len);
+		if(json != NULL) /* OOM: keep the left side only */
+			mstr_append_n(s, json->cstr, json->len);
 		mstr_free(json);
 
-		var_t* v = var_new_str_bin(vm, s->cstr, s->len);
+		var_t* v = var_new_str_bin(vm, (s != NULL) ? s->cstr : NULL, (s != NULL) ? s->len : 0);
 		mstr_free(s);
 		math_result(vm, op, n, v);
 		return;
@@ -9297,8 +9967,10 @@ static void merge_accessor(node_t* ex, var_t* acc) {
 		return;
 	if(getter != NULL && setter != NULL) {
 		node_t* sn = var_add(getter, FUNC_SETTER_KEY, setter);
-		sn->invisable = 1;
-		sn->be_unenumerable = 1;
+		if(sn != NULL) { /* OOM: the pairing link is dropped */
+			sn->invisable = 1;
+			sn->be_unenumerable = 1;
+		}
 	}
 	if(primary != ex_var)
 		node_replace(ex, primary); //refs primary, releases the node's old var.
@@ -10188,6 +10860,8 @@ var_t* new_obj(vm_t* vm, const char* name, int arg_num) {
 }
 
 static int parse_func_name(const char* full, mstr_t* name) {
+	if(full == NULL) /* OOM: the constant-pool string could not be materialized */
+		return 0;
 	/* gen_func_name() encodes a call as "<name>$<argcount>" (suffix present only
 	 * when argcount>0). JS identifiers may themselves contain '$' (e.g. jQuery's
 	 * `$`, or `$el`/`a$b`), so splitting at the FIRST '$' corrupts them: "$" would
@@ -10221,10 +10895,13 @@ static int parse_func_name(const char* full, mstr_t* name) {
 static bool do_new(vm_t* vm, const char* full) {
 	mstr_t* name = mstr_new("");
 	int arg_num = parse_func_name(full, name);
+	/* OOM: no name builder - degrade to an anonymous lookup instead of
+	 * dereferencing a NULL cstr below. */
+	const char* nm = (name != NULL && name->cstr != NULL) ? name->cstr : "";
 
 	if(getenv("MARIO_NEWDBG") != NULL) { /* DIAG (temp): scalar peek of named-NEW args */
 		scope_t* nsc = vm_get_scope(vm);
-		fprintf(stderr, "[newdbg] NEW '%s' argc=%d pc=%u caller_fpc=%u\n", name->cstr, arg_num,
+		fprintf(stderr, "[newdbg] NEW '%s' argc=%d pc=%u caller_fpc=%u\n", nm, arg_num,
 			(unsigned)(vm->pc > 0 ? vm->pc - 1 : 0),
 			(nsc != NULL && nsc->func != NULL) ? (unsigned)nsc->func->pc : 0u);
 		if(getenv("MARIO_NEWPC") != NULL &&
@@ -10258,12 +10935,12 @@ static bool do_new(vm_t* vm, const char* full) {
 	 * TypeError. Detect it before building anything, drop the pushed args, and
 	 * throw. Return true so handle_new does not vm_terminate (the throw must be
 	 * catchable by an enclosing try/catch). */
-	node_t* cn = vm_load_node(vm, name->cstr, false);
+	node_t* cn = vm_load_node(vm, nm, false);
 	if(getenv("MARIO_NEWAT") != NULL) { /* DIAG (temp): dump named-NEW at a specific call vpc */
 		PC cur = (vm->pc > 0) ? vm->pc - 1 : 0;
 		if(cur == (PC)atoi(getenv("MARIO_NEWAT"))) {
 			fprintf(stderr, "[newat] NEW name='%s' argc=%d vpc=%u resolved=%p is_func=%u is_class=%u\n",
-				name->cstr, arg_num, (unsigned)cur, (void*)(cn ? cn->var : NULL),
+				nm, arg_num, (unsigned)cur, (void*)(cn ? cn->var : NULL),
 				(unsigned)(cn && cn->var ? cn->var->is_func : 0u),
 				(unsigned)(cn && cn->var ? cn->var->is_class : 0u));
 			/* DIAG (temp): which node/name did the free-variable lookup land on, and
@@ -10303,13 +10980,13 @@ static bool do_new(vm_t* vm, const char* full) {
 			int k = arg_num;
 			while(k-- > 0)
 				vm_pop(vm);
-			vm_throw(vm, "arrow function '%s' is not a constructor!", name->cstr);
+			vm_throw(vm, "arrow function '%s' is not a constructor!", nm);
 			mstr_free(name);
 			return true;
 		}
 	}
 
-	var_t* obj = new_obj(vm, name->cstr, arg_num);
+	var_t* obj = new_obj(vm, nm, arg_num);
 	mstr_free(name);
 
 	if(obj == NULL)
@@ -10337,6 +11014,16 @@ var_t* call_m_func(vm_t* vm, var_t* obj, var_t* func, var_t* args) {
 	 * args without touching its refcount, leaving exactly one release (the
 	 * caller's). The elements still go on the value stack for func_call. */
 	vm->gc.gc_defer++;
+	/* gc_defer only gates OPPORTUNISTIC collections; an explicit gc() inside
+	 * the callee ignores it. The args array itself is held solely by the
+	 * native caller's C local (its elements go on the value stack below, the
+	 * array does not), so the mid-run never_gc cycle pass would classify it
+	 * garbage (refs==1, no internal in-edges - indistinguishable from a
+	 * self-cycle) and the caller's trailing var_unref(args) became a UAF
+	 * (es6_full promise drain). Root it for the whole call; c_root is a mark
+	 * anchor, not a ref, so the refs==0-on-entry contract (handle_call_spread)
+	 * and the single caller release stay intact. */
+	bool args_rooted = vm_push_c_root(vm, args);
 	if(args != NULL) {
 		// Push arguments onto the stack
 		arg_num = var_array_size(args);
@@ -10377,11 +11064,15 @@ var_t* call_m_func(vm_t* vm, var_t* obj, var_t* func, var_t* args) {
 		 * sees NULL; propagation continues when that native returns. */
 		if(ret != NULL)
 			var_unref(ret);
+		if(args_rooted)
+			vm_pop_c_roots(vm, 1);
 		vm->gc.gc_defer--;
 		return NULL;
 	}
 	if(ret != NULL && obj == ret)
 		ret->refs--;
+	if(args_rooted)
+		vm_pop_c_roots(vm, 1);
 	vm->gc.gc_defer--;
 	return ret;
 }
@@ -10894,6 +11585,10 @@ static inline void handle_load_impl(vm_t* vm, uint32_t offset, bool safe, bool r
 			 * still yields undefined instead of throwing. */
 			var_t* var = raw ? vm->root : vm_get_scope_var(vm);
 			node = var_add(var, s, NULL);
+			if(node == NULL) { /* OOM: the implicit binding could not be created */
+				vm_throw(vm, "'%s' undefined!", s);
+				return;
+			}
 		}
 		/* Accessor bindings need the scope object that supplied them as their
 		 * receiver, for BOTH reads and writes. A read invokes the getter now. A
@@ -11088,6 +11783,10 @@ static inline void handle_strict(vm_t* vm, PC ins, opr_code_t instr, uint32_t of
 
 static inline void handle_block(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
 	scope_t* sc = scope_new(vm, var_new_block(vm));
+	if(sc == NULL) { /* OOM: cannot open the block - degrade to a JS error */
+		vm_throw(vm, "out of memory");
+		return;
+	}
 	sc->is_block = true;
 	sc->stack_top = vm->stack_top; //entry height (a block nests inside its func frame's baseline)
 	if(instr == INSTR_LOOP) {
@@ -11681,6 +12380,10 @@ static inline void vm_step_op(vm_t* vm, PC ins, node_t* n, var_t* v, int step, b
 			var_unref(getter);
 		}
 		if(cur == NULL) cur = var_new(vm);
+		if(cur == NULL) { /* OOM: the update expression degrades to undefined */
+			vm_push(vm, NULL);
+			return;
+		}
 		bool steppable = (cur->type == V_INT || cur->type == V_FLOAT ||
 		                  cur->type == V_INT64 || cur->type == V_FLOAT64 ||
 		                  cur->type == V_BIGINT);
@@ -12248,7 +12951,7 @@ static inline void handle_asign(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 				mstr_t* sm = mstr_new("");
 				bc_srcmap_locate(&vm->bc, vm->pc, sm);
 				fprintf(stderr, "[emptystore] tag=%s pc=%u idx=%s src=%s\n",
-					vm->dbg_tag, (unsigned)vm->pc, nm, sm->cstr);
+					vm->dbg_tag, (unsigned)vm->pc, nm, (sm != NULL && sm->cstr != NULL) ? sm->cstr : "");
 				mstr_free(sm);
 			}
 		}
@@ -12901,6 +13604,8 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 	bool unrefObj = false;
 	bool is_super_call = false;
 	const char* s = bc_getstr(&vm->bc, offset);
+	if(s == NULL) /* OOM: constant-pool string unavailable - anonymous call */
+		s = "";
 	/* Every call used to malloc/free a heap mstr_t plus its string buffer
 	 * just to split "<name>$<argc>". The name is only READ while this
 	 * frame runs (find_func compares, var_add copies), so parse it into a
@@ -12913,7 +13618,9 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 	mstr_t* name = &nst;
 	if(strlen(s) >= sizeof(nbuf))
 		name = mstr_new("");
-	int arg_num = parse_func_name(s, name);
+	if(name == NULL) /* OOM: read-only empty name; parse skips the copy */
+		name = &s_empty_name;
+	int arg_num = parse_func_name(s, (name == &s_empty_name) ? NULL : name);
 	var_t* sc_var = vm_get_scope_var(vm);
 
 	if(instr == INSTR_CALLO) {
@@ -13563,8 +14270,10 @@ static inline void handle_callx(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 	 * until the trailing var_unref it lives in a C local the collector can not
 	 * see. func_call runs arbitrary JS - including a nested vm_run whose
 	 * instruction-boundary gc_pending check, or an explicit gc(), both of which
-	 * can sweep it mid-call. Park it as a C-side root for the whole handler. */
-	vm_push_c_root(vm, func);
+	 * can sweep it mid-call. Park it as a C-side root for the whole handler.
+	 * push skips NULL/dead vars: pop ONLY what was actually pushed or the LIFO
+	 * loses an enclosing frame's anchor (stale slot -> UAF at the next mark). */
+	bool func_rooted = vm_push_c_root(vm, func);
 
 	if(func != NULL && func->is_class && !func->is_func && !var_is_proxy(func)) {
 		var_t* ret = new_obj_with_ctor(vm, func, "value", arg_num, true);
@@ -13790,7 +14499,8 @@ static inline void handle_callx(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 		vm->gc.gc_defer--;
 	}
 
-	vm_pop_c_roots(vm, 1);
+	if(func_rooted)
+		vm_pop_c_roots(vm, 1);
 	if(func != NULL)
 		var_unref(func); // release the ref the value-stack slot held
 }
@@ -13810,9 +14520,11 @@ static inline void handle_callxo(vm_t* vm, PC ins, opr_code_t instr, uint32_t of
 	var_t* obj  = vm_stack_pick(vm, arg_num + 1); /* receiver now at that depth */
 
 	/* Both were just detached from the value stack, so only these C locals keep
-	 * them alive across func_call's arbitrary JS (see handle_callx). */
-	vm_push_c_root(vm, func);
-	vm_push_c_root(vm, obj);
+	 * them alive across func_call's arbitrary JS (see handle_callx). Pop only
+	 * what push actually parked (NULL/dead vars are skipped). */
+	int callxo_rooted = 0;
+	if(vm_push_c_root(vm, func)) callxo_rooted++;
+	if(vm_push_c_root(vm, obj)) callxo_rooted++;
 
 	if(func != NULL && func->is_class && !func->is_func && !var_is_proxy(func)) {
 		var_t* ret = new_obj_with_ctor(vm, func, "computed", arg_num, true);
@@ -13848,7 +14560,8 @@ static inline void handle_callxo(vm_t* vm, PC ins, opr_code_t instr, uint32_t of
 		vm->gc.gc_defer--;
 	}
 
-	vm_pop_c_roots(vm, 2);
+	if(callxo_rooted > 0)
+		vm_pop_c_roots(vm, callxo_rooted);
 	vm->gc.gc_defer++; //the first unref may gc-sweep the second target
 	if(func != NULL)
 		var_unref(func);
@@ -13887,6 +14600,11 @@ static inline void handle_member(vm_t* vm, PC ins, opr_code_t instr, uint32_t of
 			(unsigned)(v != NULL ? v->type : 999u),
 			(v != NULL && v->type == V_STRING) ? var_get_str(v) : "-",
 			(v != NULL ? (int)v->refs : -1), (unsigned)vm->pc);
+	}
+	if(v == NULL || var == NULL) { /* OOM: value or target missing - drop the write */
+		if(v != NULL)
+			var_unref(v);
+		return;
 	}
 	if(var->is_array) {
 		var_array_add(var, v);
@@ -14104,6 +14822,11 @@ static inline void handle_func(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 		vm_capture_closure(vm, v);
 		vm_push(vm, v);
 	}
+	else {
+		/* OOM: the function object could not be built - push undefined so the
+		 * operand window stays balanced for the consuming MEMBERN/ARRE. */
+		vm_push(vm, NULL);
+	}
 }
 
 static inline void handle_obj(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
@@ -14114,6 +14837,10 @@ static inline void handle_obj(vm_t* vm, PC ins, opr_code_t instr, uint32_t offse
 	else
 		obj = var_new_array(vm);
 	scope_t* sc = scope_new(vm, obj);
+	if(sc == NULL) { /* OOM: push undefined for the literal, keep running */
+		vm_push(vm, NULL);
+		return;
+	}
 	/* The literal-under-construction scope is a MEMBERN/ARRE write target, not a
 	 * lexical env: mark it so free-name resolution (vm_load_node /
 	 * vm_find_in_scopes) skips it. Without this a bare identifier inside a
@@ -14444,6 +15171,11 @@ static var_t* gen_resume_body(vm_t* vm, gen_state_t* g, var_t* sent, int mode) {
 			return iter_result(vm, NULL, true);
 		}
 		scope_t* sc = scope_new(vm, g->env);
+		if(sc == NULL) { /* OOM: cannot open the body frame - finish with an error */
+			g->done = true;
+			vm_throw(vm, "out of memory");
+			return iter_result(vm, NULL, true);
+		}
 		sc->pc = caller_pc; //stale after this resume; every exit path below restores pc itself
 		sc->is_func = true;
 		sc->func = g->func;
@@ -14610,9 +15342,15 @@ static var_t* native_gen_self(vm_t* vm, var_t* env, void* data) {
 
 static var_t* gen_create(vm_t* vm, var_t* func_var, var_t* env) {
 	gen_state_t* g = (gen_state_t*)mario_malloc(sizeof(gen_state_t));
+	if(g == NULL) /* OOM: the caller degrades to an undefined result */
+		return NULL;
 	memset(g, 0, sizeof(gen_state_t));
 
 	var_t* gen = var_new_obj(vm, var_get_prototype(vm->builtin_vars.var_Object), g, NULL);
+	if(gen == NULL) { /* OOM: var_new_obj did not adopt g - release it here */
+		mario_free(g);
+		return NULL;
+	}
 	gen->on_destroy = gen_on_destroy;
 	g->obj = gen;
 	g->env = env;
@@ -15313,7 +16051,9 @@ static inline void handle_obj_spread(vm_t* vm, PC ins, opr_code_t instr, uint32_
 static inline void handle_call_spread(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
 	const char* s = bc_getstr(&vm->bc, offset);
 	mstr_t* name = mstr_new("");
-	parse_func_name(s, name); // strip any $arity suffix, resolve by base name
+	if(name == NULL) /* OOM: read-only empty name */
+		name = &s_empty_name;
+	parse_func_name(s, (name == &s_empty_name) ? NULL : name); // strip any $arity suffix, resolve by base name
 
 	var_t* args = vm_pop2(vm);
 	if(args == NULL || !args->is_array) {
@@ -15501,7 +16241,9 @@ static inline void handle_call_spread(vm_t* vm, PC ins, opr_code_t instr, uint32
 static inline void handle_new_spread(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
 	const char* s = bc_getstr(&vm->bc, offset);
 	mstr_t* name = mstr_new("");
-	parse_func_name(s, name);
+	if(name == NULL) /* OOM: read-only empty name */
+		name = &s_empty_name;
+	parse_func_name(s, (name == &s_empty_name) ? NULL : name);
 
 	var_t* args = vm_pop2(vm);
 	int arg_num = 0;
@@ -15554,10 +16296,19 @@ static inline void handle_memberv(vm_t* vm, PC ins, opr_code_t instr, uint32_t o
 		if(!key_is_symbol) {
 			ks = mstr_new("");
 			var_to_str(k, ks);
-			key = ks->cstr;
+			key = (ks != NULL && ks->cstr != NULL) ? ks->cstr : ""; /* OOM: empty key */
 		}
 	}
 	var_t* var = vm_get_scope_var(vm);
+	if(v == NULL || var == NULL) { /* OOM: value or target missing - drop the write */
+		if(v != NULL)
+			var_unref(v);
+		if(k != NULL)
+			var_unref(k);
+		if(ks != NULL)
+			mstr_free(ks);
+		return;
+	}
 	if(var->is_array) {
 		var_array_add(var, v);
 	}
@@ -15814,7 +16565,8 @@ static void array_at_push(vm_t* vm, var_t* v1, var_t* v2, bool for_write) {
 			 * toString, so the depth-capped var_to_str is the right converter. */
 			mstr_t* ks = mstr_new("");
 			var_to_str(v2, ks);
-			n = for_write ? var_find_member_create(v1, ks->cstr) : var_find_member(v1, ks->cstr);
+			if(ks != NULL) /* OOM: unresolved member (NULL node) instead of a NULL key */
+				n = for_write ? var_find_member_create(v1, ks->cstr) : var_find_member(v1, ks->cstr);
 			mstr_free(ks);
 		}
 	}
@@ -15956,15 +16708,38 @@ static inline void handle_array_at_w(vm_t* vm, PC ins, opr_code_t instr, uint32_
 		int64_t idx = ta_key_index(v2);
 		vm->gc.gc_defer++;   /* sn/cur are unrooted until vm_push_node below */
 		node_t* sn = (node_t*)mario_malloc(sizeof(node_t));
+		if(sn == NULL) { /* OOM: drop the element write */
+			vm->gc.gc_defer--;
+			var_unref(v1);
+			var_unref(v2);
+			return;
+		}
 		memset(sn, 0, sizeof(node_t));
 		sn->magic = 1;
 		sn->name = (char*)mario_malloc(strlen(TA_SLOT)+1);
+		if(sn->name == NULL) { /* OOM: recycle the sentinel, drop the write */
+			mario_free(sn);
+			vm->gc.gc_defer--;
+			var_unref(v1);
+			var_unref(v2);
+			return;
+		}
 		memcpy(sn->name, TA_SLOT, strlen(TA_SLOT)+1);
 		var_t* cur = var_typedarray_get_at(vm, v1, idx);
 		if(cur == NULL) cur = var_new(vm);
+		if(cur == NULL) { /* OOM: no element body - drop the write */
+			mario_free(sn->name);
+			mario_free(sn);
+			vm->gc.gc_defer--;
+			var_unref(v1);
+			var_unref(v2);
+			return;
+		}
 		sn->var = var_ref(cur);                    /* node's own reference */
 		node_t* tn = var_add(cur, TA_SLOT_TA, v1); /* hidden back-ref (var_add refs v1) */
-		tn->invisable = 1; tn->be_unenumerable = 1;
+		if(tn != NULL) { /* OOM: the back-ref is dropped, the write still lands */
+			tn->invisable = 1; tn->be_unenumerable = 1;
+		}
 		sn->ncache_instr = (uint32_t)(int32_t)idx;
 		vm_push_node(vm, sn);                      /* adds the stack reference to cur */
 		vm->gc.gc_defer--;
@@ -16001,7 +16776,8 @@ static inline void handle_array_at_m(vm_t* vm, PC ins, opr_code_t instr, uint32_
 			else {
 				mstr_t* ks = mstr_new("");
 				var_to_str(v2, ks);
-				n = var_find_member(v1, ks->cstr);
+				if(ks != NULL) /* OOM: member stays unresolved */
+					n = var_find_member(v1, ks->cstr);
 				mstr_free(ks);
 			}
 		}
@@ -16068,6 +16844,10 @@ static inline void handle_class(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 
 	var_t* protoV = var_get_prototype(cls_var);
 	scope_t* sc = scope_new(vm, protoV);
+	if(sc == NULL) { /* OOM: cannot open the class body - degrade to a JS error */
+		vm_throw(vm, "out of memory");
+		return;
+	}
 	sc->class_var = cls_var; // CLASS_END pushes the constructor so class expressions evaluate to it
 	sc->class_self_name = self_name; // named class expression: self-name for method binding (else NULL)
 	vm_push_scope(vm, sc);
@@ -16337,7 +17117,8 @@ static inline void handle_delete_at(vm_t* vm, PC ins, opr_code_t instr, uint32_t
 			if(cont != NULL) {
 				mstr_t* ks = mstr_new("");
 				var_to_str(key, ks);
-				res = var_delete_own_member(cont, ks->cstr);
+				if(ks != NULL) /* OOM: delete degrades to a no-op */
+					res = var_delete_own_member(cont, ks->cstr);
 				mstr_free(ks);
 			}
 		}
@@ -16391,7 +17172,8 @@ static inline void handle_in(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset
 			/* ToString(key), not int32 truncation (see handle_delete). */
 			mstr_t* ks = mstr_new("");
 			var_to_str(key, ks);
-			res = var_has_member(obj, ks->cstr);
+			if(ks != NULL) /* OOM: `in` degrades to false */
+				res = var_has_member(obj, ks->cstr);
 			mstr_free(ks);
 		}
 	}
@@ -17546,12 +18328,12 @@ static inline void handle_module_v(vm_t* vm, PC ins, opr_code_t instr, uint32_t 
 		var_to_str(sv, spec);
 		var_unref(sv);
 	}
-	var_t* ns = (spec->len > 0) ? do_module(vm, spec->cstr) : NULL;
+	var_t* ns = (spec != NULL && spec->len > 0) ? do_module(vm, spec->cstr) : NULL;
 	if(getenv("MARIO_MODDBG") != NULL) {
 		var_t* wm = (ns != NULL) ? var_find_member_var(ns, "__webpack_modules__") : NULL;
 		var_t* ids = (ns != NULL) ? var_find_member_var(ns, "__rspack_esm_ids") : NULL;
 		fprintf(stderr, "[moddbg] MODULE_V spec=%.60s ns=%p wpmod=%s ids=%s\n",
-		        spec->cstr, (void*)ns,
+		        (spec != NULL && spec->cstr != NULL) ? spec->cstr : "", (void*)ns,
 		        (wm != NULL && !var_empty(wm)) ? "yes" : "NO",
 		        (ids != NULL && !var_empty(ids)) ? "yes" : "NO");
 	}
@@ -18542,16 +19324,18 @@ bool vm_load_run(vm_t* vm, const char* s) {
 		var_t* anon_mod = NULL;
 		if(is_mod) {
 			scope_t* msc = scope_new(vm, var_new_block(vm));
-			msc->is_block = true;
-			/* A module body is its own variable environment: `var` and function
-			 * declarations stay inside it instead of hoisting to the global
-			 * object. Chunks that top-level `var b={}` (the webpack/rspack module
-			 * registry) otherwise shared one global binding, so a later chunk's
-			 * initializer clobbered the earlier chunk's registry and its require
-			 * function could no longer find any factory. */
-			msc->is_var_env = true;
-			msc->stack_top = vm->stack_top;
-			vm_push_scope(vm, msc);
+			if(msc != NULL) { /* OOM: run the body in the global scope instead */
+				msc->is_block = true;
+				/* A module body is its own variable environment: `var` and function
+				 * declarations stay inside it instead of hoisting to the global
+				 * object. Chunks that top-level `var b={}` (the webpack/rspack module
+				 * registry) otherwise shared one global binding, so a later chunk's
+				 * initializer clobbered the earlier chunk's registry and its require
+				 * function could no longer find any factory. */
+				msc->is_var_env = true;
+				msc->stack_top = vm->stack_top;
+				vm_push_scope(vm, msc);
+			}
 			if(vm->cur_module == NULL) {
 				/* A top-level module <script> has no registry entry (nothing
 				 * registered its URL); give its exports an anonymous namespace
@@ -18656,6 +19440,13 @@ void vm_close(vm_t* vm) {
 	vm->gc.c_roots = NULL;
 	vm->gc.c_roots_top = 0;
 	vm->gc.c_roots_cap = 0;
+	/* Parked refcount-dead bodies (see gc_free_free_vars): no C frame can hold
+	 * an anchor at close, so hand every block back. */
+	while(vm->gc.c_dead != NULL) {
+		var_t* dv = vm->gc.c_dead;
+		vm->gc.c_dead = dv->next;
+		mario_free(dv);
+	}
 
 	// Pop and free all scopes
 	while(vm->scope_stack_top > 0) {
@@ -18745,6 +19536,8 @@ void vm_close(vm_t* vm) {
 
 void vm_reg_init(vm_t* vm, void (*func)(void*), void* data) {
 	native_init_t* it = (native_init_t*)mario_malloc(sizeof(native_init_t));
+	if(it == NULL) /* OOM: skip the hook registration */
+		return;
 	it->func = func;
 	it->data = data;
 	array_add(&vm->init_natives, it);
@@ -18752,6 +19545,8 @@ void vm_reg_init(vm_t* vm, void (*func)(void*), void* data) {
 
 void vm_reg_close(vm_t* vm, void (*func)(void*), void* data) {
 	native_init_t* it = (native_init_t*)mario_malloc(sizeof(native_init_t));
+	if(it == NULL) /* OOM: skip the hook registration */
+		return;
 	it->func = func;
 	it->data = data;
 	array_add(&vm->close_natives, it);
@@ -18764,6 +19559,8 @@ node_t* vm_reg_var(vm_t* vm, var_t* cls, const char* name, var_t* var, bool be_c
 	}
 
 	node_t* node = var_add(cls_var, name, var);
+	if(node == NULL) /* OOM: registration dropped */
+		return NULL;
 	node->be_const = be_const;
 	node->be_unenumerable = true;
 	return node;
@@ -18778,6 +19575,13 @@ static node_t* reg_native_to(vm_t* vm, var_t* target, const char* decl, native_f
 	mstr_t* arg = mstr_new("");
 
 	func_t* func = func_new();
+	if(name == NULL || arg == NULL || func == NULL) { /* OOM at registration */
+		mstr_free(name);
+		mstr_free(arg);
+		if(func != NULL)
+			func_free(func);
+		return NULL;
+	}
 	func->native = native;
 	func->data = data;
 
@@ -18832,14 +19636,17 @@ static node_t* reg_native_to(vm_t* vm, var_t* target, const char* decl, native_f
 	}
 	if(node == NULL)
 		node = var_add(cls_var, name->cstr, var);
-	node->be_unenumerable = true;
+	if(node != NULL) /* OOM may drop the insert */
+		node->be_unenumerable = true;
 	/* Remember the declared name on the function var itself so
 	 * Function.prototype.toString can render `function name() { [native code] }`
 	 * (core-js's inspectSource relies on that marker to trust natives). Hidden
 	 * and unenumerable, like V8's internal name slot. */
 	node_t* fnn = var_add(var, "@@fname", var_new_str(vm, name->cstr));
-	fnn->invisable = 1;
-	fnn->be_unenumerable = true;
+	if(fnn != NULL) { /* OOM may drop the insert */
+		fnn->invisable = 1;
+		fnn->be_unenumerable = true;
+	}
 	mstr_free(name);
 
 	return node;
@@ -18870,8 +19677,11 @@ node_t* vm_reg_native(vm_t* vm, var_t* cls, const char* decl, native_func_t nati
 
 node_t* vm_reg_static(vm_t* vm, var_t* cls, const char* decl, native_func_t native, void* data) {
 	node_t* n = vm_reg_native(vm, cls, decl, native, data);
+	if(n == NULL) /* OOM: registration dropped */
+		return NULL;
 	func_t* func = var_get_func(n->var);
-	func->is_static = true;
+	if(func != NULL)
+		func->is_static = true;
 	return n;
 }
 
@@ -18984,6 +19794,8 @@ vm_t* vm_new(compiler_func_t compiler, uint32_t var_cache_size, uint32_t load_nc
 		return NULL;
 
 	vm_t* vm = (vm_t*)mario_malloc(sizeof(vm_t));
+	if(vm == NULL) /* OOM: the embedder NULL-checks vm_new */
+		return NULL;
 	memset(vm, 0, sizeof(vm_t));
 
 	vm->compiler = compiler;
@@ -18993,6 +19805,7 @@ vm_t* vm_new(compiler_func_t compiler, uint32_t var_cache_size, uint32_t load_nc
 	vm->terminated = false;
 	vm->pc = 0;
 	vm->gc.gc_trig_var_num = GC_TRIG_VAR_NUM_DEF;
+	vm->gc.cycle_trig_num = GC_CYCLE_TRIG_DEF;
 	vm->gc.gc_pending = false;
 	vm->gc.free_var_buffer_num = FREE_VAR_BUFFER_NUM_DEF;
 	vm->stack_top = 0;

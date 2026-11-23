@@ -14,11 +14,15 @@ extern "C" {
 var_t* native_Array_constructor(vm_t* vm, var_t* env, void* data) {
     (void)data;
     var_t* this_v = get_obj(env, THIS);
+    if(this_v == NULL) /* OOM: the ctor object could not be built */
+        return NULL;
     this_v->is_array = 1;
     var_t* members = var_new_obj_no_proto(vm, NULL, NULL);
     node_t* n = var_add(this_v, "_ARRAY_", members);
-    n->be_unenumerable = 1;
-	n->invisable = 1;
+    if(n != NULL) { /* OOM may drop the store; array ops degrade to empty */
+        n->be_unenumerable = 1;
+        n->invisable = 1;
+    }
 
     /* ES23.1.1 Array(...values): a single Number argument sets the initial length
      * (ArrayCreate(len) - holes), any other single value or a list of values
@@ -44,8 +48,12 @@ var_t* native_Array_constructor(vm_t* vm, var_t* env, void* data) {
                 return this_v;
             }
             uint32_t len = (uint32_t)d;
-            for(uint32_t i = 0; i < len; ++i)
-                var_array_add(this_v, var_new(vm)); /* undefined hole */
+            for(uint32_t i = 0; i < len; ++i) {
+                var_t* hole = var_new(vm); /* undefined hole */
+                if(hole == NULL) /* OOM: stop materializing, keep the short array */
+                    break;
+                var_array_add(this_v, hole);
+            }
         }
         else {
             var_array_add(this_v, a0); /* a single non-Number is element 0 */
@@ -144,12 +152,12 @@ var_t* native_Array_toString(vm_t* vm, var_t* env, void* data) {
 		var_t* el = (n != NULL) ? n->var : NULL;
 		if(el != NULL && el->type != V_UNDEF && el->type != V_NULL) {
 			var_to_str(el, str);
-			mstr_append(ret, str->cstr);
+			mstr_append(ret, MSTR_CSTR(str));
 		}
 	}
 	mstr_free(str);
 
-	var_t* v = var_new_str(vm, ret->cstr);
+	var_t* v = var_new_str(vm, MSTR_CSTR(ret));
 	mstr_free(ret);
 	return v;
 }
@@ -180,12 +188,12 @@ var_t* native_Array_join(vm_t* vm, var_t* env, void* data) {
 		var_t* el = (n != NULL) ? n->var : NULL;
 		if(el != NULL && el->type != V_UNDEF && el->type != V_NULL) {
 			var_to_str(el, str);
-			mstr_append(ret, str->cstr);
+			mstr_append(ret, MSTR_CSTR(str));
 		}
 	}
 	mstr_free(str);
 
-	var_t* v = var_new_str(vm, ret->cstr);
+	var_t* v = var_new_str(vm, MSTR_CSTR(ret));
 	mstr_free(ret);
 	return v;
 }
@@ -224,7 +232,7 @@ var_t* native_Array_toLocaleString(vm_t* vm, var_t* env, void* data) {
 				if(r != NULL) {
 					mstr_t* rs = mstr_new("");
 					var_to_str(r, rs);
-					mstr_append(ret, rs->cstr);
+					mstr_append(ret, MSTR_CSTR(rs));
 					mstr_free(rs);
 					var_unref(r);
 					continue;
@@ -233,10 +241,10 @@ var_t* native_Array_toLocaleString(vm_t* vm, var_t* env, void* data) {
 		}
 		mstr_t* es = mstr_new("");
 		var_to_str(el, es);
-		mstr_append(ret, es->cstr);
+		mstr_append(ret, MSTR_CSTR(es));
 		mstr_free(es);
 	}
-	var_t* v = var_new_str(vm, ret->cstr);
+	var_t* v = var_new_str(vm, MSTR_CSTR(ret));
 	mstr_free(ret);
 	return v;
 }
@@ -1440,7 +1448,7 @@ static int array_sort_compare(vm_t* vm, var_t* env, var_t* f, var_t* x, var_t* y
 	mstr_t* sb = mstr_new("");
 	var_to_str(x, sa);
 	var_to_str(y, sb);
-	int cmp = strcmp(sa->cstr, sb->cstr);
+	int cmp = strcmp(MSTR_CSTR(sa), MSTR_CSTR(sb));
 	mstr_free(sa);
 	mstr_free(sb);
 	return (cmp < 0) ? -1 : ((cmp > 0) ? 1 : 0);

@@ -191,7 +191,7 @@ static var_t* json_parse_factor(vm_t* vm, lex_t *l, bool* failed) {
 	else if (l->tk==LEX_STR) {
 		mstr_t* s = mstr_new(l->tk_str->cstr);
 		lex_json_chkread(l, LEX_STR);
-		var_t* ret = var_new_str(vm, s->cstr);
+		var_t* ret = var_new_str(vm, MSTR_CSTR(s));
 		mstr_free(s);
 		return ret;
 	}

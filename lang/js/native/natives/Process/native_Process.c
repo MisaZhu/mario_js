@@ -102,7 +102,7 @@ static var_t* proc_stream_write(vm_t* vm, var_t* env, void* data) {
     if(sn != NULL && sn->var != NULL) {
         mstr_t* s = mstr_new("");
         var_to_str(sn->var, s);
-        _platform_out(s->cstr);
+        _platform_out(MSTR_CSTR(s));
         mstr_free(s);
     }
     return var_new_bool(vm, true);

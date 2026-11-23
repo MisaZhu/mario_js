@@ -38,9 +38,13 @@ var_t* native_FR_constructor(vm_t* vm, var_t* env, void* data) {
 		return this_v;
 	}
 	node_t* mn = var_add(this_v, EXOTIC_MARKER, var_new_str(vm, EXOTIC_FR));
-	mn->invisable = 1; mn->be_unenumerable = 1;
+	if(mn != NULL) {
+		mn->invisable = 1; mn->be_unenumerable = 1;
+	}
 	node_t* cn = var_add(this_v, FR_CALLBACK, cb); // var_add refs cb
-	cn->invisable = 1; cn->be_unenumerable = 1;
+	if(cn != NULL) {
+		cn->invisable = 1; cn->be_unenumerable = 1;
+	}
 	this_v->on_destroy = fr_on_destroy;
 	return this_v;
 }

@@ -99,7 +99,7 @@ static var_t* buf_toString(vm_t* vm, var_t* env, void* data) {
             mstr_add(out, "0123456789abcdef"[(bytes[i] >> 4) & 0xF]);
             mstr_add(out, "0123456789abcdef"[bytes[i] & 0xF]);
         }
-        var_t* r = var_new_str(vm, out->cstr);
+        var_t* r = var_new_str(vm, MSTR_CSTR(out));
         mstr_free(out);
         return r;
     }
@@ -114,7 +114,7 @@ static var_t* buf_toString(vm_t* vm, var_t* env, void* data) {
             mstr_add(out, (i + 1 < len) ? kB64[((b1 << 2) | (b2 >> 6)) & 0x3F] : '=');
             mstr_add(out, (i + 2 < len) ? kB64[b2 & 0x3F] : '=');
         }
-        var_t* r = var_new_str(vm, out->cstr);
+        var_t* r = var_new_str(vm, MSTR_CSTR(out));
         mstr_free(out);
         return r;
     }
@@ -123,7 +123,7 @@ static var_t* buf_toString(vm_t* vm, var_t* env, void* data) {
         mstr_t* out = mstr_new("");
         for(int64_t i = 0; i < len; ++i)
             mstr_add(out, (char)bytes[i]);
-        var_t* r = var_new_str(vm, out->cstr);
+        var_t* r = var_new_str(vm, MSTR_CSTR(out));
         mstr_free(out);
         return r;
     }
@@ -157,6 +157,7 @@ static int64_t decode_string(const char* s, const char* enc, uint8_t** out) {
     int64_t slen = (int64_t)strlen(s);
     if(enc != NULL && strcasecmp(enc, "hex") == 0) {
         uint8_t* b = (uint8_t*)mario_malloc((size_t)(slen / 2 + 1));
+        if(b == NULL) { *out = NULL; return 0; } /* OOM: empty decode */
         int64_t n = 0;
         for(int64_t i = 0; i + 1 < slen; i += 2) {
             int hi = hex_val(s[i]), lo = hex_val(s[i+1]);
@@ -168,6 +169,7 @@ static int64_t decode_string(const char* s, const char* enc, uint8_t** out) {
     }
     if(enc != NULL && strcasecmp(enc, "base64") == 0) {
         uint8_t* b = (uint8_t*)mario_malloc((size_t)(slen + 1));
+        if(b == NULL) { *out = NULL; return 0; } /* OOM: empty decode */
         int64_t n = 0; int acc = 0, bits = 0;
         for(int64_t i = 0; i < slen; ++i) {
             char c = s[i];
@@ -183,12 +185,14 @@ static int64_t decode_string(const char* s, const char* enc, uint8_t** out) {
     if(enc != NULL && (strcasecmp(enc, "latin1") == 0 || strcasecmp(enc, "binary") == 0 ||
                        strcasecmp(enc, "ascii") == 0)) {
         uint8_t* b = (uint8_t*)mario_malloc((size_t)(slen + 1));
+        if(b == NULL) { *out = NULL; return 0; } /* OOM: empty decode */
         for(int64_t i = 0; i < slen; ++i) b[i] = (uint8_t)s[i];
         *out = b;
         return slen;
     }
     /* utf8 / default: mario strings already hold UTF-8 bytes. */
     uint8_t* b = (uint8_t*)mario_malloc((size_t)(slen + 1));
+    if(b == NULL) { *out = NULL; return 0; } /* OOM: empty decode */
     memcpy(b, s, (size_t)slen);
     *out = b;
     return slen;
@@ -222,6 +226,8 @@ static var_t* buffer_from(vm_t* vm, var_t* env, void* data) {
     if(value->type == V_OBJECT) {
         uint32_t n = var_array_size(value);
         uint8_t* b = (uint8_t*)mario_malloc((size_t)(n + 1));
+        if(b == NULL) /* OOM: degrade to an empty buffer */
+            return buffer_from_bytes(vm, NULL, 0);
         for(uint32_t i = 0; i < n; ++i) {
             node_t* an = var_array_get(value, (int32_t)i);
             b[i] = (an != NULL && an->var != NULL) ? (uint8_t)var_get_int(an->var) : 0;
@@ -251,6 +257,8 @@ static var_t* buffer_alloc(vm_t* vm, var_t* env, bool zeroFill) {
         }
     }
     uint8_t* b = (uint8_t*)mario_malloc((size_t)size + 1);
+    if(b == NULL) /* OOM: the allocation degrades to a JS null result */
+        return NULL;
     memset(b, fill, (size_t)size);
     var_t* r = buffer_from_bytes(vm, b, size);
     mario_free(b);
@@ -296,7 +304,7 @@ static var_t* buffer_byteLength(vm_t* vm, var_t* env, void* data) {
     var_to_str(value, tmp);
     const char* enc = (encv != NULL && encv->type == V_STRING) ? var_get_str(encv) : "utf8";
     uint8_t* b = NULL;
-    int64_t n = decode_string(tmp->cstr, enc, &b);
+    int64_t n = decode_string(MSTR_CSTR(tmp), enc, &b);
     if(b != NULL) mario_free(b);
     mstr_free(tmp);
     return var_new_int64(vm, n);

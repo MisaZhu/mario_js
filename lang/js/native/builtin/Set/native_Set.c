@@ -111,11 +111,15 @@ var_t* native_Set_constructor(vm_t* vm, var_t* env, void* data) {
 
     var_t* sz = var_new_int(vm, 0);
     node_t* sn = var_add(this_v, "size", sz);
-    sn->be_unenumerable = 1;
+    if(sn != NULL) {
+	    sn->be_unenumerable = 1;
+    }
 
     node_t* kn = var_add(this_v, "@@keep", var_new_array(vm)); /* GC anchor, see set_sync_size */
-    kn->invisable = 1;
-    kn->be_unenumerable = 1;
+    if(kn != NULL) {
+	    kn->invisable = 1;
+	    kn->be_unenumerable = 1;
+    }
 
     var_t* iter = get_obj(env, "iterable");
     if (iter != NULL && iter->type != V_UNDEF && iter->type != V_NULL) {
@@ -276,8 +280,10 @@ var_t* native_WeakSet_constructor(vm_t* vm, var_t* env, void* data) {
     this_v->free_func = set_free;
 
     node_t* kn = var_add(this_v, "@@keep", var_new_array(vm)); /* GC anchor, see set_sync_size */
-    kn->invisable = 1;
-    kn->be_unenumerable = 1;
+    if(kn != NULL) {
+	    kn->invisable = 1;
+	    kn->be_unenumerable = 1;
+    }
     return this_v;
 }
 

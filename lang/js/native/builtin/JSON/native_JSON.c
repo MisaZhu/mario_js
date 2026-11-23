@@ -20,7 +20,7 @@ var_t* native_json_stringify(vm_t* vm, var_t* env, void* data) {
 	mstr_t* s = mstr_new("");
 	var_to_json_str(n->var, s, 0, true);
 
-	var_t* var = var_new_str(vm, s->cstr);
+	var_t* var = var_new_str(vm, MSTR_CSTR(s));
 	mstr_free(s);
 	return var;
 }
@@ -112,7 +112,7 @@ var_t* native_json_parse(vm_t* vm, var_t* env, void* data) {
 	var_t* sv = get_func_arg(env, 0);
 	mstr_t* sb = mstr_new("");
 	var_to_str(sv, sb);
-	const char* s = sb->cstr;
+	const char* s = MSTR_CSTR(sb);
 	var_t* reviver = get_func_arg(env, 1);
 	bool failed = false;
 	var_t* root = json_parse(vm, s, &failed);

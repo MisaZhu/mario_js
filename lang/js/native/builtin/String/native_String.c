@@ -165,7 +165,7 @@ var_t* native_StringConstructor(vm_t* vm, var_t* env, void* data) {
 	mstr_t* s = mstr_new("");
 	if(arg != NULL)
 		var_to_str(arg, s);
-	var_t* thisV = var_new_str(vm, s->cstr);
+	var_t* thisV = var_new_str(vm, MSTR_CSTR(s));
 	mstr_free(s);
 
 	var_instance_from(thisV, get_obj(env, THIS));
@@ -471,7 +471,7 @@ var_t* native_StringToLowerCase(vm_t* vm, var_t* env, void* data) {
 		mstr_add(result, c);
 	}
 
-	var_t* ret = var_new_str(vm, result->cstr);
+	var_t* ret = var_new_str(vm, MSTR_CSTR(result));
 	mstr_free(result);
 	var_instance_from(ret, get_obj(env, THIS));
 	return ret;
@@ -494,7 +494,7 @@ var_t* native_StringToUpperCase(vm_t* vm, var_t* env, void* data) {
 		mstr_add(result, c);
 	}
 
-	var_t* ret = var_new_str(vm, result->cstr);
+	var_t* ret = var_new_str(vm, MSTR_CSTR(result));
 	mstr_free(result);
 	var_instance_from(ret, get_obj(env, THIS));
 	return ret;
@@ -585,7 +585,7 @@ static void str_re_call_repl(vm_t* vm, var_t* env, var_t* f, mstr_t* out,
 	if(res != NULL) {
 		mstr_t* rs = mstr_new("");
 		var_to_str(res, rs);
-		mstr_append(out, rs->cstr);
+		mstr_append(out, MSTR_CSTR(rs));
 		mstr_free(rs);
 		var_unref(res);
 	}
@@ -630,7 +630,7 @@ static var_t* str_re_replace(vm_t* vm, var_t* env, var_t* re, bool force_all) {
 	if(pos < slen)
 		str_re_append_n(out, s + pos, slen - pos);
 	re_free(p);
-	var_t* ret = var_new_str(vm, out->cstr);
+	var_t* ret = var_new_str(vm, MSTR_CSTR(out));
 	mstr_free(out);
 	var_instance_from(ret, get_obj(env, THIS));
 	return ret;
@@ -828,7 +828,7 @@ var_t* native_StringReplace(vm_t* vm, var_t* env, void* data) {
 		// Insert replacement at the beginning
 		mstr_t* result = mstr_new(replacement);
 		mstr_append(result, s);
-		var_t* ret = var_new_str(vm, result->cstr);
+		var_t* ret = var_new_str(vm, MSTR_CSTR(result));
 		mstr_free(result);
 		var_instance_from(ret, get_obj(env, THIS));
 		return ret;
@@ -871,7 +871,7 @@ var_t* native_StringReplace(vm_t* vm, var_t* env, void* data) {
 		mstr_append(result, s + foundIndex + searchLen);
 	}
 
-	var_t* ret = var_new_str(vm, result->cstr);
+	var_t* ret = var_new_str(vm, MSTR_CSTR(result));
 	mstr_free(result);
 	var_instance_from(ret, get_obj(env, THIS));
 	return ret;
@@ -899,7 +899,7 @@ var_t* native_UTF8ToString(vm_t* vm, var_t* env, void* data) {
 	utf8_t* u = (utf8_t*)get_raw(env, THIS);
 	mstr_t *s = mstr_new("");
 	utf8_to_str(u, s);
-	var_t* v = var_new_str(vm, s->cstr);
+	var_t* v = var_new_str(vm, MSTR_CSTR(s));
 	mstr_free(s);
 	return v;
 }
@@ -969,7 +969,7 @@ var_t* native_UTF8ReaderRead(vm_t* vm, var_t* env, void* data) {
 	mstr_t* s = mstr_new("");
 	var_t* v;
 	if(utf8_read(ur, s)) 
-		v = var_new_str(vm, s->cstr);
+		v = var_new_str(vm, MSTR_CSTR(s));
 	else
 		v = var_new_str(vm, "");
 	mstr_free(s);
@@ -1113,7 +1113,7 @@ var_t* native_StringRepeat(vm_t* vm, var_t* env, void* data) {
 	int i;
 	for(i = 0; i < count; i++)
 		mstr_append(result, s);
-	var_t* ret = var_new_str(vm, result->cstr);
+	var_t* ret = var_new_str(vm, MSTR_CSTR(result));
 	mstr_free(result);
 	var_instance_from(ret, get_obj(env, THIS));
 	return ret;
@@ -1135,7 +1135,7 @@ static var_t* string_create_html(vm_t* vm, var_t* env, const char* tag,
 		mstr_append(out, " ");
 		mstr_append(out, attribute);
 		mstr_append(out, "=\"");
-		for(const char* p = value->cstr; *p != 0; ++p) {
+		for(const char* p = MSTR_CSTR(value); *p != 0; ++p) {
 			if(*p == '"')
 				mstr_append(out, "&quot;");
 			else
@@ -1149,7 +1149,7 @@ static var_t* string_create_html(vm_t* vm, var_t* env, const char* tag,
 	mstr_append(out, "</");
 	mstr_append(out, tag);
 	mstr_append(out, ">");
-	var_t* ret = var_new_str(vm, out->cstr);
+	var_t* ret = var_new_str(vm, MSTR_CSTR(out));
 	mstr_free(out);
 	return ret;
 }
@@ -1187,7 +1187,7 @@ var_t* native_StringPadStart(vm_t* vm, var_t* env, void* data) {
 	if(target > len)
 		str_build_pad(result, get_str(env, "padString"), target - len);
 	mstr_append(result, s);
-	var_t* ret = var_new_str(vm, result->cstr);
+	var_t* ret = var_new_str(vm, MSTR_CSTR(result));
 	mstr_free(result);
 	var_instance_from(ret, get_obj(env, THIS));
 	return ret;
@@ -1202,7 +1202,7 @@ var_t* native_StringPadEnd(vm_t* vm, var_t* env, void* data) {
 	mstr_append(result, s);
 	if(target > len)
 		str_build_pad(result, get_str(env, "padString"), target - len);
-	var_t* ret = var_new_str(vm, result->cstr);
+	var_t* ret = var_new_str(vm, MSTR_CSTR(result));
 	mstr_free(result);
 	var_instance_from(ret, get_obj(env, THIS));
 	return ret;
@@ -1232,7 +1232,7 @@ var_t* native_String_fromCodePoint(vm_t* vm, var_t* env, void* data) {
 		if(a == NULL) continue;
 		str_utf8_encode(out, (uint32_t)var_get_int(a));
 	}
-	var_t* ret = var_new_str_bin(vm, out->cstr, out->len);
+	var_t* ret = var_new_str_bin(vm, MSTR_CSTR(out), MSTR_LEN(out));
 	mstr_free(out);
 	return ret;
 }
@@ -1269,13 +1269,13 @@ var_t* native_String_raw(vm_t* vm, var_t* env, void* data) {
 			if(chunk != NULL) {
 				/* var_to_str RESETS tmp, so stringify then append. */
 				var_to_str(chunk, tmp);
-				mstr_append(out, tmp->cstr);
+				mstr_append(out, MSTR_CSTR(tmp));
 			}
 			if(i + 1 < an && i + 1 < n) {
 				var_t* sub = get_func_arg(env, i + 1);
 				if(sub != NULL) {
 					var_to_str(sub, tmp);
-					mstr_append(out, tmp->cstr);
+					mstr_append(out, MSTR_CSTR(tmp));
 				}
 			}
 		}
@@ -1283,7 +1283,7 @@ var_t* native_String_raw(vm_t* vm, var_t* env, void* data) {
 	}
 done:
 	{
-		var_t* ret = var_new_str(vm, out->cstr);
+		var_t* ret = var_new_str(vm, MSTR_CSTR(out));
 		mstr_free(out);
 		return ret;
 	}
@@ -1443,7 +1443,7 @@ var_t* native_StringNormalize(vm_t* vm, var_t* env, void* data) {
 			str_utf8_encode(out, starter);
 		}
 	}
-	var_t* ret = var_new_str(vm, out->cstr);
+	var_t* ret = var_new_str(vm, MSTR_CSTR(out));
 	mstr_free(out);
 	var_instance_from(ret, get_obj(env, THIS));
 	return ret;
@@ -1550,7 +1550,7 @@ var_t* native_StringReplaceAll(vm_t* vm, var_t* env, void* data) {
 			}
 		}
 	}
-	var_t* ret = var_new_str(vm, result->cstr);
+	var_t* ret = var_new_str(vm, MSTR_CSTR(result));
 	mstr_free(result);
 	var_instance_from(ret, get_obj(env, THIS));
 	return ret;
@@ -1721,9 +1721,9 @@ var_t* native_StringConcat(vm_t* vm, var_t* env, void* data) {
 		var_t* a = get_func_arg(env, i);
 		if(a == NULL) { mstr_append(out, "undefined"); continue; }
 		var_to_str(a, tmp);
-		mstr_append_n(out, tmp->cstr, tmp->len);
+		mstr_append_n(out, MSTR_CSTR(tmp), MSTR_LEN(tmp));
 	}
-	var_t* ret = var_new_str_bin(vm, out->cstr, out->len);
+	var_t* ret = var_new_str_bin(vm, MSTR_CSTR(out), MSTR_LEN(out));
 	mstr_free(tmp);
 	mstr_free(out);
 	var_instance_from(ret, get_obj(env, THIS));
@@ -1820,7 +1820,7 @@ static var_t* uri_encode(vm_t* vm, var_t* env, bool component) {
 			uri_append_escaped(out, *p);
 	}
 	mstr_free(s);
-	var_t* r = var_new_str(vm, out->cstr);
+	var_t* r = var_new_str(vm, MSTR_CSTR(out));
 	mstr_free(out);
 	return r;
 }
@@ -1852,7 +1852,7 @@ static var_t* uri_decode(vm_t* vm, var_t* env, bool component) {
 		}
 	}
 	mstr_free(s);
-	var_t* r = var_new_str(vm, out->cstr);
+	var_t* r = var_new_str(vm, MSTR_CSTR(out));
 	mstr_free(out);
 	return r;
 }
@@ -1899,7 +1899,7 @@ static var_t* native_escape(vm_t* vm, var_t* env, void* data) {
 		mstr_add(out, hex[cp & 0xF]);
 	}
 	mstr_free(s);
-	var_t* r = var_new_str(vm, out->cstr);
+	var_t* r = var_new_str(vm, MSTR_CSTR(out));
 	mstr_free(out);
 	return r;
 }
@@ -1937,7 +1937,7 @@ static var_t* native_unescape(vm_t* vm, var_t* env, void* data) {
 		}
 	}
 	mstr_free(s);
-	var_t* r = var_new_str(vm, out->cstr);
+	var_t* r = var_new_str(vm, MSTR_CSTR(out));
 	mstr_free(out);
 	return r;
 }
@@ -1999,7 +1999,7 @@ static var_t* native_btoa(vm_t* vm, var_t* env, void* data) {
 		mstr_add(out, (i + 2 < len) ? kB64[b2 & 0x3F] : '=');
 	}
 	mstr_free(bin);
-	var_t* r = var_new_str(vm, out->cstr);
+	var_t* r = var_new_str(vm, MSTR_CSTR(out));
 	mstr_free(out);
 	return r;
 }
@@ -2024,11 +2024,11 @@ static var_t* native_atob(vm_t* vm, var_t* env, void* data) {
 	/* Each decoded byte becomes one code unit: UTF-8-encode it so charCodeAt /
 	 * length read it back, and keep embedded 0x00 via the binary ctor. */
 	mstr_t* out = mstr_new("");
-	for(uint32_t i = 0; i < bytes->len; i++)
-		str_utf8_encode(out, (unsigned char)bytes->cstr[i]);
+	for(uint32_t i = 0; i < MSTR_LEN(bytes); i++)
+		str_utf8_encode(out, (unsigned char)MSTR_CSTR(bytes)[i]);
 	mstr_free(s);
 	mstr_free(bytes);
-	var_t* r = var_new_str_bin(vm, out->cstr, out->len);
+	var_t* r = var_new_str_bin(vm, MSTR_CSTR(out), MSTR_LEN(out));
 	mstr_free(out);
 	return r;
 }

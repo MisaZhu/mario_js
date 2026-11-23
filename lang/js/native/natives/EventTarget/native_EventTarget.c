@@ -84,7 +84,7 @@ static var_t* et_addEventListener(vm_t* vm, var_t* env, void* data) {
 	bool once = (opts != NULL && opts->type == V_OBJECT) ? et_opt_bool(opts, "once") : false;
 
 	var_t* listeners = et_listeners(vm, self);
-	var_array_add(listeners, et_new_listener(vm, type->cstr, cb, capture, once));
+	var_array_add(listeners, et_new_listener(vm, MSTR_CSTR(type), cb, capture, once));
 	mstr_free(type);
 	return NULL;
 }
@@ -119,7 +119,7 @@ static var_t* et_removeEventListener(vm_t* vm, var_t* env, void* data) {
 		var_t* rt = var_find_own_member_var(rec, "type");
 		var_t* rcb = var_find_own_member_var(rec, "cb");
 		var_t* rc = var_find_own_member_var(rec, "capture");
-		bool match = (rt != NULL && strcmp(var_get_str(rt), type->cstr) == 0) &&
+		bool match = (rt != NULL && strcmp(var_get_str(rt), MSTR_CSTR(type)) == 0) &&
 		             (rcb == cb) &&
 		             ((rc != NULL && var_get_bool(rc)) == capture);
 		if(match) continue;
@@ -164,7 +164,7 @@ void native_EventTarget_dispatch(vm_t* vm, var_t* self, var_t* ev) {
 			if(ln == NULL || ln->var == NULL) continue;
 			var_t* rec = ln->var;
 			var_t* rt = var_find_own_member_var(rec, "type");
-			if(rt == NULL || strcmp(var_get_str(rt), type->cstr) != 0) continue;
+			if(rt == NULL || strcmp(var_get_str(rt), MSTR_CSTR(type)) != 0) continue;
 			var_t* sn = var_find_own_member_var(ev, EV_STOPNOW);
 			if(sn != NULL && var_get_bool(sn)) break;
 			var_t* rcb = var_find_own_member_var(rec, "cb");
@@ -182,7 +182,7 @@ void native_EventTarget_dispatch(vm_t* vm, var_t* self, var_t* ev) {
 			var_t* ro = var_find_own_member_var(rec, "once");
 			var_t* rt = var_find_own_member_var(rec, "type");
 			bool fired_once = (ro != NULL && var_get_bool(ro)) &&
-			                  (rt != NULL && strcmp(var_get_str(rt), type->cstr) == 0);
+			                  (rt != NULL && strcmp(var_get_str(rt), MSTR_CSTR(type)) == 0);
 			if(fired_once) continue;
 			var_array_add(out, rec);
 		}
@@ -192,8 +192,8 @@ void native_EventTarget_dispatch(vm_t* vm, var_t* self, var_t* ev) {
 
 	/* on<type> handler property (e.g. signal.onabort). */
 	mstr_t* onname = mstr_new("on");
-	mstr_append(onname, type->cstr);
-	var_t* onh = var_find_member_var(self, onname->cstr);
+	mstr_append(onname, MSTR_CSTR(type));
+	var_t* onh = var_find_member_var(self, MSTR_CSTR(onname));
 	mstr_free(onname);
 	if(onh != NULL && onh->is_func) {
 		var_t* sn = var_find_own_member_var(ev, EV_STOPNOW);
@@ -229,7 +229,7 @@ static void event_init_common(vm_t* vm, var_t* self, var_t* typev, var_t* init) 
 		if(c != NULL) cancelable = var_get_bool(c);
 		if(co != NULL) composed = var_get_bool(co);
 	}
-	ev_set(self, "type", var_new_str(vm, type->cstr), false);
+	ev_set(self, "type", var_new_str(vm, MSTR_CSTR(type)), false);
 	ev_set(self, "bubbles", var_new_bool(vm, bubbles), false);
 	ev_set(self, "cancelable", var_new_bool(vm, cancelable), false);
 	ev_set(self, "composed", var_new_bool(vm, composed), false);

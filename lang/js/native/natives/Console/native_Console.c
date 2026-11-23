@@ -15,7 +15,7 @@ static mstr_t* args_to_str(var_t* args) {
 			var_to_str(n->var, str);
 			if(i > 0)
 				mstr_add(ret, ' ');
-			mstr_append(ret, str->cstr);
+			mstr_append(ret, MSTR_CSTR(str));
 		}
 	}
 	mstr_free(str);

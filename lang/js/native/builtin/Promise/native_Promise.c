@@ -108,8 +108,10 @@ static void promise_anchor(vm_t* vm, var_t* promise, promise_data* pd) {
     var_t* keep = var_find_own_member_var(promise, "@@keep");
     if (keep == NULL) {
         node_t* kn = var_add(promise, "@@keep", var_new_array(vm));
-        kn->invisable = 1;
-        kn->be_unenumerable = 1;
+        if(kn != NULL) {
+	        kn->invisable = 1;
+	        kn->be_unenumerable = 1;
+        }
         keep = kn->var;
     }
     var_t* arr = var_find_own_member_var(keep, "_ARRAY_");
@@ -357,7 +359,7 @@ var_t* native_await(vm_t* vm, var_t* env, void* data) {
                     if (getenv("MARIO_SRCMAP") != NULL) {
                         mstr_t* loc = mstr_new("");
                         if (bc_srcmap_locate(&vm->bc, vm->pc, loc))
-                            fprintf(stderr, "[awaitdbg]   at %s\n", loc->cstr);
+                            fprintf(stderr, "[awaitdbg]   at %s\n", MSTR_CSTR(loc));
                         mstr_free(loc);
                     }
                 }
@@ -631,9 +633,10 @@ static var_t* native_promise_drain(vm_t* vm, var_t* env, void* data) {
      * JS, and an explicit gc() (or a forced collection) fired from inside one
      * ignores gc_defer, sweeps these arrays and the trailing var_unref() then
      * reads freed memory. Park them as C-side roots for the whole loop. */
-    vm_push_c_root(vm, promise);
-    vm_push_c_root(vm, cbs);
-    vm_push_c_root(vm, prs);
+    int drain_rooted = 0;
+    if (vm_push_c_root(vm, promise)) drain_rooted++;
+    if (vm_push_c_root(vm, cbs)) drain_rooted++;
+    if (vm_push_c_root(vm, prs)) drain_rooted++;
     uint32_t n = var_array_size(cbs);
     if (getenv("MARIO_RSDBG") != NULL) {
         fprintf(stderr, "[rsdbg] drain promise=%p fulfilled=%d n=%u value=%p vtype=%d vrefs=%d\n",
@@ -749,7 +752,7 @@ static var_t* native_promise_drain(vm_t* vm, var_t* env, void* data) {
             var_unref(result);
         }
     }
-    vm_pop_c_roots(vm, 3);
+    vm_pop_c_roots(vm, drain_rooted);
     var_unref(cbs);
     var_unref(prs);
     promise_drain_unroot(vm, promise, pd);

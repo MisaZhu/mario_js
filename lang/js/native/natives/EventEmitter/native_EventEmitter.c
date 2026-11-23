@@ -95,7 +95,7 @@ static var_t* ee_on(vm_t* vm, var_t* env, void* data) {
 	var_t* cb = get_obj(env, "listener");
 	mstr_t* type = mstr_new("");
 	if(typev != NULL) var_to_str(typev, type);
-	ee_add(vm, self, type->cstr, cb, false, false);
+	ee_add(vm, self, MSTR_CSTR(type), cb, false, false);
 	mstr_free(type);
 	return self;   /* chainable, same convention as native_Map_set */
 }
@@ -107,7 +107,7 @@ static var_t* ee_once(vm_t* vm, var_t* env, void* data) {
 	var_t* cb = get_obj(env, "listener");
 	mstr_t* type = mstr_new("");
 	if(typev != NULL) var_to_str(typev, type);
-	ee_add(vm, self, type->cstr, cb, true, false);
+	ee_add(vm, self, MSTR_CSTR(type), cb, true, false);
 	mstr_free(type);
 	return self;
 }
@@ -119,7 +119,7 @@ static var_t* ee_prependListener(vm_t* vm, var_t* env, void* data) {
 	var_t* cb = get_obj(env, "listener");
 	mstr_t* type = mstr_new("");
 	if(typev != NULL) var_to_str(typev, type);
-	ee_add(vm, self, type->cstr, cb, false, true);
+	ee_add(vm, self, MSTR_CSTR(type), cb, false, true);
 	mstr_free(type);
 	return self;
 }
@@ -131,7 +131,7 @@ static var_t* ee_prependOnceListener(vm_t* vm, var_t* env, void* data) {
 	var_t* cb = get_obj(env, "listener");
 	mstr_t* type = mstr_new("");
 	if(typev != NULL) var_to_str(typev, type);
-	ee_add(vm, self, type->cstr, cb, true, true);
+	ee_add(vm, self, MSTR_CSTR(type), cb, true, true);
 	mstr_free(type);
 	return self;
 }
@@ -148,7 +148,7 @@ static var_t* ee_off(vm_t* vm, var_t* env, void* data) {
 	if(store == NULL) return self;
 	mstr_t* type = mstr_new("");
 	if(typev != NULL) var_to_str(typev, type);
-	var_t* arr = var_find_own_member_var(store, type->cstr);
+	var_t* arr = var_find_own_member_var(store, MSTR_CSTR(type));
 	if(arr != NULL) {
 		bool removed = false;
 		vm->gc.gc_defer++;
@@ -162,7 +162,7 @@ static var_t* ee_off(vm_t* vm, var_t* env, void* data) {
 			if(!removed && rcb == cb) { removed = true; continue; }  /* skip first match */
 			var_array_add(out, rec);
 		}
-		node_t* pn = var_find_own_member(store, type->cstr);
+		node_t* pn = var_find_own_member(store, MSTR_CSTR(type));
 		if(pn != NULL) node_replace(pn, out);
 		else var_unref(out);
 		vm->gc.gc_defer--;
@@ -183,7 +183,7 @@ static var_t* ee_removeAllListeners(vm_t* vm, var_t* env, void* data) {
 	if(typev != NULL && typev->type != V_UNDEF) {
 		mstr_t* type = mstr_new("");
 		var_to_str(typev, type);
-		node_t* pn = var_find_own_member(store, type->cstr);
+		node_t* pn = var_find_own_member(store, MSTR_CSTR(type));
 		if(pn != NULL) node_replace(pn, var_new_array(vm));
 		mstr_free(type);
 	} else {
@@ -214,7 +214,7 @@ static var_t* ee_emit(vm_t* vm, var_t* env, void* data) {
 	var_array_reverse(callargs);
 
 	var_t* store = var_find_own_member_var(self, EE_EVENTS);
-	var_t* arr = (store != NULL) ? var_find_own_member_var(store, type->cstr) : NULL;
+	var_t* arr = (store != NULL) ? var_find_own_member_var(store, MSTR_CSTR(type)) : NULL;
 	bool had = (arr != NULL && var_array_size(arr) > 0);
 
 	if(had) {
@@ -241,7 +241,7 @@ static var_t* ee_emit(vm_t* vm, var_t* env, void* data) {
 		/* Post-pass: drop the `once` records that just fired. Re-fetch arr since a
 		 * listener may have replaced it. */
 		vm->gc.gc_defer++;
-		arr = var_find_own_member_var(store, type->cstr);
+		arr = var_find_own_member_var(store, MSTR_CSTR(type));
 		if(arr != NULL) {
 			var_t* out = var_new_array(vm);
 			uint32_t m = var_array_size(arr);
@@ -252,7 +252,7 @@ static var_t* ee_emit(vm_t* vm, var_t* env, void* data) {
 				if(ov != NULL && var_get_bool(ov)) continue;   /* fired once -> drop */
 				var_array_add(out, ln->var);
 			}
-			node_t* pn = var_find_own_member(store, type->cstr);
+			node_t* pn = var_find_own_member(store, MSTR_CSTR(type));
 			if(pn != NULL) node_replace(pn, out);
 			else var_unref(out);
 		}
@@ -272,7 +272,7 @@ static var_t* ee_listenerCount(vm_t* vm, var_t* env, void* data) {
 	mstr_t* type = mstr_new("");
 	if(typev != NULL) var_to_str(typev, type);
 	var_t* store = var_find_own_member_var(self, EE_EVENTS);
-	var_t* arr = (store != NULL) ? var_find_own_member_var(store, type->cstr) : NULL;
+	var_t* arr = (store != NULL) ? var_find_own_member_var(store, MSTR_CSTR(type)) : NULL;
 	int cnt = (arr != NULL) ? (int)var_array_size(arr) : 0;
 	mstr_free(type);
 	return var_new_int(vm, cnt);
@@ -288,7 +288,7 @@ static var_t* ee_listeners(vm_t* vm, var_t* env, void* data) {
 	mstr_t* type = mstr_new("");
 	if(typev != NULL) var_to_str(typev, type);
 	var_t* store = var_find_own_member_var(self, EE_EVENTS);
-	var_t* arr = (store != NULL) ? var_find_own_member_var(store, type->cstr) : NULL;
+	var_t* arr = (store != NULL) ? var_find_own_member_var(store, MSTR_CSTR(type)) : NULL;
 	if(arr != NULL) {
 		uint32_t n = var_array_size(arr);
 		for(uint32_t i = 0; i < n; ++i) {

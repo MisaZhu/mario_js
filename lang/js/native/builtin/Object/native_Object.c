@@ -140,7 +140,7 @@ var_t* native_Object_hasOwnProperty(vm_t* vm, var_t* env, void* data) {
 	if(name == NULL && keyv != NULL) {
 		mstr_t* ks = mstr_new("");
 		var_to_str(keyv, ks);
-		name = ks->cstr;
+		name = MSTR_CSTR(ks);
 		node_t* n = var_find_own_member(obj, name);
 		bool hit = (n != NULL && n->be_inherited == 0 && n->invisable == 0);
 		if(!hit)
@@ -476,10 +476,10 @@ var_t* native_Object_groupBy(vm_t* vm, var_t* env, void* data) {
 		mstr_t* ks = mstr_new("");
 		if(kv != NULL)
 			var_to_str(kv, ks);
-		var_t* bucket = var_find_own_member_var(ret, ks->cstr);
+		var_t* bucket = var_find_own_member_var(ret, MSTR_CSTR(ks));
 		if(bucket == NULL) {
 			bucket = var_new_array(vm);
-			var_add(ret, ks->cstr, bucket);
+			var_add(ret, MSTR_CSTR(ks), bucket);
 		}
 		var_array_add(bucket, el != NULL ? el : var_new(vm));
 		mstr_free(ks);

@@ -121,7 +121,7 @@ var_t* native_BigInt_toString(vm_t* vm, var_t* env, void* data) {
 	else { tmp = bn_new(); b = tmp; }
 	mstr_t* s = mstr_new("");
 	bn_to_mstr(b, radix, s);
-	var_t* ret = var_new_str(vm, s->cstr);
+	var_t* ret = var_new_str(vm, MSTR_CSTR(s));
 	mstr_free(s);
 	if(tmp) bn_free(tmp);
 	return ret;
@@ -148,7 +148,7 @@ var_t* native_BigInt_toLocaleString(vm_t* vm, var_t* env, void* data) {
 	else { tmp = bn_new(); b = tmp; }
 	mstr_t* s = mstr_new("");
 	bn_to_mstr(b, 10, s);
-	var_t* ret = var_new_str(vm, s->cstr);
+	var_t* ret = var_new_str(vm, MSTR_CSTR(s));
 	mstr_free(s);
 	if(tmp) bn_free(tmp);
 	return ret;

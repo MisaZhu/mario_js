@@ -376,8 +376,10 @@ var_t* native_DateConstructor(vm_t* vm, var_t* env, void* data) {
 	}
 
 	node_t* tn = var_add(obj, "@@t", var_new_int64(vm, ms));
-	tn->be_unenumerable = 1;
-	tn->invisable = 1;
+	if(tn != NULL) {
+		tn->be_unenumerable = 1;
+		tn->invisable = 1;
+	}
 	/* Derived classes (`class D extends Date {}`): the construction path builds a
 	 * fresh object here and the derived instance (the ambient `this`) keeps its own
 	 * prototype - mario does NOT replace `this` with the base-constructed object
@@ -393,8 +395,10 @@ var_t* native_DateConstructor(vm_t* vm, var_t* env, void* data) {
 			var_set_int64(sn->var, ms);
 		else {
 			sn = var_add(thisV, "@@t", var_new_int64(vm, ms));
-			sn->be_unenumerable = 1;
-			sn->invisable = 1;
+			if(sn != NULL) {
+				sn->be_unenumerable = 1;
+				sn->invisable = 1;
+			}
 		}
 	}
 	return obj;
@@ -784,7 +788,7 @@ var_t* native_date_parse(vm_t* vm, var_t* env, void* data) {
 	mstr_t* s = mstr_new("");
 	var_to_str(a, s);
 	int64_t ms = 0;
-	bool ok = date_parse_ms(s->cstr, &ms);
+	bool ok = date_parse_ms(MSTR_CSTR(s), &ms);
 	mstr_free(s);
 	if(!ok)
 		return var_new_float64(vm, NAN);

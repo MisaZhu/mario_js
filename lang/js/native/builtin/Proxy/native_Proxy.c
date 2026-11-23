@@ -33,13 +33,21 @@ static bool proxy_check_args(vm_t* vm, var_t* target, var_t* handler) {
  * var_add refs target and handler, so the proxy owns a reference to each. */
 static void proxy_setup(vm_t* vm, var_t* obj, var_t* target, var_t* handler) {
 	node_t* mn = var_add(obj, EXOTIC_MARKER, var_new_str(vm, EXOTIC_PROXY));
-	mn->invisable = 1; mn->be_unenumerable = 1;
+	if(mn != NULL) {
+		mn->invisable = 1; mn->be_unenumerable = 1;
+	}
 	node_t* tn = var_add(obj, PROXY_TARGET, target);
-	tn->invisable = 1; tn->be_unenumerable = 1;
+	if(tn != NULL) {
+		tn->invisable = 1; tn->be_unenumerable = 1;
+	}
 	node_t* hn = var_add(obj, PROXY_HANDLER, handler);
-	hn->invisable = 1; hn->be_unenumerable = 1;
+	if(hn != NULL) {
+		hn->invisable = 1; hn->be_unenumerable = 1;
+	}
 	node_t* rn = var_add(obj, PROXY_REVOKED, var_new_bool(vm, false));
-	rn->invisable = 1; rn->be_unenumerable = 1;
+	if(rn != NULL) {
+		rn->invisable = 1; rn->be_unenumerable = 1;
+	}
 }
 
 /* new Proxy(target, handler): `this` is the freshly allocated instance (with the

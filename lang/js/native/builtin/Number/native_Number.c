@@ -376,7 +376,7 @@ var_t* native_Number_toFixed(vm_t* vm, var_t* env, void* data) {
 		 * fixed expansion. ToString already carries the sign, so no prefix here. */
 		mstr_t* ms = mstr_new("");
 		var_to_str(v, ms);
-		var_t* r = var_new_str(vm, ms->cstr);
+		var_t* r = var_new_str(vm, MSTR_CSTR(ms));
 		mstr_free(ms);
 		return r;
 	}
@@ -477,7 +477,7 @@ var_t* native_Number_toPrecision(vm_t* vm, var_t* env, void* data) {
 	if(p == NULL || p->type == V_UNDEF) {
 		mstr_t* s = mstr_new("");
 		var_to_str(v, s);
-		var_t* r = var_new_str(vm, s->cstr);
+		var_t* r = var_new_str(vm, MSTR_CSTR(s));
 		mstr_free(s);
 		return r;
 	}
@@ -641,7 +641,7 @@ var_t* native_Number_parseInt(vm_t* vm, var_t* env, void* data) {
 		return var_new_float64(vm, NAN);
 	mstr_t* s = mstr_new("");
 	var_to_str(v, s);
-	const char* p = s->cstr;
+	const char* p = MSTR_CSTR(s);
 	while(*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\v' || *p == '\f')
 		p++;
 	int radix = 0;
@@ -672,7 +672,7 @@ var_t* native_Number_parseFloat(vm_t* vm, var_t* env, void* data) {
 		return var_new_float64(vm, NAN);
 	mstr_t* s = mstr_new("");
 	var_to_str(v, s);
-	const char* p = s->cstr;
+	const char* p = MSTR_CSTR(s);
 	while(*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\v' || *p == '\f')
 		p++;
 	char* end = NULL;
