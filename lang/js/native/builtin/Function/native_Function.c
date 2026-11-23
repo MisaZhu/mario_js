@@ -332,11 +332,19 @@ static var_t* native_Function_constructor(vm_t* vm, var_t* env, void* data) {
 		vm_throw_type_native(vm, "SyntaxError", "malformed Function constructor body");
 		return var_new(vm);
 	}
-	var_t* fn = var_find_own_member_var(vm->root, FNCTOR_KEY);
+	var_t* fn = var_take_own_member(vm->root, FNCTOR_KEY);
 	if(fn == NULL) return var_new(vm);
-	var_ref(fn);                       // root across the delete below
-	var_delete_own_member(vm->root, FNCTOR_KEY);
-	return fn;                         // one ref handed to the caller
+	/* refs==0 baseline, exactly like bind's fresh function: func_call adopts it
+	 * (var_ref / refs-- / push). The old var_ref()+delete pair returned an OWNED
+	 * ref on top of that contract, leaving every generated function with one
+	 * phantom external ref - the cycle collector read it as externally rooted
+	 * and never reclaimed the func<->prototype pair (20k `new Function` calls
+	 * accumulated ~80MB). Dropping the transferred node ref here is a plain
+	 * decrement, NOT var_unref: at refs==0 that would free the body before
+	 * func_call adopts it; the never_gc list keeps a refs==0 baseline readable
+	 * (same discipline as every var_new result). */
+	fn->refs--;
+	return fn;
 }
 
 void reg_native_Function(vm_t* vm) {

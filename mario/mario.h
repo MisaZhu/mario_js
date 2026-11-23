@@ -224,6 +224,18 @@ typedef struct st_bytecode {
 	 * materializes the source slice into func_t.src_text. */
 	struct st_bc_fspan_ent { PC entry_pc; uint32_t src; uint32_t start; uint32_t end; } *fspans;
 	uint32_t            fspans_size, fspans_max;
+	/* Compile dedup: byte-identical sources reuse the code already in code_buf
+	 * instead of appending a fresh copy. Long-lived pages compile the same
+	 * snippet over and over (eval / new Function / inline on* handlers /
+	 * JSONP-style dynamic injections); without dedup every compile grows
+	 * code_buf AND bc.srcs (a full private source copy) until vm_close.
+	 * Open-addressed table keyed by (FNV-1a hash, length); a hit is verified
+	 * with strcmp against srcs[src] before reuse. src_pcs is parallel to srcs
+	 * and records the first pc each source compiled to (see bc_srcmap_begin). */
+	struct st_bc_dedup_ent { uint64_t hash; uint32_t len; uint32_t src; bool is_module; } *dedup;
+	uint32_t            dedup_size, dedup_cap;   /* cap 0 = table not allocated */
+	PC                 *src_pcs;
+	uint32_t            src_pcs_cap;
 	/* Set by the compiler when the source just compiled carries top-level
 	 * import/export syntax, i.e. the chunk is an ES module body: vm_load_run
 	 * then gives it its own module scope (and an export namespace) so two
@@ -1438,6 +1450,12 @@ bool        var_typedarray_set_at(vm_t* vm, var_t* ta, int64_t idx, var_t* val);
 /* Member removal / presence used by the `delete` and `in` operators (and by
  * Reflect.deleteProperty / Reflect.has in Phase 5). */
 bool        var_delete_own_member(var_t* obj, const char* name);
+/* Remove an own member and TRANSFER the node's reference to the caller (the
+ * node itself is freed, its var is not unref'd). Returns the member var still
+ * carrying the ref the member node held, or NULL when absent. The caller owns
+ * that ref and must eventually var_unref it (or hand it to a consumer that
+ * adopts it, e.g. drop it to the refs==0 native-return baseline first). */
+var_t*      var_take_own_member(var_t* obj, const char* name);
 bool        var_has_member(var_t* obj, const char* name); // own + prototype chain
 
 /* Proxy trap plumbing (Phase 5), implemented in mario.c next to the exotic

@@ -1860,6 +1860,10 @@ void bc_init(bytecode_t* bc) {
 	bc->srcmap_on = true; /* Error.stack V8 frames need line/col at throw time */
 	bc->fspans = NULL;
 	bc->fspans_size = bc->fspans_max = 0;
+	bc->dedup = NULL;
+	bc->dedup_size = bc->dedup_cap = 0;
+	bc->src_pcs = NULL;
+	bc->src_pcs_cap = 0;
 }
 
 /* Length of the script source func_def last measured (see the toString span
@@ -1884,6 +1888,14 @@ void bc_release(bytecode_t* bc) {
 		mario_free(bc->fspans);
 	bc->fspans = NULL;
 	bc->fspans_size = bc->fspans_max = 0;
+	if(bc->dedup != NULL)
+		mario_free(bc->dedup);
+	bc->dedup = NULL;
+	bc->dedup_size = bc->dedup_cap = 0;
+	if(bc->src_pcs != NULL)
+		mario_free(bc->src_pcs);
+	bc->src_pcs = NULL;
+	bc->src_pcs_cap = 0;
 	array_clean(&bc->srcs, NULL);
 	array_clean(&bc->src_urls, mario_free);
 }
@@ -1920,6 +1932,24 @@ void bc_srcmap_begin(bytecode_t* bc, const char* src) {
 	memcpy(copy, src, n + 1);
 	array_add(&bc->srcs, copy);
 	bc->srcmap_cur = bc->srcs.size - 1;
+	/* First pc of this source's code (cindex before the compile emits anything):
+	 * vm_load's compile dedup reuses it to re-run a byte-identical source without
+	 * appending a second copy. OOM keeps the cap short - dedup guards on it. */
+	if(bc->srcs.size > bc->src_pcs_cap) {
+		uint32_t ncap = bc->src_pcs_cap == 0 ? 64 : bc->src_pcs_cap * 2;
+		while(ncap < bc->srcs.size) ncap *= 2;
+		PC* np = (PC*)mario_malloc(ncap * sizeof(PC));
+		if(np != NULL) {
+			if(bc->src_pcs != NULL) {
+				memcpy(np, bc->src_pcs, bc->src_pcs_cap * sizeof(PC));
+				mario_free(bc->src_pcs);
+			}
+			bc->src_pcs = np;
+			bc->src_pcs_cap = ncap;
+		}
+	}
+	if(bc->srcmap_cur < bc->src_pcs_cap)
+		bc->src_pcs[bc->srcmap_cur] = bc->cindex;
 	/* Parallel URL slot for V8 Error.stack frames; the browser sets the current
 	 * script URL via mario_set_script_url before each vm_load_run. */
 	const char* u = (g_cur_script_url != NULL) ? g_cur_script_url : "";
@@ -3181,6 +3211,25 @@ bool var_delete_own_member(var_t* obj, const char* name) {
 	if(node != NULL)
 		node_free(node);
 	return true;
+}
+
+/* Delete-with-transfer: the member node dies but its var keeps the node's
+ * reference, handed to the caller (see mario.h). Used by the Function
+ * constructor to move the freshly compiled wrapper binding out of the global
+ * object without the extra var_ref/delete pair that over-retained every
+ * generated function by one phantom external ref. */
+var_t* var_take_own_member(var_t* obj, const char* name) {
+	if(obj == NULL || name == NULL)
+		return NULL;
+	node_t* node = (node_t*)hash_map_remove(&obj->children, name);
+	if(node == NULL)
+		return NULL;
+	var_t* v = node->var;
+	if(!var_empty(v))
+		load_ncache_invalidate(v->vm, node);
+	node->var = NULL; /* detach: node_free must not unref the transferred var */
+	node_free(node);
+	return v;
 }
 
 /* `name in obj`: own OR prototype-chain presence. Arrays keep their elements in
@@ -19293,16 +19342,118 @@ bool vm_run(vm_t* vm) {
 	return rv;
 }
 
+/* ---- compile dedup (see bytecode_t.dedup in mario.h) ----
+ * FNV-1a over the source bytes; the length comes out alongside so a table hit
+ * can reject different-length collisions before the verifying strcmp. */
+static uint64_t bc_src_hash(const char* s, uint32_t* len_out) {
+	uint64_t h = 14695981039346656037ULL;
+	uint32_t n = 0;
+	for(const unsigned char* p = (const unsigned char*)s; *p != 0; ++p, ++n) {
+		h ^= (uint64_t)*p;
+		h *= 1099511628211ULL;
+	}
+	*len_out = n;
+	return h;
+}
+
+/* Empty slot sentinel: hash==0 && len==0. Registered sources always have
+ * len > 0 (empty scripts are never dedup'd), so the sentinel is unambiguous. */
+static bool bc_dedup_find(bytecode_t* bc, const char* s, uint64_t hash, uint32_t len,
+		PC* pc_out, bool* mod_out) {
+	if(bc->dedup_cap == 0 || len == 0)
+		return false;
+	uint32_t mask = bc->dedup_cap - 1;
+	uint32_t i = (uint32_t)hash & mask;
+	for(uint32_t probe = 0; probe < bc->dedup_cap; ++probe) {
+		struct st_bc_dedup_ent* e = &bc->dedup[(i + probe) & mask];
+		if(e->hash == 0 && e->len == 0)
+			return false;
+		if(e->hash == hash && e->len == len &&
+		   e->src < (uint32_t)bc->srcs.size && e->src < bc->src_pcs_cap) {
+			const char* prev = (const char*)array_get(&bc->srcs, e->src);
+			if(prev != NULL && strcmp(prev, s) == 0) {
+				*pc_out = bc->src_pcs[e->src];
+				*mod_out = e->is_module;
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+static void bc_dedup_add(bytecode_t* bc, uint64_t hash, uint32_t len,
+		uint32_t src_idx, bool is_module) {
+	if(len == 0)
+		return;
+	if(bc->dedup_size * 4 >= bc->dedup_cap * 3) { /* grow past 75% load */
+		uint32_t ncap = bc->dedup_cap == 0 ? 128 : bc->dedup_cap * 2;
+		struct st_bc_dedup_ent* nd =
+			(struct st_bc_dedup_ent*)mario_malloc(ncap * sizeof(*nd));
+		if(nd == NULL) /* OOM: dedup is an optimization, drop the record */
+			return;
+		memset(nd, 0, ncap * sizeof(*nd));
+		uint32_t nmask = ncap - 1;
+		for(uint32_t i = 0; i < bc->dedup_cap; ++i) {
+			struct st_bc_dedup_ent* e = &bc->dedup[i];
+			if(e->hash == 0 && e->len == 0)
+				continue;
+			uint32_t j = (uint32_t)e->hash & nmask;
+			while(!(nd[j].hash == 0 && nd[j].len == 0))
+				j = (j + 1) & nmask;
+			nd[j] = *e;
+		}
+		if(bc->dedup != NULL)
+			mario_free(bc->dedup);
+		bc->dedup = nd;
+		bc->dedup_cap = ncap;
+	}
+	uint32_t mask = bc->dedup_cap - 1;
+	uint32_t i = (uint32_t)hash & mask;
+	while(!(bc->dedup[i].hash == 0 && bc->dedup[i].len == 0))
+		i = (i + 1) & mask;
+	bc->dedup[i].hash = hash;
+	bc->dedup[i].len = len;
+	bc->dedup[i].src = src_idx;
+	bc->dedup[i].is_module = is_module;
+	bc->dedup_size++;
+}
+
 bool vm_load(vm_t* vm, const char* s) {
 	if(vm->compiler == NULL)
 		return false;
 
 	vm->bc.chunk_is_module = false;   /* the coming compile re-decides it */
+	/* Byte-identical source already compiled: re-run its code instead of
+	 * appending another copy to code_buf and another private source text to
+	 * bc.srcs. String-table indices and jump targets are bc-relative, so the
+	 * old code executes exactly like a freshly compiled twin. This is what
+	 * bounds memory on pages that eval / new Function / compile inline on*
+	 * handlers with the same body over and over. */
+	uint32_t slen = 0;
+	uint64_t shash = bc_src_hash(s, &slen);
+	PC dpc = 0;
+	bool dmod = false;
+	/* MARIO_NODEDUP=1 disables the dedup (A/B escape hatch, resolved once). */
+	static int nodedup = -1;
+	if(nodedup < 0) nodedup = (getenv("MARIO_NODEDUP") != NULL) ? 1 : 0;
+	if(!nodedup && bc_dedup_find(&vm->bc, s, shash, slen, &dpc, &dmod)) {
+		vm->pc = dpc;
+		vm->bc.chunk_is_module = dmod;
+		return true;
+	}
+	uint32_t srcs_before = vm->bc.srcs.size;
 	if(vm->bc.cindex > 0) {
 		//vm->bc.cindex--;
 		vm->pc = vm->bc.cindex;
 	}
-	return vm->compiler(&vm->bc, s);
+	bool ok = vm->compiler(&vm->bc, s);
+	/* Register only when THIS compile reserved a fresh srcs slot (a failed
+	 * compile may have appended partial code; srcmap_cur would be stale). */
+	if(ok && vm->bc.srcs.size == srcs_before + 1 &&
+	   vm->bc.srcmap_cur == vm->bc.srcs.size - 1 &&
+	   vm->bc.srcmap_cur < vm->bc.src_pcs_cap)
+		bc_dedup_add(&vm->bc, shash, slen, vm->bc.srcmap_cur, vm->bc.chunk_is_module);
+	return ok;
 }
 
 bool vm_load_run(vm_t* vm, const char* s) {
