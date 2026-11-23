@@ -297,6 +297,30 @@ section("5. Spread & object rest/spread");
     const o3 = { ...o1, a: 99 };
     eq(o3.a, 99, "later key overrides spread value");
 
+    // OwnPropertyKeys: array indices first, then string keys in insertion order.
+    const ordered = { appId: "44670", params: "x", 2: "two", 1: "one" };
+    deepEq(Object.keys(ordered), ["1", "2", "appId", "params"], "Object.keys uses OwnPropertyKeys order");
+    deepEq(Object.values(ordered), ["one", "two", "44670", "x"], "Object.values follows key order");
+    deepEq(Object.entries(ordered), [["1", "one"], ["2", "two"], ["appId", "44670"], ["params", "x"]], "Object.entries follows key order");
+    const forInOrder = [];
+    for (const forInKey in ordered) { forInOrder.push(forInKey); }
+    deepEq(forInOrder, ["1", "2", "appId", "params"], "for-in follows own property order");
+    eq(JSON.stringify(ordered), '{"1":"one","2":"two","appId":"44670","params":"x"}', "JSON.stringify preserves property order");
+    const parsedOrder = JSON.parse('{"appId":"44670","params":"x"}');
+    eq(JSON.stringify(parsedOrder), '{"appId":"44670","params":"x"}', "JSON.parse/stringify round-trip preserves insertion order");
+    const assignedOrder = Object.assign({}, { appId: "44670" }, { params: "x" });
+    eq(JSON.stringify(assignedOrder), '{"appId":"44670","params":"x"}', "Object.assign copies in source key order");
+    const spreadOrder = { appId: "44670", ...{ params: "x" } };
+    eq(JSON.stringify(spreadOrder), '{"appId":"44670","params":"x"}', "object spread copies in source key order");
+    const spreadSourceOrder = { appId: "44670", params: "x" };
+    eq(JSON.stringify({ ...spreadSourceOrder }), '{"appId":"44670","params":"x"}', "object spread preserves source order");
+    const mutatedOrder = { alpha: 1, beta: 2 };
+    mutatedOrder.alpha = 3;
+    delete mutatedOrder.beta;
+    mutatedOrder.gamma = 4;
+    mutatedOrder.beta = 5;
+    deepEq(Object.keys(mutatedOrder), ["alpha", "gamma", "beta"], "overwrite keeps position and delete/re-add moves key to end");
+
     // Object rest in destructuring
     const { a, ...restObj } = { a: 1, b: 2, c: 3 };
     eq(a, 1, "object rest: extracted a");
@@ -1436,6 +1460,12 @@ section("15. async / await");
         eq("hello".charAt(9), "", "charAt out of range yields ''");
         eq("abc".charCodeAt(0), 97, "charCodeAt(0) === 97");
         ok(Number.isNaN("abc".charCodeAt(9)), "charCodeAt out of range is NaN");
+        var utf16Astral = "A\uD841\uDE07B";
+        eq(utf16Astral.length, 4, "astral literal occupies two UTF-16 code units");
+        eq(utf16Astral.charCodeAt(1), 0xD841, "charCodeAt returns the high surrogate");
+        eq(utf16Astral.charCodeAt(2), 0xDE07, "charCodeAt returns the low surrogate");
+        eq(utf16Astral.charCodeAt(3), 66, "charCodeAt advances past an astral pair");
+        ok(Number.isNaN(utf16Astral.charCodeAt(4)), "charCodeAt after astral pair checks the UTF-16 length");
         eq("abcdef".substring(1, 3), "bc", "substring(1,3)");
         eq("abcdef".substring(3, 1), "bc", "substring swaps when start > end");
         eq("abcdef".substring(-1, 2), "ab", "substring clamps negatives to 0");
@@ -2245,6 +2275,48 @@ section("15. async / await");
         throws(() => Atomics.load(i32, 99), "an out-of-range index throws RangeError");
         throws(() => Atomics.load(i32, -1), "a negative index throws RangeError");
         throws(() => Atomics.load({}, 0), "a non-TypedArray first argument throws TypeError");
+    })();
+
+    // =========================================================================
+    // for-in whose RHS is a comma expression: identifiers in ANY operand must
+    // resolve through the scope chain and must never become phantom hoisted
+    // locals of the loop's function. JD index.chunk.js mounts a component with
+    // `for(var Je in (0,kt.reportNewExpose)(Re),(0,kt.reportSpmExposeWithBatch)
+    // (..))`; the prescan used to collect `kt` from the 2nd operand as a
+    // hoisted local, shadowing the closure binding with undefined and throwing
+    // "value is not a function!" at render (whole-page error boundary).
+    (function () {
+        var kt = { f: function () { return { a: 1 }; }, v: 7 };
+        function secondOperand() {
+            var out = 0;
+            for (var j in {}, (0, kt.f)()) { out++; }
+            return out + kt.v;
+        }
+        eq(secondOperand(), 8, "for-in comma RHS: free var in 2nd operand resolves");
+        function firstOperand() {
+            var out = 0;
+            for (var j in (0, kt.f)(), {}) { out++; }
+            return out + kt.v;
+        }
+        eq(firstOperand(), 7, "for-in comma RHS: free var in 1st operand resolves");
+        function loopVarStillBinds() {
+            var seen = [];
+            for (var k in { p: 1, q: 2 }) { seen.push(k); }
+            return seen.join(",");
+        }
+        eq(loopVarStillBinds(), "p,q", "for-in loop variable still binds keys");
+        function declAfterForIn() {
+            for (var j in {}, (0, kt.f)()) {}
+            var kt2 = 1;
+            return kt2 + kt.v;
+        }
+        eq(declAfterForIn(), 8, "var declarators after a for-in still hoist");
+        function letLoopVar() {
+            var n = 0;
+            for (let k in { p: 1 }) { n++; }
+            return n + kt.v;
+        }
+        eq(letLoopVar(), 8, "for(let ... in comma RHS) free var resolves");
     })();
 
     // =========================================================================

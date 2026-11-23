@@ -8,16 +8,33 @@ extern "C" {
 
 #define CLS_ERROR "Error"
 
-/* Set a string member on an error instance. var_find_member() resolves the
- * per-instance member the same way the original Error constructor did (which
- * yields distinct messages per instance); var_add() creates an own member when
- * none is reachable. var_add() refs the value, so the fresh var is owned. */
+/* Set an OWN string member on an error instance. This must NEVER walk the
+ * prototype chain: the previous var_find_member() resolved an inherited member
+ * (Error.prototype.name/.message, or a user-installed Error.prototype.stack
+ * accessor) and var_set_str()'d IT. Besides mutating the shared prototype, that
+ * was memory-unsafe on an accessor wrapper var - such a var carries is_func=1,
+ * free_func=func_free and a func_t* value; var_set_str() mario_free()'d the
+ * func_t as raw bytes (leaking its internals) and pointed value at a string
+ * buffer while leaving is_func/free_func set. That corrupt var was then read as
+ * a func_t on the next prototype walk (heap-buffer-overflow in
+ * find_in_proto_chain_ex: rf0->is_static read past the 9-byte "Error: x" string)
+ * and its string bytes were freed as pointers at teardown (malloc: pointer
+ * being freed was not allocated). Own-member writes also match the spec/V8:
+ * every error carries its own message/name/stack. */
 static void error_set_str_member(var_t* thisV, const char* key, const char* val) {
-	node_t* n = var_find_member(thisV, key);
-	if(n != NULL && n->var != NULL)
-		var_set_str(n->var, val);
-	else
-		var_add(thisV, key, var_new_str(thisV->vm, val));
+	node_t* n = var_find_own_member(thisV, key);
+	if(n != NULL && n->var != NULL && !n->var->is_func && !n->var->is_class) {
+		var_set_str(n->var, val);   /* update the instance's own plain member in place */
+		return;
+	}
+	/* No own member, or the own member is a func/accessor: install a fresh own
+	 * string. var_add()/node_replace() tears down any displaced func var through
+	 * the correct func_free path (never a raw mario_free of the func_t). Error
+	 * message/name/stack are non-enumerable in V8, so mark the node to keep
+	 * for..in / Object.keys / JSON.stringify clean. */
+	node_t* nn = var_add(thisV, key, var_new_str(thisV->vm, val != NULL ? val : ""));
+	if(nn != NULL)
+		nn->be_unenumerable = 1;
 }
 
 /* ---- V8 structured stack traces (Error.prepareStackTrace / captureStackTrace) ----

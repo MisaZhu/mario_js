@@ -7,9 +7,6 @@ extern "C" {
 
 /** Object */
 
-/* Defined below (ES6 statics section); forward-declared for native_Object_keys. */
-static void var_own_keys(vm_t* vm, var_t* var, var_t* keys_var, bool enum_only);
-
 /* From native_Symbol.c: resolve a "@@S:..." property-key string back to its
  * canonical symbol object (borrowed ref). Used by getOwnPropertySymbols. */
 extern var_t* symbol_lookup_by_key(vm_t* vm, const char* key);
@@ -93,6 +90,35 @@ var_t* native_Object_getPrototypeOf(vm_t* vm, var_t* env, void* data) {
 	return (res != NULL) ? res : var_new_null(vm);
 }
 
+/* True when `name` is a canonical array-index string ("0","1",..) that falls
+ * within the element range of a TypedArray (backing buffer) or a real Array
+ * ("_ARRAY_" member) - neither stores elements as named own members, so
+ * var_find_own_member alone misses them. */
+static bool obj_has_index_key(vm_t* vm, var_t* obj, const char* name) {
+	(void)vm;
+	if(obj == NULL || name == NULL || name[0] < '0' || name[0] > '9')
+		return false;
+	const char* p = name;
+	if(p[0] == '0' && p[1] != '\0')
+		return false;   /* leading zero is not a canonical index */
+	int64_t idx = 0;
+	for(; *p; ++p) {
+		if(*p < '0' || *p > '9')
+			return false;
+		idx = idx * 10 + (*p - '0');
+		if(idx > (int64_t)4294967294LL)
+			return false;
+	}
+	if(var_is_typedarray(obj)) {
+		var_t* lenv = var_find_own_member_var(obj, "length");
+		int64_t len = (lenv != NULL) ? var_get_int64(lenv) : 0;
+		return idx < len;
+	}
+	if(obj->is_array)
+		return (uint64_t)idx < (uint64_t)var_array_size(obj);
+	return false;
+}
+
 var_t* native_Object_hasOwnProperty(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* obj = get_obj(env, THIS);
@@ -114,44 +140,38 @@ var_t* native_Object_hasOwnProperty(vm_t* vm, var_t* env, void* data) {
 	if(name == NULL && keyv != NULL) {
 		mstr_t* ks = mstr_new("");
 		var_to_str(keyv, ks);
-		node_t* n = var_find_own_member(obj, ks->cstr);
+		name = ks->cstr;
+		node_t* n = var_find_own_member(obj, name);
 		bool hit = (n != NULL && n->be_inherited == 0 && n->invisable == 0);
+		if(!hit)
+			hit = obj_has_index_key(vm, obj, name);
 		mstr_free(ks);
 		return var_new_bool(vm, hit);
 	}
 	node_t* n = var_find_own_member(obj, name);
-	return var_new_bool(vm, (n != NULL && n->be_inherited == 0 && n->invisable == 0));
+	if(n != NULL && n->be_inherited == 0 && n->invisable == 0)
+		return var_new_bool(vm, true);
+	/* TypedArray elements live in the backing buffer and real Array elements under
+	 * the "_ARRAY_" member, so neither is a named own member. Without this,
+	 * `u8.hasOwnProperty(0)` and `[1,2,3].hasOwnProperty(0)` were false while a
+	 * browser reports true (indices ARE own properties). Check the index range. */
+	return var_new_bool(vm, obj_has_index_key(vm, obj, name));
 }
 
 // Callback function for hash_map_iterate in var_properties_num
 typedef struct {
 	vm_t* vm;
-	var_t* var;
 	var_t* keys_var;
-	bool enumerable;
 	uint32_t num;
 	hash_map_t* seen_properties; // hash map for quickly checking whether a property already exists
 } properties_callback_data;
 
-static void properties_callback(const char* key, void* value, void* user_data) {
-	properties_callback_data* data = (properties_callback_data*)user_data;
-	node_t* node = (node_t*)value;
-	
-	if(node != NULL && 
-		node->be_inherited == 0 &&
-		node->invisable == 0 &&
-		node->var != data->keys_var) {
-		if(!node->be_unenumerable || !data->enumerable) {
-			// use the hash map to quickly check whether the property already exists
-			if(hash_map_get(data->seen_properties, node->name) == NULL) {
-				// add the property to the hash map, marking it as seen
-				hash_map_add(data->seen_properties, node->name, (void*)"");
-				// add the property name to the result array
-				var_array_add(data->keys_var, var_new_str(data->vm, node->name));
-				data->num++;
-			}
-		}
-	}
+static void properties_add_key(properties_callback_data* data, const char* key) {
+	if(key == NULL || hash_map_get(data->seen_properties, key) != NULL)
+		return;
+	hash_map_add(data->seen_properties, key, (void*)"");
+	var_array_add(data->keys_var, var_new_str(data->vm, key));
+	data->num++;
 }
 
 static inline uint32_t var_properties_num(vm_t* vm, var_t* var, var_t* keys_var, bool enumerable) {
@@ -164,44 +184,33 @@ static inline uint32_t var_properties_num(vm_t* vm, var_t* var, var_t* keys_var,
 	 * until the result array is fully built and handed back to the caller. */
 	vm->gc.gc_defer++;
 
-	// create and initialize the hash map used to quickly check whether a property already exists
 	hash_map_t* seen_properties = hash_map_new();
-	
-	// Use hash_map_iterate to traverse the properties
 	properties_callback_data data;
 	data.vm = vm;
-	data.var = var;
 	data.keys_var = keys_var;
-	data.enumerable = enumerable;
 	data.num = 0;
 	data.seen_properties = seen_properties;
-	
-	hash_map_iterate(&var->children, properties_callback, &data);
-	num += data.num;
 
-	// handle properties along the prototype chain
-	var_t* proto = var_get_prototype(var);
-	while(proto != NULL) {
-		// pass the same hash map on the recursive call so no property across the whole prototype chain is duplicated
-		properties_callback_data proto_data;
-		proto_data.vm = vm;
-		proto_data.var = proto;
-		proto_data.keys_var = keys_var;
-		proto_data.enumerable = enumerable;
-		proto_data.num = 0;
-		proto_data.seen_properties = seen_properties;
-		
-		hash_map_iterate(&proto->children, properties_callback, &proto_data);
-		num += proto_data.num;
-		
-		proto = var_get_prototype(proto);
+	/* for-in starts with the object's standard OwnPropertyKeys order, then
+	 * visits each prototype with the same per-object ordering and duplicate
+	 * suppression. Array indices are included by var_own_keys itself. */
+	var_t* current = var;
+	while(current != NULL) {
+		var_t* own = var_new_array(vm);
+		var_own_keys(vm, current, own, enumerable);
+		uint32_t own_count = var_array_size(own);
+		for(uint32_t i = 0; i < own_count; i++) {
+			var_t* key = var_array_get_var(own, (int32_t)i);
+			if(key != NULL && key->type == V_STRING)
+				properties_add_key(&data, var_get_str(key));
+		}
+		var_unref(own);
+		current = var_get_prototype(current);
 	}
-	
-	// free the hash map
+	num = data.num;
+
 	hash_map_free(seen_properties, mario_free, NULL);
-
 	vm->gc.gc_defer--;
-
 	return num;
 }
 
@@ -227,14 +236,6 @@ var_t* native_enum_keys(vm_t* vm, var_t* env, void* data) {
 	var_t* keys = var_new_array(vm);
 	if(obj != NULL && obj->type == V_OBJECT) {
 		vm->gc.gc_defer++; /* keys unrooted while we build it */
-		if(obj->is_array) {
-			uint32_t n = var_array_size(obj);
-			for(uint32_t i = 0; i < n; i++) {
-				char buf[24];
-				snprintf(buf, sizeof(buf), "%u", i);
-				var_array_add(keys, var_new_str(vm, buf));
-			}
-		}
 		var_properties_num(vm, obj, keys, true);
 		vm->gc.gc_defer--;
 	}
@@ -290,71 +291,6 @@ var_t* native_Object_defineProperty(vm_t* vm, var_t* env, void* data) {
 }
 
 /* ---- ES6+ Object statics ---- */
-
-/* Collect OWN property keys (no prototype chain). When enum_only is true,
- * non-enumerable members are skipped. */
-typedef struct {
-	vm_t* vm;
-	var_t* keys_var;
-	bool enum_only;
-	hash_map_t* seen;
-} own_keys_cb_data;
-
-static void own_keys_cb(const char* key, void* value, void* user_data) {
-	(void)key;
-	own_keys_cb_data* d = (own_keys_cb_data*)user_data;
-	node_t* node = (node_t*)value;
-	if(node == NULL || node->be_inherited || node->invisable)
-		return;
-	if(d->enum_only && node->be_unenumerable)
-		return;
-	if(hash_map_get(d->seen, node->name) != NULL)
-		return;
-	hash_map_add(d->seen, node->name, (void*)"");
-	var_array_add(d->keys_var, var_new_str(d->vm, node->name));
-}
-
-static void var_own_keys(vm_t* vm, var_t* var, var_t* keys_var, bool enum_only) {
-	if(var == NULL)
-		return;
-	if(var_is_proxy(var)) {
-		/* ownKeys trap (or the default forward to the target). proxy_own_keys returns
-		 * a fresh refs=0 array; copy its elements into the caller's keys_var. */
-		var_t* pk = proxy_own_keys(vm, var, false, enum_only);
-		if(pk != NULL) {
-			uint32_t sz = var_array_size(pk), j;
-			vm->gc.gc_defer++;   // keys_var/pk unrooted while we build
-			for(j = 0; j < sz; j++) {
-				var_t* kv = var_array_get_var(pk, (int32_t)j);
-				var_array_add(keys_var, (kv != NULL) ? kv : var_new(vm));
-			}
-			vm->gc.gc_defer--;
-			var_unref(pk);
-		}
-		return;
-	}
-	vm->gc.gc_defer++; // keys_var is unrooted here; see var_properties_num().
-	hash_map_t* seen = hash_map_new();
-	own_keys_cb_data d;
-	d.vm = vm;
-	d.keys_var = keys_var;
-	d.enum_only = enum_only;
-	d.seen = seen;
-	/* Array elements live in the nested _ARRAY_ store (keys "0","1",...), so an
-	 * array's own keys are its indices - enumerate those first (Object.keys([a,b])
-	 * must yield ["0","1"], which core-js structuredClone's key walk relies on).
-	 * Then walk the outer children for any custom own props (a.foo = 1); _ARRAY_
-	 * itself is invisible and skipped by own_keys_cb, and `length` is computed on
-	 * the fly (no own member). Mirrors own_keys_default()/Reflect.ownKeys. */
-	if(var->is_array) {
-		var_t* cont = var_find_own_member_var(var, "_ARRAY_");
-		if(cont != NULL)
-			hash_map_iterate(&cont->children, own_keys_cb, &d);
-	}
-	hash_map_iterate(&var->children, own_keys_cb, &d);
-	hash_map_free(seen, mario_free, NULL);
-	vm->gc.gc_defer--;
-}
 
 static bool var_is_nan(var_t* v) {
 	if(v == NULL || v->value == NULL)
@@ -631,9 +567,12 @@ var_t* native_Object_getOwnPropertyDescriptor(vm_t* vm, var_t* env, void* data) 
 	(void)data;
 	var_t* obj = get_func_arg(env, 0);
 	var_t* keyv = get_func_arg(env, 1);
-	const char* name = get_func_arg_str(env, 1);
-	if(name == NULL && var_is_symbol(keyv))
-		name = var_symbol_key(keyv);
+	/* A symbol argument stringifies to "" through var_get_str (value==NULL), so
+	 * the old name==NULL symbol fallback never fired: gOPD(obj, sym) searched
+	 * "" and always returned undefined. babel _objectSpread2 then read
+	 * .enumerable off undefined for every getOwnPropertySymbols key (taobao
+	 * Uncaught under Chrome-parity strict get). Resolve symbols first. */
+	const char* name = var_is_symbol(keyv) ? var_symbol_key(keyv) : get_func_arg_str(env, 1);
 	if(obj == NULL)
 		return var_new(vm);
 	if(var_is_proxy(obj)) {
@@ -701,7 +640,10 @@ var_t* native_Object_getOwnPropertyDescriptor(vm_t* vm, var_t* env, void* data) 
 var_t* native_Object_hasOwn(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* obj = get_func_arg(env, 0);
-	const char* name = get_func_arg_str(env, 1);
+	var_t* keyv = get_func_arg(env, 1);
+	/* Same symbol-key resolution as getOwnPropertyDescriptor: var_get_str on a
+	 * symbol yields "", which would never match the SYMKEY node name. */
+	const char* name = var_is_symbol(keyv) ? var_symbol_key(keyv) : get_func_arg_str(env, 1);
 	node_t* n = (obj != NULL) ? var_find_own_member(obj, name) : NULL;
 	return var_new_bool(vm, n != NULL && n->be_inherited == 0 && n->invisable == 0);
 }

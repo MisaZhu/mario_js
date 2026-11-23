@@ -133,7 +133,18 @@ var_t* native_Function_apply(vm_t* vm, var_t* env, void* data) {
 var_t* native_Function_bind(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* target = get_obj(env, THIS);
-	if(!var_is_callable(target)) {
+	/* Spec: bind's first step is IsCallable(Target), and a CLASS value is callable
+	 * (it has a [[Call]] that throws when invoked without `new`). Every mario
+	 * builtin (String/Array/Number/Function/...) is a class wrapper (is_class set,
+	 * is_func clear), so `Array.bind(x)` / core-js `uncurryThis(builtinMethod)`
+	 * must NOT throw here. var_is_callable deliberately excludes is_class (a script
+	 * class can't be *called* without new), so accept the class target explicitly -
+	 * the same idiom native_Array.c uses for a comparator. The real call-vs-new
+	 * semantics stay enforced downstream in mario_apply_var (a native class is
+	 * callable; a script class only throws when the bound fn is invoked without
+	 * `new`, and `new boundClass()` routes through @new.target). */
+	bool class_target = target != NULL && target->is_class && !target->is_func && !var_is_proxy(target);
+	if(!var_is_callable(target) && !class_target) {
 		/* DIAG (temp): who binds a non-callable - taobao fireyejs
 		 * `t=v(s,l[20],null,3)` threw this; print the target and the
 		 * scope-chain binding of `l` (incl. its [20] slot). */
@@ -283,7 +294,8 @@ return NULL;
  * function in the GLOBAL scope (ES 19.2.1.1.1 - CreatedAsyncFunction/Function
  * always use the global env, never the caller's), with the leading arguments
  * as parameter names and the last as the body. Reuses the eval compile path
- * (vm_load_run_native) by assigning the function expression into a hidden
+ * (vm_load_run_native_sloppy, which forces global-sloppy eval per ES even
+ * when the caller is strict) by assigning the function expression into a hidden
  * global, reading it back, then deleting the key so no foreign global leaks
  * into fingerprint scans. '@' is not a legal identifier start here, so use a
  * $_-prefixed collision-proof key. */
@@ -303,7 +315,7 @@ static var_t* native_Function_constructor(vm_t* vm, var_t* env, void* data) {
 	mstr_append(code, "\n};");
 	extern void js_compile_set_quiet(bool quiet);
 	js_compile_set_quiet(true);
-	bool ok = vm_load_run_native(vm, code->cstr);
+	bool ok = vm_load_run_native_sloppy(vm, code->cstr);
 	js_compile_set_quiet(false);
 	mstr_free(code);
 	if(!ok) {

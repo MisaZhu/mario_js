@@ -705,20 +705,19 @@ static var_t* native_promise_drain(vm_t* vm, var_t* env, void* data) {
             result = (value != NULL) ? var_ref(value) : NULL;   /* identity */
         }
         if (npd != NULL) {
-            /* ES result adoption: a reaction that returns a promise/thenable which
-             * has NOT settled yet must leave the chained promise PENDING and adopt
-             * it (link our resolve/reject into it), so it settles with the inner
-             * promise's eventual value. Unwrapping synchronously instead read
-             * pd->value==NULL and fulfilled the chained promise with null - this
-             * is the nested-adoption shape every async/await chain compiles to. */
+            /* ES result adoption applies to pending AND already-settled promises.
+             * In particular, `catch(e => Promise.reject(e))` must keep the chained
+             * promise rejected. Unwrapping an already-rejected result and then
+             * unconditionally fulfilling np turned its reason into a successful
+             * value, so `await` resumed normally (taobao tbnav then called forEach
+             * on the raw error response). Route every promise/thenable through the
+             * same resolve/reject adoption path; an already-settled input simply
+             * schedules that settlement as a microtask. */
             if (result != NULL && result != np &&
-                (is_promise(vm, result) || is_thenable(vm, result))) {
-                promise_data* rpd0 = is_promise(vm, result) ? (promise_data*)result->value : NULL;
-                bool is_pending = (rpd0 == NULL) || (rpd0->state == PROMISE_STATE_PENDING);
-                if (is_pending && promise_adopt_thenable(vm, np, result)) {
-                    var_unref(result);
-                    continue;   /* np stays PENDING until `result` settles */
-                }
+                (is_promise(vm, result) || is_thenable(vm, result)) &&
+                promise_adopt_thenable(vm, np, result)) {
+                var_unref(result);
+                continue;   /* np adopts result's eventual fulfillment OR rejection */
             }
             if (getenv("MARIO_DRAINDBG") != NULL && result != NULL) {
                 promise_data* rpd0 = is_promise(vm, result) ? (promise_data*)result->value : NULL;

@@ -31,18 +31,6 @@ var_t* native_json_stringify(vm_t* vm, var_t* env, void* data) {
  * client references / undefined / promises / Maps. Without reviver support the
  * flight body tree stays literal strings and no client component ever resolves
  * (head-hint rows still apply, so the page looks half-rendered). */
-typedef struct {
-	vm_t*	vm;
-	var_t*	keys;	/* array of own enumerable key strings for one object */
-} json_key_ctx_t;
-
-static void json_collect_own_key(const char* key, void* value, void* user_data) {
-	json_key_ctx_t* c = (json_key_ctx_t*)user_data;
-	node_t* nd = (node_t*)value;
-	if(key == NULL || key[0] == 0) return;
-	if(nd == NULL || nd->be_unenumerable) return;
-	var_array_add(c->keys, var_new_str(c->vm, key));
-}
 
 /* read holder[name]: arrays address elements by decimal index, objects by member */
 static var_t* json_holder_get(vm_t* vm, var_t* holder, const char* name) {
@@ -83,9 +71,7 @@ static var_t* json_walk(vm_t* vm, var_t* holder, const char* name, var_t* revive
 				var_array_add(keys, var_new_str(vm, buf));
 			}
 		} else {
-			json_key_ctx_t c;
-			c.vm = vm; c.keys = keys;
-			hash_map_iterate(&value->children, json_collect_own_key, &c);
+			var_own_keys(vm, value, keys, true);
 		}
 		uint32_t kn = var_array_size(keys);
 		for(uint32_t i = 0; i < kn; i++) {
@@ -115,13 +101,38 @@ static var_t* json_walk(vm_t* vm, var_t* holder, const char* name, var_t* revive
 var_t* native_json_parse(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 
-	const char* s = get_str(env, "str");
+	/* ES 25.5.1.1: JSON.parse(text) first ToString(text). Reading the raw member
+	 * string (get_str) yielded "" for null/number/boolean args, so JSON.parse(null)
+	 * - the universal `JSON.parse(localStorage.getItem(k))` idiom for a missing key,
+	 * getItem returns null - parsed an empty string and threw SyntaxError, aborting
+	 * web.wechat.com's Angular bootstrap (appController never finished, the login QR
+	 * panel never rendered). Coerce per spec: null->"null", 123->"123", true->"true".
+	 * (JSON `null` still parses to undefined - the deliberate lenient deviation in
+	 * json_parse_factor - but it no longer THROWS, which is what blocked the page.) */
+	var_t* sv = get_func_arg(env, 0);
+	mstr_t* sb = mstr_new("");
+	var_to_str(sv, sb);
+	const char* s = sb->cstr;
 	var_t* reviver = get_func_arg(env, 1);
-	var_t* root = json_parse(vm, s);
+	bool failed = false;
+	var_t* root = json_parse(vm, s, &failed);
 	if(getenv("MARIO_JSONDBG") != NULL)
-		fprintf(stderr, "[jsondbg] parse len=%u reviver=%d head=%.40s\n",
+		fprintf(stderr, "[jsondbg] parse len=%u reviver=%d failed=%d head=%.40s\n",
 			(unsigned)(s ? strlen(s) : 0), (reviver != NULL && reviver->is_func) ? 1 : 0,
-			(s != NULL) ? s : "");
+			failed ? 1 : 0, (s != NULL) ? s : "");
+	if(failed) {
+		/* ES 25.5.1.1: JSON.parse MUST throw a SyntaxError for malformed JSON.
+		 * Silently returning undefined broke JD's h5st signer, which does
+		 * try{JSON.parse(algo)}catch(e){eval/algo-fallback}: the catch never ran,
+		 * so the algorithm function was lost, cactus was retried 6x and the
+		 * signature was invalid -> api.m.jd.com 403 -> home-page gray blocks. */
+		if(root != NULL) var_unref(root);
+		vm_throw_type_native(vm, "SyntaxError",
+			"Unexpected token in JSON: %.40s", (s != NULL) ? s : "");
+		mstr_free(sb);
+		return var_new(vm);
+	}
+	mstr_free(sb);
 	if(root == NULL) root = var_new(vm);
 	if(reviver == NULL || !reviver->is_func) return root;
 

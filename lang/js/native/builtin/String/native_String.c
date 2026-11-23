@@ -1119,6 +1119,65 @@ var_t* native_StringRepeat(vm_t* vm, var_t* env, void* data) {
 	return ret;
 }
 
+/* Annex B HTML wrappers are still feature-detected by core-js bundles. */
+static var_t* string_create_html(vm_t* vm, var_t* env, const char* tag,
+	const char* attribute, const char* arg_name) {
+	const char* s = get_str(env, THIS);
+	mstr_t* out = mstr_new("<");
+	mstr_append(out, tag);
+	if(attribute != NULL) {
+		mstr_t* value = mstr_new("");
+		var_t* arg = get_obj(env, arg_name);
+		if(arg != NULL)
+			var_to_str(arg, value);
+		else
+			mstr_append(value, "undefined");
+		mstr_append(out, " ");
+		mstr_append(out, attribute);
+		mstr_append(out, "=\"");
+		for(const char* p = value->cstr; *p != 0; ++p) {
+			if(*p == '"')
+				mstr_append(out, "&quot;");
+			else
+				mstr_add(out, *p);
+		}
+		mstr_append(out, "\"");
+		mstr_free(value);
+	}
+	mstr_append(out, ">");
+	mstr_append(out, s);
+	mstr_append(out, "</");
+	mstr_append(out, tag);
+	mstr_append(out, ">");
+	var_t* ret = var_new_str(vm, out->cstr);
+	mstr_free(out);
+	return ret;
+}
+
+var_t* native_StringHTML(vm_t* vm, var_t* env, void* data) {
+	return string_create_html(vm, env, (const char*)data, NULL, NULL);
+}
+
+var_t* native_StringAnchor(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	return string_create_html(vm, env, "a", "name", "name");
+}
+
+var_t* native_StringFontcolor(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	return string_create_html(vm, env, "font", "color", "color");
+}
+
+var_t* native_StringFontsize(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	return string_create_html(vm, env, "font", "size", "size");
+}
+
+var_t* native_StringLink(vm_t* vm, var_t* env, void* data) {
+	(void)data;
+	return string_create_html(vm, env, "a", "href", "url");
+}
+
 var_t* native_StringPadStart(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	const char* s = get_str(env, THIS);
@@ -1497,6 +1556,44 @@ var_t* native_StringReplaceAll(vm_t* vm, var_t* env, void* data) {
 	return ret;
 }
 
+/* charAt forward cursor for big non-ASCII strings. charAt(idx) walks idx code
+ * points from byte 0, so scanning a byte-buffer string with `S.charAt(c++)` is
+ * O(n^2) (see var_str_units in mario.c - same CHAOS VM loader loop). Per string
+ * this remembers the last position reached (code-point index -> byte offset);
+ * a call at or beyond it resumes there, so a forward scan is O(1) amortized,
+ * while a backward jump simply restarts from 0 as before. Keyed by (vm, var
+ * pointer, incarnation serial, buffer, size) - compared only, never
+ * dereferenced. Small / boxed strings do not use it. */
+#define STR_CURSOR_N   4
+#define STR_CURSOR_MIN 256
+typedef struct {
+	var_t*          vp;
+	struct st_vm*   vm;
+	uint64_t        serial;
+	const char*     s;
+	uint32_t        bytes;
+	int             idx;
+	uint32_t        off;
+} str_cursor_t;
+static str_cursor_t s_str_cursor[STR_CURSOR_N];
+static uint32_t s_str_cursor_next = 0;
+
+static str_cursor_t* str_cursor(var_t* tv, const char* s, uint32_t bytes) {
+	if(tv == NULL || tv->type != V_STRING || bytes < STR_CURSOR_MIN)
+		return NULL;
+	int i;
+	for(i = 0; i < STR_CURSOR_N; i++) {
+		str_cursor_t* c = &s_str_cursor[i];
+		if(c->vp == tv && c->vm == tv->vm && c->serial == tv->serial &&
+				c->s == s && c->bytes == bytes)
+			return c;
+	}
+	str_cursor_t* c = &s_str_cursor[s_str_cursor_next++ % STR_CURSOR_N];
+	c->vp = tv; c->vm = tv->vm; c->serial = tv->serial;
+	c->s = s; c->bytes = bytes; c->idx = 0; c->off = 0;
+	return c;
+}
+
 /* String.prototype.charAt(index): the single character at index as a string, or
  * "" when index is out of range or negative. Walks code points like at(); unlike
  * at() a negative index is NOT counted from the end (spec: it yields ""). */
@@ -1511,14 +1608,27 @@ var_t* native_StringCharAt(vm_t* vm, var_t* env, void* data) {
 		var_instance_from(e, get_obj(env, THIS));
 		return e;
 	}
+	/* Pure-ASCII fast path (same memo as charCodeAt / s[i] / .length): the
+	 * character at idx is the single byte s[idx], O(1). Without it a charAt
+	 * scan loop over a big string is O(n^2) - the Tencent CHAOS VM base64-decodes
+	 * its ~200KB program text via S.charAt(B++). Boxed strings fall through to
+	 * the UTF-8 walk; big non-ASCII ones resume from the cursor above. */
+	if(var_str_is_ascii(get_obj(env, THIS))) {
+		var_t* r = ((uint32_t)idx < bytes) ? var_new_str_bin(vm, s + idx, 1) : var_new_str(vm, "");
+		var_instance_from(r, get_obj(env, THIS));
+		return r;
+	}
+	str_cursor_t* cur = str_cursor(get_obj(env, THIS), s, bytes);
 	const char* p = s;
 	int i = 0;
+	if(cur != NULL && cur->idx <= idx) { i = cur->idx; p = s + cur->off; }
 	while(p < end && i < idx) { str_utf8_decode(&p); i++; }
 	if(p >= end) {
 		var_t* e = var_new_str(vm, "");
 		var_instance_from(e, get_obj(env, THIS));
 		return e;
 	}
+	if(cur != NULL) { cur->idx = i; cur->off = (uint32_t)(p - s); }
 	const char* start = p;
 	str_utf8_decode(&p);
 	var_t* ret = var_new_str_bin(vm, start, (uint32_t)(p - start));
@@ -1526,10 +1636,9 @@ var_t* native_StringCharAt(vm_t* vm, var_t* env, void* data) {
 	return ret;
 }
 
-/* String.prototype.charCodeAt(index): numeric code of the character at index, or
- * NaN when out of range. NOTE: Mario stores text as UTF-8 and decodes whole code
- * points, so for astral characters this returns the code point rather than a
- * UTF-16 surrogate half; identical to spec for the BMP. */
+/* String.prototype.charCodeAt(index): return the UTF-16 code unit at index.
+ * Mario stores text as UTF-8, so an astral code point occupies two indices:
+ * the first yields its high surrogate and the second its low surrogate. */
 var_t* native_StringCharCodeAt(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	const char* s = NULL;
@@ -1537,14 +1646,37 @@ var_t* native_StringCharCodeAt(vm_t* vm, var_t* env, void* data) {
 	int idx = get_int(env, "index");
 	if(idx < 0)
 		return var_new_float(vm, NAN);
+	/* Pure-ASCII fast path: code-unit index == byte index, so charCodeAt(idx) is
+	 * just s[idx] (O(1)). ASCII-ness is memoized per string var (var_str_is_ascii),
+	 * so a tight loop over a large string - a JS MD5's str2binl walking a 240KB
+	 * canvas-fingerprint string - is O(n) total instead of O(n^2) (which hung the
+	 * JD pc-tk.js VM). Boxed / non-ASCII strings fall through to the UTF-8 walk. */
+	if(var_str_is_ascii(get_obj(env, THIS))) {
+		if((uint32_t)idx < bytes)
+			return var_new_int(vm, (int)(unsigned char)s[idx]);
+		return var_new_float(vm, NAN);
+	}
 	const char* p = s;
 	const char* end = s + bytes;
 	int i = 0;
-	while(p < end && i < idx) { str_utf8_decode(&p); i++; }
-	if(p >= end)
-		return var_new_float(vm, NAN);
-	uint32_t cp = str_utf8_decode(&p);
-	return var_new_int(vm, (int)cp);
+	while(p < end) {
+		uint32_t cp = str_utf8_decode(&p);
+		if(cp > 0xFFFF) {
+			uint32_t v = cp - 0x10000;
+			if(i == idx)
+				return var_new_int(vm, (int)(0xD800 + (v >> 10)));
+			if(i + 1 == idx)
+				return var_new_int(vm, (int)(0xDC00 + (v & 0x3FF)));
+			i += 2;
+		} else {
+			if(i == idx)
+				return var_new_int(vm, (int)cp);
+			i++;
+		}
+		if(i > idx)
+			break;
+	}
+	return var_new_float(vm, NAN);
 }
 
 /* String.prototype.substring(start[, end]): like slice but with substring's
@@ -1713,13 +1845,8 @@ static var_t* uri_decode(vm_t* vm, var_t* env, bool component) {
 			}
 			p += 3;
 		}
-		else if(p[0] == '+' && component) {
-			/* Only the component decoder treats '+' as a space, matching what
-			 * application/x-www-form-urlencoded producers emit. */
-			mstr_add(out, ' ');
-			p += 1;
-		}
 		else {
+			/* Unlike form decoding, decodeURIComponent preserves '+'. */
 			mstr_add(out, *p);
 			p += 1;
 		}
@@ -1936,6 +2063,19 @@ void reg_native_String(vm_t* vm) {
 	vm_reg_native(vm, cls, "endsWith(searchString, endPosition)#1", native_StringEndsWith, NULL); 
 	vm_reg_native(vm, cls, "includes(searchString, position)#1", native_StringIncludes, NULL); 
 	vm_reg_native(vm, cls, "repeat(count)", native_StringRepeat, NULL); 
+	vm_reg_native(vm, cls, "anchor(name)", native_StringAnchor, NULL);
+	vm_reg_native(vm, cls, "big()", native_StringHTML, (void*)"big");
+	vm_reg_native(vm, cls, "blink()", native_StringHTML, (void*)"blink");
+	vm_reg_native(vm, cls, "bold()", native_StringHTML, (void*)"b");
+	vm_reg_native(vm, cls, "fixed()", native_StringHTML, (void*)"tt");
+	vm_reg_native(vm, cls, "fontcolor(color)", native_StringFontcolor, NULL);
+	vm_reg_native(vm, cls, "fontsize(size)", native_StringFontsize, NULL);
+	vm_reg_native(vm, cls, "italics()", native_StringHTML, (void*)"i");
+	vm_reg_native(vm, cls, "link(url)", native_StringLink, NULL);
+	vm_reg_native(vm, cls, "small()", native_StringHTML, (void*)"small");
+	vm_reg_native(vm, cls, "strike()", native_StringHTML, (void*)"strike");
+	vm_reg_native(vm, cls, "sub()", native_StringHTML, (void*)"sub");
+	vm_reg_native(vm, cls, "sup()", native_StringHTML, (void*)"sup");
 	vm_reg_native(vm, cls, "padStart(targetLength, padString)#1", native_StringPadStart, NULL); 
 	vm_reg_native(vm, cls, "padEnd(targetLength, padString)#1", native_StringPadEnd, NULL); 
 	vm_reg_native(vm, cls, "codePointAt(position)", native_StringCodePointAt, NULL); 

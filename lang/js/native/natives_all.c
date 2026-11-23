@@ -111,6 +111,13 @@ void reg_all_natives(vm_t* vm) {
 	vm->builtin_vars.var_BigInt = vm_load_var(vm, "BigInt", false);
 	vm->builtin_vars.var_Error = vm_load_var(vm, "Error", false);
 	vm->builtin_vars.var_Array = vm_load_var(vm, "Array", false);
+	/* The global object is an ordinary object at the top of the global environment,
+	 * not a null-prototype dictionary. It is allocated in vm_new before Object's
+	 * native class exists, so link it now that Object.prototype is available.
+	 * Without this link named calls happened to work through find_func's legacy
+	 * Object.prototype fallback, while computed calls such as globalThis[key]()
+	 * with key === "toString" resolved to undefined and aborted fireye's VMP. */
+	var_set_prototype(vm->root, var_get_prototype(vm->builtin_vars.var_Object));
 	/* reg_natives must run before load_basic_classes: Console/TextEncoder/URL/
 	 * EventTarget and the rest of the platform classes now live here, and
 	 * load_basic_classes instantiates `console` via new_obj(vm, "Console", 0).

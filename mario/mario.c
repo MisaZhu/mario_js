@@ -1738,7 +1738,15 @@ void bc_init(bytecode_t* bc) {
 	bc->fspans_size = bc->fspans_max = 0;
 }
 
+/* Length of the script source func_def last measured (see the toString span
+ * lookup there). A recorded source is immutable and is only ever freed by
+ * bc_release, which drops the entry, so a match is always current. */
+static const char* s_fspan_src = NULL;
+static size_t      s_fspan_src_len = 0;
+
 void bc_release(bytecode_t* bc) {
+	if(bc->srcs.size > 0)
+		s_fspan_src = NULL;
 	array_clean(&bc->mstr_table, NULL);
 	hash_map_clean(&bc->mstr_index, mario_free, NULL);
 	bc->jmptgt_marked = 0;
@@ -2098,10 +2106,11 @@ PC bc_add_instr(bytecode_t* bc, PC anchor, opr_code_t op, PC target) {
  *
  *  The scan is incremental: code_buf[jmptgt_marked .. cindex) is new since the
  *  last call, and a jump emitted in an earlier slice is already final (its
- *  operand is patched before the next script is appended). Every word is
- *  inspected, including literal payload words - a payload that happens to look
- *  like a jump only marks one extra slot, which merely disables a peephole
- *  there. Missing a real target is impossible, so the elisions stay sound. */
+ *  operand is patched before the next script is appended). Literal payload
+ *  words are skipped (see the INSTR_INT/INT64/FLOAT64 guard below): decoding
+ *  one as an instruction could compute a bogus target and OR INSTR_OPT_JMPTGT
+ *  into another immediate's payload, corrupting the literal. Missing a real
+ *  target is impossible, so the elisions stay sound. */
 void bc_mark_jump_targets(bytecode_t* bc) {
 	if(bc == NULL || bc->code_buf == NULL)
 		return;
@@ -2116,6 +2125,18 @@ void bc_mark_jump_targets(bytecode_t* bc) {
 		opr_code_t op = OP(ins);
 		uint32_t off = OFF(ins);
 		bool fwd;
+		/* Literal payload words MUST NOT be treated as instruction heads. A wide
+		 * int/float immediate rides along as raw value words after its opcode; if
+		 * we decode one as an instruction, its OP field can collide with a jump
+		 * opcode, we compute a bogus target and OR INSTR_OPT_JMPTGT into whatever
+		 * word sits there -- which may be ANOTHER immediate's payload word. That
+		 * silently corrupts the literal (e.g. 0x04000000 == 67108864 becomes
+		 * 0x44000000 == 1140850688), which broke jsbn modPow / RSA and the h5st
+		 * token on jd.com. Skip the payload words: INSTR_INT always carries one
+		 * following word (the short form is rewritten to INSTR_INT_S and packs its
+		 * value in-line), INSTR_INT64/INSTR_FLOAT64 carry two. */
+		if(op == INSTR_INT) { i += 1; continue; }
+		if(op == INSTR_INT64 || op == INSTR_FLOAT64) { i += 2; continue; }
 		if(op == INSTR_JMP || op == INSTR_NJMP ||
 		   /* `a ?? b`, `a && b`, `a || b`: handle_nullish/handle_logic_sc keep the
 		    * LHS and jump forward past the RHS - the SAME relative math as NJMP.
@@ -2602,6 +2623,10 @@ static inline node_t* mic_lookup(vm_t* vm, PC site, var_t* base, const char* nam
 static inline void mic_fill(vm_t* vm, PC site, var_t* base, const char* name, node_t* node) {
 	if(base == NULL || name == NULL || node == NULL || !mic_enabled())
 		return;
+	/* An inherited copy is revalidated against the live prototype chain on
+	 * every read (inherited_refresh); a cached hit would bypass that. */
+	if(node->be_inherited)
+		return;
 	mic_entry_t* e = &vm->mic[MIC_HASH(site)];
 	e->pc = site;
 	e->base_func = (uint32_t)(base->is_func || base->is_class);
@@ -2617,6 +2642,10 @@ static inline bool nbox_type(uint8_t t); /* fwd: defined with the nbox pool belo
 
 inline var_t* node_replace(node_t* node, var_t* v) {
 	var_t* old = node->var;
+	/* A write through an inherited-copy node (see inherited_refresh) makes it a
+	 * real own member: it must shadow the prototype from here on instead of
+	 * being resynced from it. The two copy sites re-flag after their own call. */
+	node->be_inherited = 0;
 	/* In-place scalar rewrite: when the node's current value is a poolable
 	 * scalar the node owns EXCLUSIVELY (refs==1: the node's own hold only - a
 	 * stack-aliased node carries a +1 from vm_push_node, so refs==1 also proves
@@ -2722,8 +2751,12 @@ node_t* var_add(var_t* var, const char* name, var_t* add) {
 		 * bumping here would churn the epoch on every allocation. A
 		 * REWRITE of an existing link takes var_add's node_replace branch
 		 * and is bumped explicitly in var_set_prototype/var_set_callable_proto. */
+		/* The PROTOTYPE exemption applies only to a CALLABLE, whose "prototype"
+		 * member is the internal instance-template link. A PLAIN object's
+		 * "prototype" is an ordinary script data property (its [[Prototype]] lives
+		 * in FPROTO), so adding it changes the visible shape and MUST bump. */
 		if(var->vm != NULL &&
-		   !(name[0] == 'p' && strcmp(name, PROTOTYPE) == 0) &&
+		   !((var->is_func || var->is_class) && name[0] == 'p' && strcmp(name, PROTOTYPE) == 0) &&
 		   !(name[0] == '@' && strcmp(name, FPROTO) == 0)) {
 			var->vm->shape_epoch++;
 			s_bmp_va++;
@@ -2858,14 +2891,7 @@ static double ta_to_number(var_t* v) {
 	if(v == NULL)
 		return 0.0;
 	if(v->type == V_STRING) {
-		const char* s = var_get_str(v);
-		while(*s==' '||*s=='\t'||*s=='\n'||*s=='\r') s++;
-		if(*s == 0) return 0.0;
-		char* end = NULL;
-		double d = strtod(s, &end);
-		while(end != NULL && (*end==' '||*end=='\t'||*end=='\n'||*end=='\r')) end++;
-		if(end != NULL && *end != 0) return NAN;
-		return d;
+		return es_str_to_number(var_get_str(v));
 	}
 	return var_get_float64(v);
 }
@@ -2996,8 +3022,76 @@ bool var_has_member(var_t* obj, const char* name) {
 	return var_find_member(obj, name) != NULL;
 }
 
+static node_t* vm_find_in_class_ex(var_t* var, const char* name, bool noclone, int depth);
+
+/* Does the receiver's inherited copy still equal the prototype's member?
+ * Mirrors var_clone: int/float/string are copied by value, everything else
+ * shares the var, so identity decides. */
+static inline bool inherited_copy_current(var_t* copy, var_t* src) {
+	if(copy == src)
+		return true;
+	if(copy == NULL || src == NULL || copy->type != src->type)
+		return false;
+	switch(src->type) {
+		case V_INT:
+			return var_get_int(copy) == var_get_int(src);
+		case V_FLOAT: {
+			float a = var_get_float(copy), b = var_get_float(src);
+			return a == b || (a != a && b != b);
+		}
+		case V_STRING: {
+			const char* a = var_get_str(copy);
+			const char* b = var_get_str(src);
+			return a == b || (a != NULL && b != NULL && strcmp(a, b) == 0);
+		}
+		default:
+			return false;
+	}
+}
+
+/* find_in_proto_chain_ex copies an inherited data member onto the receiver
+ * (be_inherited) so natives and write targets find a node there. The copy is
+ * only a cache of the prototype's member: `P.prototype.x = 2` after `c.x` was
+ * read must still be visible through c (Angular child scopes read their
+ * parent's model through the chain on every digest). Re-resolve the member on
+ * the live chain and resync the copy; a member that has since vanished, or
+ * become a function (returned from the chain uncopied), blanks the copy.
+ * Returns the node a read should use, NULL when the member is gone. `depth`
+ * bounds the recursion through intermediate prototypes' own copies (a cyclic
+ * chain would otherwise bounce between two of them). */
+static node_t* inherited_refresh(var_t* obj, node_t* own, const char* name, int depth) {
+	if(depth >= 32)
+		return own;
+	node_t* src = vm_find_in_class_ex(obj, name, true, depth + 1);
+	if(src == own)
+		return own;
+	if(src == NULL || src->var == NULL || src->var->is_func) {
+		if(own->var != NULL && own->var->type != V_UNDEF) {
+			node_replace(own, var_new(obj->vm));
+			own->be_inherited = 1;
+		}
+		return (src != NULL && src->var != NULL) ? src : NULL;
+	}
+	if(!inherited_copy_current(own->var, src->var)) {
+		node_replace(own, var_clone(src->var));
+		own->be_inherited = 1;
+	}
+	return own;
+}
+
+/* Own member for a prototype-chain hop: an inherited copy sitting on an
+ * intermediate prototype is brought up to date before it is used. */
+static inline node_t* proto_own_live(var_t* proto, const char* name, int depth) {
+	node_t* n = var_find_own_member(proto, name);
+	if(n != NULL && n->be_inherited)
+		n = inherited_refresh(proto, n, name, depth);
+	return n;
+}
+
 node_t* var_find_member(var_t* obj, const char* name) {
 	node_t* node = var_find_own_member(obj, name);
+	if(node != NULL && node->be_inherited)
+		return inherited_refresh(obj, node, name, 0);
 	if(node == NULL)
 		node = vm_find_in_class(obj, name);
 	return node;
@@ -3033,6 +3127,26 @@ node_t* var_get(var_t* var, int32_t index) {
  * short, which is a far cheaper lie than an OOM. */
 #define ARRAY_HOLE_FILL_MAX (1 << 20)
 
+/* Decimal element key ("0", "1", ..): byte-identical to snprintf("%u") /
+ * snprintf("%d"), minus the printf machinery every indexed access through the
+ * helpers below used to pay (a third of their cost in profiles). */
+static inline void array_index_key_u(char* key, uint32_t u) {
+	char tmp[12];
+	int n = 0;
+	do { tmp[n++] = (char)('0' + (u % 10)); u /= 10; } while(u != 0);
+	while(n > 0) *key++ = tmp[--n];
+	*key = 0;
+}
+
+static inline void array_index_key(char* key, int32_t index) {
+	uint32_t u = (uint32_t)index;
+	if(index < 0) {
+		*key++ = '-';
+		u = 0u - u;
+	}
+	array_index_key_u(key, u);
+}
+
 node_t* var_array_get(var_t* var, int32_t index) {
 	if(var_empty(var))
 		return NULL;
@@ -3049,7 +3163,7 @@ node_t* var_array_get(var_t* var, int32_t index) {
 
 	// Convert index to string key
 	char key[32];
-	snprintf(key, sizeof(key), "%d", index);
+	array_index_key(key, index);
 
 	/* Fast path: the slot already exists (every read-modify-write, every
 	 * in-range store). */
@@ -3065,7 +3179,7 @@ node_t* var_array_get(var_t* var, int32_t index) {
 				uint32_t i;
 				for(i = start; i < (uint32_t)index; i++) {
 					char current_key[32];
-					snprintf(current_key, sizeof(current_key), "%u", i);
+					array_index_key_u(current_key, i);
 					if(hash_map_get(&arr_var->children, current_key) == NULL)
 						var_add(arr_var, current_key, NULL);
 				}
@@ -3096,7 +3210,7 @@ static node_t* var_array_peek(var_t* var, int32_t index) {
 	if(arr_var == NULL)
 		return NULL;
 	char key[32];
-	snprintf(key, sizeof(key), "%d", index);
+	array_index_key(key, index);
 	node_t* node = (node_t*)hash_map_get(&arr_var->children, key);
 	if(node_empty(node))
 		return NULL;
@@ -3135,7 +3249,7 @@ node_t* var_array_add(var_t* var, var_t* add_var) {
 		uint32_t index = hash_map_size(&arr_var->children);
 		// Convert index to string key
 		char key[32];
-		snprintf(key, sizeof(key), "%u", index);
+		array_index_key_u(key, index);
 		ret = var_add(arr_var, key, add_var);
 	}
 	return ret;
@@ -3179,7 +3293,7 @@ node_t* var_array_remove(var_t* var, int32_t index) {
 	
 	// Convert index to string key
 	char key[32];
-	snprintf(key, sizeof(key), "%d", index);
+	array_index_key(key, index);
 	
 	return (node_t*)hash_map_remove(&arr_var->children, key);
 }
@@ -3191,7 +3305,7 @@ void var_array_del(var_t* var, int32_t index) {
 	
 	// Convert index to string key
 	char key[32];
-	snprintf(key, sizeof(key), "%d", index);
+	array_index_key(key, index);
 	
 	// Remove the node from hash map
 	node_t* node = (node_t*)hash_map_remove(&arr_var->children, key);
@@ -3343,6 +3457,38 @@ static inline void add_to_free(var_t* var) {
 }
 
 static void gc(vm_t* vm, bool force);
+/* never_gc list: every live var that has not joined gc_vars rides here (see
+ * the gc struct comment in mario.h). Same prev/next linkage as gc_vars; a var
+ * is on exactly one of the two lists (or the free pool) at any time, and its
+ * status tells which - prev/next alone can NOT distinguish the two lists. */
+static inline void add_to_never_gc(var_t* var) {
+	vm_t* vm = var->vm;
+	if(vm == NULL)
+		return;
+	var->prev = vm->gc.never_gc_tail;
+	if(vm->gc.never_gc_tail != NULL)
+		vm->gc.never_gc_tail->next = var;
+	else
+		vm->gc.never_gc = var;
+	var->next = NULL;
+	vm->gc.never_gc_tail = var;
+}
+
+static inline void remove_from_never_gc(var_t* var) {
+	vm_t* vm = var->vm;
+	if(vm == NULL)
+		return;
+	if(var->prev != NULL)
+		var->prev->next = var->next;
+	else
+		vm->gc.never_gc = var->next;
+	if(var->next != NULL)
+		var->next->prev = var->prev;
+	else
+		vm->gc.never_gc_tail = var->prev;
+	var->prev = var->next = NULL;
+}
+
 static inline void add_to_gc(var_t* var) {
 	vm_t* vm = var->vm;
 	/* Same sentinel as add_to_free: vm==NULL means this "var" is recycled heap
@@ -3350,6 +3496,9 @@ static inline void add_to_gc(var_t* var) {
 	 * faulted at NULL+offsetof(gc) during Array.sort teardown. */
 	if(vm == NULL)
 		return;
+	/* Leaving the never_gc list for gc_vars: unlink there first or the var
+	 * would sit on both lists and the next walk of either would corrupt it. */
+	remove_from_never_gc(var);
 	var->prev = vm->gc.gc_vars_tail;
 	if(vm->gc.gc_vars_tail != NULL)
 		vm->gc.gc_vars_tail->next = var;
@@ -3765,22 +3914,21 @@ void var_free(void* p) {
 	}
 
 	//clean var. var_clean() preserves next/prev across its memset.
+	/* Snapshot list membership NOW - after the closure teardown above (which
+	 * can re-enter var_ref/var_unref on this very var and flip it between the
+	 * never_gc and gc_vars lists) and immediately before var_clean (which
+	 * resets status to V_ST_FREE and whose own teardown can no longer flip
+	 * this var: re-entrant var_free bails on var_empty, and add_to_gc only
+	 * fires on V_ST_REF). Status is the ONLY reliable list discriminator:
+	 * both lists share prev/next, so a pointer test would misread a mid-list
+	 * never_gc var as a gc_vars member and corrupt the gc list head/tail.
+	 * V_ST_GC/V_ST_GC_FREE = gc_vars; V_ST_REF = never_gc. */
+	bool was_gc = (var->status == V_ST_GC || var->status == V_ST_GC_FREE);
 	var_clean(var);
 	var->type = V_UNDEF;
 	var->vm = vm;
 
-	/* Decide gc-list membership from the var's ACTUAL list pointers, never from a
-	 * status snapshot taken before the closure teardown above. Releasing the closure
-	 * re-enters the object graph and can var_ref()/var_unref() this very var,
-	 * flipping it between the gc_vars list and the referenced set; a stale snapshot
-	 * then makes us either remove_from_gc() a var that is no longer linked (which
-	 * wipes gc_vars head/tail) or add_to_free() a var that IS still linked (leaving
-	 * a dangling node the next gc_vars walk dereferences -> heap-use-after-free).
-	 * var_clean() kept next/prev, so the true linkage is readable right here. */
-	bool in_gc = (var->prev != NULL || var->next != NULL ||
-		vm->gc.gc_vars == var || vm->gc.gc_vars_tail == var);
-
-	if(in_gc) { //still linked in the gc_vars list
+	if(was_gc) { //died while linked in the gc_vars list
 		if(vm->gc.is_doing_gc) { // if is doing gc, change status to GC_FREE for moving to free_var_buffer list later.
 			var->status = V_ST_GC_FREE;
 		}
@@ -3789,7 +3937,8 @@ void var_free(void* p) {
 			add_to_free(var);
 		}
 	}
-	else {
+	else { //died while linked in the never_gc list (V_ST_REF at snapshot)
+		remove_from_never_gc(var);
 		add_to_free(var);
 	}
 vfree_out:
@@ -3835,7 +3984,30 @@ inline void var_unref(var_t* var) {
 	if(var->refs == 0) {
 		/*referenced count is 0, means this variable not be referenced anymore,
 		free it immediately.*/
-		var_free(var);
+		if(var->vm->gc.is_doing_gc) {
+			/* Sweep-time cascade death: a dying garbage var's node (or its
+			 * func_t's pinned closure/owner refs) unrefs THIS var down to
+			 * zero. It may have been MARKED live (a root reached it during
+			 * marking) yet lose its last real reference during the teardown
+			 * pass - freeing it right here releases its value (func_t / jit
+			 * code) and recycles the body while OTHER not-yet-torn-down
+			 * garbage nodes still point at it; the allocator can even reuse
+			 * the body for a jit_code_t, whose bytes then pass var_empty's
+			 * health check and get dereferenced (taobao vm_close final-sweep
+			 * UAF in node_free). Defer ALL sweep-time deaths to the teardown
+			 * drain: flag dead and park on gc_vars. var_empty() already
+			 * treats V_ST_GC_FREE as dead, so further cascade unrefs bail
+			 * and the body stays intact (never recycled) until teardown. */
+			if(var->status == V_ST_REF)
+				add_to_gc(var); /* unlink never_gc + link gc_vars (sets V_ST_GC) */
+			/* V_ST_GC vars are already linked in gc_vars - flag in place, do
+			 * NOT re-add (add_to_gc would unlink/relink through the wrong list
+			 * head/tail and duplicate the entry). */
+			var->status = V_ST_GC_FREE;
+		}
+		else {
+			var_free(var);
+		}
 	}
 	else if(var->status == V_ST_REF &&
 			(nbox_type(var->type) || var->type == V_UNDEF || var->type == V_NULL)) {
@@ -3847,7 +4019,14 @@ inline void var_unref(var_t* var) {
 	 * gc_vars_num, which would otherwise trigger pointless collections.
 	 * Their death is refcount-driven (var_free at refs==0); reachability
 	 * marking is unaffected since the sweep only reclaims V_ST_GC
-	 * entries. */
+	 * entries.
+	 * NOTE: object vars deliberately stay OFF the gc list here - many C
+	 * sides hold long-lived var_ref'd vars (timer hops, xhr/bc delivery
+	 * records, promise resolve/reject, static pending slots) without a
+	 * registered gc root, so listing them would let an opportunistic
+	 * sweep reclaim live vars (taobao xhr_fire_completion UAF). Cycle
+	 * garbage they form is instead reclaimed by the vm_close final sweep
+	 * over the never_gc list (see gc_never_gc_sweep). */
 		add_to_gc(var);
 	}
 }
@@ -3881,6 +4060,7 @@ static inline void var_unref_fast(var_t* var) {
 			vm_t* vm = var->vm;
 			nbox_release(vm, var->value);
 			var->value = NULL;
+			remove_from_never_gc(var);
 			var->status = V_ST_FREE;
 			add_to_free(var);
 			return;
@@ -3897,7 +4077,14 @@ static inline void var_unref_fast(var_t* var) {
 	 * gc_vars_num, which would otherwise trigger pointless collections.
 	 * Their death is refcount-driven (var_free at refs==0); reachability
 	 * marking is unaffected since the sweep only reclaims V_ST_GC
-	 * entries. */
+	 * entries.
+	 * NOTE: object vars deliberately stay OFF the gc list here - many C
+	 * sides hold long-lived var_ref'd vars (timer hops, xhr/bc delivery
+	 * records, promise resolve/reject, static pending slots) without a
+	 * registered gc root, so listing them would let an opportunistic
+	 * sweep reclaim live vars (taobao xhr_fire_completion UAF). Cycle
+	 * garbage they form is instead reclaimed by the vm_close final sweep
+	 * over the never_gc list (see gc_never_gc_sweep). */
 		add_to_gc(var);
 	}
 }
@@ -3966,14 +4153,19 @@ static inline void gc_vars(vm_t* vm) {
 
 	//mario_debug("free all unmarked var\n");
 	var_t* v = vm->gc.gc_vars;
-	//first step: free unmarked vars
+	/* First step: mark every unmarked var dead (V_ST_GC_FREE) WITHOUT tearing
+	 * anything down. Garbage vars reference each other (cycles, shared func
+	 * vars): freeing one here releases its value while OTHER not-yet-swept
+	 * garbage nodes still point at it, and their later node_free reads the
+	 * dangling value (taobao vm_close final-sweep UAF: func_t / jit code).
+	 * With ALL garbage flagged dead up front, every cascade unref during the
+	 * teardown pass below bails on var_empty (V_ST_GC_FREE <= V_ST_GC_FREE),
+	 * so no value is ever released while a garbage node can still read it.
+	 * The bodies stay linked and intact until the teardown pass. */
 	while(v != NULL) {
 		var_t* next = v->next;
-		if(v->status == V_ST_GC && v->gc_marked == false) {
-			if(v == vm->gc.gc_vars)
-			vm->gc.gc_vars = next;
-			var_free(v);
-		}
+		if(v->status == V_ST_GC && v->gc_marked == false)
+			v->status = V_ST_GC_FREE;
 		v = next;
 	}
 
@@ -3995,12 +4187,44 @@ static inline void gc_vars(vm_t* vm) {
 	gc_mark_weak(vm, false);
 	gc_mark_wanchor_pool(vm, false);
 
-	//second step: move freed var to free_var_list for reusing.
+	/* Third step: tear down every dead var. var_free() bails on var_empty()
+	 * (true for V_ST_GC_FREE), so flip the status back to a live value for the
+	 * call; its tail snapshots was_gc=true and, with is_doing_gc set, leaves
+	 * the body V_ST_GC_FREE and linked for the pool pass below. Teardown can
+	 * cascade NEW deaths (a marked-live var whose last ref was held by a
+	 * garbage node - var_unref parks it dead at the gc_vars tail), so drain
+	 * in a loop until a full walk finds nothing left to tear down. */
+	bool tore;
+	do {
+		tore = false;
+		v = vm->gc.gc_vars;
+		while(v != NULL) {
+			var_t* next = v->next;
+			if(v->status == V_ST_GC_FREE) {
+				v->status = V_ST_GC;
+				var_free(v);
+				/* Pool the torn body IMMEDIATELY. Leaving it linked as
+				 * V_ST_GC_FREE would make the next drain round flip it back
+				 * and "tear it down" again - tore would never clear and the
+				 * drain would spin forever (engine thread hang: blank page,
+				 * silent eval). get_from_free returns NULL while is_doing_gc,
+				 * so a pooled body can not be reused mid-sweep. */
+				if(v->status == V_ST_GC_FREE) {
+					remove_from_gc(v);
+					add_to_free(v);
+				}
+				tore = true;
+			}
+			v = next;
+		}
+	} while(tore);
+
+	//fourth step: move freed var to free_var_list for reusing.
 	v = vm->gc.gc_vars;
 	while(v != NULL) {
 		var_t* next = v->next;
 		if(v->status == V_ST_GC_FREE) {
-			remove_from_gc(v);	
+			remove_from_gc(v);
 			add_to_free(v);
 		}
 		v = next;
@@ -4369,16 +4593,32 @@ static const char* get_typeof(var_t* var) {
 }
 
 var_t* var_get_prototype(var_t* var) {
-	var_t* p = get_obj(var, PROTOTYPE);
-	if(p != NULL || var == NULL)
+	if(var == NULL)
+		return NULL;
+	/* [[Prototype]] storage is split by callable-ness. A callable's PROTOTYPE
+	 * member is its script-visible `.prototype` instance template (read by `new`),
+	 * so it keeps living there; the callable's OWN [[Prototype]] is the hidden
+	 * FPROTO link (var_get_callable_proto). A PLAIN object has no `.prototype`
+	 * property in ES, so its [[Prototype]] moves into that same hidden FPROTO slot,
+	 * freeing the literal name "prototype" to be an ordinary data property.
+	 * Previously a plain object's [[Prototype]] WAS the "prototype" member, so
+	 * `{prototype: def}` / angular.extend node_replace'd the internal slot: the key
+	 * stayed invisable (for-in/Object.keys dropped it), do_get hid it, yet
+	 * getPrototypeOf returned def - ui.router's `new (L(function(){},{prototype:e}))`
+	 * never inherited the state definition and threw "State must have a valid name"
+	 * (web.wechat.com). */
+	var_t* p = (var->is_func || var->is_class)
+		? get_obj(var, PROTOTYPE)
+		: get_obj(var, FPROTO);
+	if(p != NULL)
 		return p;
-	/* Primitive types carry NO explicit PROTOTYPE member: their [[Prototype]]
+	/* Primitive types carry NO explicit prototype link: their [[Prototype]]
 	 * is by construction always the type's builtin prototype, so resolve it
 	 * implicitly by type. Storing it as a real member node cost every numeric
-	 * / string temporary a node_new (with a "prototype" name copy) at birth
-	 * and a node_free at death - two mallocs plus a shape-epoch bump per
-	 * temporary. An explicit link still wins: setPrototypeOf on a primitive
-	 * creates the member and the member is found above. */
+	 * / string temporary a node_new (with a name copy) at birth and a node_free
+	 * at death - two mallocs plus a shape-epoch bump per temporary. An explicit
+	 * link still wins: setPrototypeOf on a primitive creates the FPROTO member
+	 * and the member is found above. */
 	vm_t* vm = var->vm;
 	if(vm == NULL)
 		return NULL;
@@ -4419,7 +4659,10 @@ void var_set_prototype(var_t* var, var_t* proto) {
 		var->vm->shape_epoch++;
 		s_bmp_sp++;
 	}
-	node_t* ret = var_add(var, PROTOTYPE, proto);
+	/* Callable: PROTOTYPE is the visible `.prototype` instance template. Plain
+	 * object: the hidden FPROTO slot is [[Prototype]], leaving "prototype" free as
+	 * a data property (see var_get_prototype). */
+	node_t* ret = var_add(var, (var->is_func || var->is_class) ? PROTOTYPE : FPROTO, proto);
 	ret->invisable = 1;
 	//ret->be_inherited = 1;
 	ret->be_unenumerable = 1;
@@ -4476,6 +4719,12 @@ inline var_t* var_new(vm_t* vm) {
 	if(vm != NULL)
 		var->serial = ++vm->var_serial;
 	var->status = V_ST_REF;
+	/* Every newborn var rides the never_gc list until it either joins gc_vars
+	 * (add_to_gc unlinks it there) or dies by refcount (var_free / the
+	 * var_unref_fast fast lane unlink it). Opportunistic sweeps never walk
+	 * this list, so C-held vars without a registered root stay safe; vm_close
+	 * drains it into gc_vars for the final cycle-collecting sweep. */
+	add_to_never_gc(var);
 	/* Children map stays LAZY: the 16-slot bucket array is only allocated by
 	 * hash_map_add's self-heal on the first member insert. Plain numeric/string
 	 * temporaries (the bulk of all vars) never grow members, so eager init here
@@ -4639,6 +4888,46 @@ inline const char* var_get_str(var_t* var) {
 		return "";
 	
 	return (const char*)var->value;
+}
+
+/* Pure-ASCII memo (see var_str_is_ascii in mario.h). Deciding ASCII-ness scans
+ * all bytes once; the verdict is cached in a small direct-mapped table keyed by
+ * (vm, var pointer, incarnation serial). Strings are immutable and JS is single
+ * threaded, so a live var's verdict can't go stale; a freed-and-recycled var body
+ * carries a fresh serial (and the vm compare guards cross-VM address reuse), so a
+ * stale entry never false-matches - it simply re-scans and overwrites. The stored
+ * pointer is only ever compared, never dereferenced, so a dangling entry is inert.
+ * This turns the .length / charCodeAt hot path from O(n)-per-call into O(1) for
+ * the overwhelmingly common pure-ASCII strings (a JS MD5's str2binl over a large
+ * canvas-fingerprint string was O(n^2) and effectively hung the JD pc-tk.js VM). */
+#define STR_ASCII_MEMO_N 256
+typedef struct {
+	var_t*          vp;
+	struct st_vm*   vm;
+	uint64_t        serial;
+	int32_t         ascii;
+	int32_t         used;
+} str_ascii_memo_t;
+static str_ascii_memo_t s_str_ascii_memo[STR_ASCII_MEMO_N];
+
+int var_str_is_ascii(var_t* v) {
+	if(v == NULL || v->type != V_STRING)
+		return 0;   /* boxed String object / non-string: caller uses the UTF-8 walk */
+	const unsigned char* s = (const unsigned char*)v->value;
+	uint32_t bytes = v->size;
+	if(s == NULL || bytes == 0)
+		return 1;   /* empty string is trivially pure ASCII */
+	uint32_t h = (uint32_t)(((uintptr_t)v >> 4) * 2654435761u) ^ (uint32_t)v->serial;
+	str_ascii_memo_t* m = &s_str_ascii_memo[h & (STR_ASCII_MEMO_N - 1)];
+	if(m->used && m->vp == v && m->vm == v->vm && m->serial == v->serial)
+		return m->ascii;
+	int32_t ascii = 1;
+	uint32_t i;
+	for(i = 0; i < bytes; i++) {
+		if(s[i] >= 0x80) { ascii = 0; break; }
+	}
+	m->vp = v; m->vm = v->vm; m->serial = v->serial; m->ascii = ascii; m->used = 1;
+	return ascii;
 }
 
 inline var_t* var_set_str(var_t* var, const char* v) {
@@ -4867,6 +5156,85 @@ static void get_m_str(const char* str, mstr_t* ret) {
 	mstr_add(ret, '"');
 }
 
+/* ES2015 StringNumericLiteral (7.1.4.1.1). strtod alone is C grammar, not ES:
+ * it accepts signed hex ("+0x1" -> 1, ES: NaN), rejects the ES6 unsigned binary/
+ * octal literal forms ("0b101"/"0o17" -> ES 5/15), and - used without a full-
+ * consumption check - silently truncates trailing garbage ("12abc" -> 12, ES:
+ * NaN). core-js gates its global Number wrapper on exactly these cases
+ * (`!Number(" 0o1") || !Number("0b1") || Number("+0x1")`); when the gate trips
+ * it replaces global Number with a JS wrapper whose constructed instances never
+ * receive the engine's boxed-value slot, so every `new Number(x)` reads back 0.
+ * Whitespace per StrWhiteSpace (SP TAB LF VT FF CR + NBSP/LS/PS as UTF-8). */
+static bool es_is_ws(unsigned char c) {
+	return c==' '||c=='\t'||c=='\n'||c=='\v'||c=='\f'||c=='\r';
+}
+double es_str_to_number(const char* s) {
+	if(s == NULL)
+		return NAN;
+	const char* p = s;
+	while(es_is_ws((unsigned char)*p) ||
+	      ((unsigned char)p[0]==0xC2 && (unsigned char)p[1]==0xA0) ||  /* NBSP */
+	      ((unsigned char)p[0]==0xE2 && (unsigned char)p[1]==0x80 &&
+	       ((unsigned char)p[2]==0xA8 || (unsigned char)p[2]==0xA9)))  /* LS/PS */
+		p += ((unsigned char)p[0]==0xC2) ? 2 : (((unsigned char)p[0]==0xE2) ? 3 : 1);
+	if(*p == 0)
+		return 0.0;
+	int neg = 0, has_sign = 0;
+	if(*p == '+' || *p == '-') {
+		neg = (*p == '-');
+		has_sign = 1;
+		p++;
+	}
+	/* Infinity / +Infinity */
+	if(strncmp(p, "Infinity", 8) == 0) {
+		const char* q = p + 8;
+		while(es_is_ws((unsigned char)*q)) q++;
+		if(*q == 0)
+			return neg ? -INFINITY : INFINITY;
+		return NAN;
+	}
+	/* Unsigned radix literals: 0x/0X hex, 0b/0B binary, 0o/0O octal. A sign in
+	 * front makes them NaN per the grammar (StrUnsignedNumericLiteral only). */
+	if(p[0]=='0' && (p[1]=='x'||p[1]=='X'||p[1]=='b'||p[1]=='B'||p[1]=='o'||p[1]=='O')) {
+		char kind = p[1] | 0x20;
+		int base = (kind=='x') ? 16 : ((kind=='b') ? 2 : 8);
+		const char* d = p + 2;
+		double acc = 0.0;
+		int nd = 0;
+		for(;;) {
+			int dv;
+			if(*d>='0' && *d<='9') dv = *d-'0';
+			else if(base==16 && *d>='a' && *d<='f') dv = *d-'a'+10;
+			else if(base==16 && *d>='A' && *d<='F') dv = *d-'A'+10;
+			else break;
+			if(dv >= base)
+				break;
+			acc = acc * (double)base + (double)dv;
+			d++;
+			nd++;
+		}
+		if(nd == 0)
+			return NAN;             /* "0x" / "0b1"-with-bad-digit / "0o8" */
+		if(has_sign)
+			return NAN;             /* "+0x1"/"-0b1": grammar admits unsigned only */
+		while(es_is_ws((unsigned char)*d)) d++;
+		if(*d != 0)
+			return NAN;             /* trailing garbage */
+		return acc;
+	}
+	/* Decimal (incl. legacy leading-zero "010" -> 10, exponent forms). */
+	char* end = NULL;
+	double d = strtod(p, &end);
+	if(end == p)
+		return NAN;
+	while(es_is_ws((unsigned char)*end) ||
+	      ((unsigned char)end[0]==0xC2 && (unsigned char)end[1]==0xA0))
+		end += ((unsigned char)end[0]==0xC2) ? 2 : 1;
+	if(*end != 0)
+		return NAN;
+	return neg ? -d : d;
+}
+
 /* ES6 Symbol.toPrimitive: if obj defines [Symbol.toPrimitive], call it with the
  * given hint ("number"/"string"/"default") and return its primitive result, or
  * NULL when absent or non-primitive (caller then falls back to the default
@@ -4909,13 +5277,7 @@ double vm_to_number(vm_t* vm, var_t* v) {
 		case V_BIGINT:  return bn_to_double((bignum_t*)v->value);
 		case V_STRING: {
 			const char* s = var_get_str(v);
-			while(*s==' '||*s=='\t'||*s=='\n'||*s=='\r') s++;
-			if(*s == 0) return 0.0;
-			char* end = NULL;
-			double d = strtod(s, &end);
-			while(end != NULL && (*end==' '||*end=='\t'||*end=='\n'||*end=='\r')) end++;
-			if(end != NULL && *end != 0) return NAN;
-			return d;
+			return es_str_to_number(s);
 		}
 		default: break;   /* V_UNDEF, V_OBJECT handled below */
 	}
@@ -5059,6 +5421,123 @@ static void append_json_spaces(mstr_t* ret, int level) {
 	}
 }
 
+/* ECMA-262 OrdinaryOwnPropertyKeys: array-index strings sort numerically,
+ * followed by the remaining string keys in creation order. node->serial is a
+ * per-VM creation serial; node_replace preserves it on overwrite, while delete
+ * followed by re-add creates a new node and therefore moves the key to the end. */
+typedef struct {
+	m_array_t* nodes;
+	hash_map_t* seen;
+	bool enum_only;
+} own_keys_collect_ctx;
+
+static bool own_key_array_index(const char* key, uint32_t* index) {
+	if(key == NULL || key[0] == 0 || (key[0] == '0' && key[1] != 0))
+		return false;
+	uint64_t value = 0;
+	for(const char* p = key; *p != 0; p++) {
+		if(*p < '0' || *p > '9')
+			return false;
+		value = value * 10 + (uint32_t)(*p - '0');
+		if(value > UINT32_MAX - 1ULL)
+			return false;
+	}
+	*index = (uint32_t)value;
+	return true;
+}
+
+static int own_key_node_compare(const void* ap, const void* bp) {
+	const node_t* a = *(node_t* const*)ap;
+	const node_t* b = *(node_t* const*)bp;
+	uint32_t ai = 0, bi = 0;
+	bool a_index = own_key_array_index(a->name, &ai);
+	bool b_index = own_key_array_index(b->name, &bi);
+	if(a_index && b_index)
+		return ai < bi ? -1 : (ai > bi ? 1 : 0);
+	if(a_index != b_index)
+		return a_index ? -1 : 1;
+	if(a->serial != b->serial)
+		return a->serial < b->serial ? -1 : 1;
+	return strcmp(a->name, b->name);
+}
+
+static void own_keys_collect_cb(const char* key, void* value, void* user_data) {
+	(void)key;
+	own_keys_collect_ctx* ctx = (own_keys_collect_ctx*)user_data;
+	node_t* node = (node_t*)value;
+	if(node == NULL || node->be_inherited || node->invisable ||
+		(ctx->enum_only && node->be_unenumerable) ||
+		hash_map_get(ctx->seen, node->name) != NULL)
+		return;
+	hash_map_add(ctx->seen, node->name, (void*)"");
+	array_add(ctx->nodes, node);
+}
+
+void var_own_keys(vm_t* vm, var_t* var, var_t* keys_var, bool enum_only) {
+	if(var == NULL)
+		return;
+	if(var_is_proxy(var)) {
+		/* A proxy trap supplies its own key order. The default trap forwards to
+		 * the target and reaches the ordinary ordered path below. */
+		var_t* proxy_keys = proxy_own_keys(vm, var, false, enum_only);
+		if(proxy_keys != NULL) {
+			uint32_t count = var_array_size(proxy_keys);
+			vm->gc.gc_defer++;
+			for(uint32_t i = 0; i < count; i++) {
+				var_t* key = var_array_get_var(proxy_keys, (int32_t)i);
+				var_array_add(keys_var, key != NULL ? key : var_new(vm));
+			}
+			vm->gc.gc_defer--;
+			var_unref(proxy_keys);
+		}
+		return;
+	}
+
+	/* A TypedArray keeps its elements in the backing buffer, not as named "0","1",..
+	 * members, so the generic walk below yields NO index keys. That made
+	 * Object.keys(u8)==0, JSON.stringify(u8)=="{}" and for-in over a view empty -
+	 * diverging from every browser (indices ARE own enumerable properties) and
+	 * hollowing out any fingerprint blob that serialises a Uint8Array. Emit the
+	 * index keys "0".."len-1" FIRST (spec OwnPropertyKeys order: ascending integer
+	 * keys, then string keys), then fall through so the generic walk still appends
+	 * the unenumerable view members (length/byteOffset/..) for getOwnPropertyNames. */
+	if(var_is_typedarray(var)) {
+		var_t* lenv = var_find_own_member_var(var, "length");
+		int64_t len = (lenv != NULL) ? var_get_int64(lenv) : 0;
+		vm->gc.gc_defer++;
+		for(int64_t i = 0; i < len; i++) {
+			char key[32];
+			snprintf(key, sizeof(key), "%lld", (long long)i);
+			var_array_add(keys_var, var_new_str(vm, key));
+		}
+		vm->gc.gc_defer--;
+	}
+
+	vm->gc.gc_defer++;
+	m_array_t nodes;
+	array_init(&nodes);
+	hash_map_t* seen = hash_map_new();
+	own_keys_collect_ctx ctx;
+	ctx.nodes = &nodes;
+	ctx.seen = seen;
+	ctx.enum_only = enum_only;
+	if(var->is_array) {
+		var_t* elements = var_find_own_member_var(var, "_ARRAY_");
+		if(elements != NULL)
+			hash_map_iterate(&elements->children, own_keys_collect_cb, &ctx);
+	}
+	hash_map_iterate(&var->children, own_keys_collect_cb, &ctx);
+	if(nodes.size > 1)
+		qsort(nodes.items, nodes.size, sizeof(void*), own_key_node_compare);
+	for(uint32_t i = 0; i < nodes.size; i++) {
+		node_t* node = (node_t*)nodes.items[i];
+		var_array_add(keys_var, var_new_str(vm, node->name));
+	}
+	array_remove_all(&nodes);
+	hash_map_free(seen, mario_free, NULL);
+	vm->gc.gc_defer--;
+}
+
 static bool _done_arr_inited = false;
 /* `compact` selects standard JSON.stringify formatting (no whitespace) versus the
  * indented form used for console/debug object rendering. `level` still drives the
@@ -5149,64 +5628,74 @@ void var_to_json_str(var_t* var, mstr_t* ret, int level, bool compact) {
 		else
 			mstr_append(ret, "{\n");
 
-		// iterate the hash map directly, without a callback function
 		bool first = true;
-		uint32_t i;
-		for (i = 0; i < var->children.capacity; i++) {
-			hash_entry_t* entry = var->children.buckets[i];
-			while (entry) {
-				const char* key = entry->key;
-				node_t* node = (node_t*)entry->value;
-
-				// skip non-enumerable properties
-				if (node->be_unenumerable)
-					goto next_entry;
-
-				// skip internal properties (such as the prototype chain)
-				if (strcmp(key, PROTOTYPE) == 0 || strcmp(key, "_ARRAY_") == 0)
-					goto next_entry;
-
-				/* ES SerializeJSONObject: an own property whose value is
-				 * undefined, a function or a symbol is OMITTED entirely (the
-				 * key never appears). Emitting `"k":undefined` produced invalid
-				 * JSON - Pinterest's resource endpoints rejected the query string
-				 * with HTTP 400 code 15 ("Unexpected token 'u' ... is not valid
-				 * JSON"), so the onboarding/feed data never loaded. Display mode
-				 * (compact==false, the var_to_str fallback) still shows every
-				 * member. The comma/first bookkeeping below runs only for emitted
-				 * properties, so a skipped one never leaves a dangling separator. */
-				if (compact && (node->var == NULL ||
-				                node->var->type == V_UNDEF || node->var->is_func ||
-				                var_is_symbol(node->var)))
-					goto next_entry;
-
-				// 添加逗号分隔符
-				if (!first) {
-					mstr_append(ret, compact ? "," : ",\n");
-				} else {
-					first = false;
-				}
-
-				// indentation
-				if(!compact)
-					append_json_spaces(ret, level);
-
-				// add the property name
-				mstr_add(ret, '"');
-				mstr_append(ret, key);
-				mstr_add(ret, '"');
-				mstr_append(ret, compact ? ":" : ": ");
-
-				// serialize the property value
-				mstr_t* value_str = mstr_new("");
-				var_to_json_str(node->var, value_str, level + 1, compact);
-				mstr_append(ret, value_str->cstr);
-				mstr_free(value_str);
-
-			next_entry:
-				entry = entry->next;
+		var_t* keys = var_new_array(var->vm);
+		var_own_keys(var->vm, var, keys, true);
+		uint32_t key_count = var_array_size(keys);
+		for(uint32_t i = 0; i < key_count; i++) {
+			var_t* key_var = var_array_get_var(keys, (int32_t)i);
+			if(key_var == NULL || key_var->type != V_STRING)
+				continue;
+			const char* key = var_get_str(key_var);
+			node_t* node = var_find_own_member(var, key);
+			var_t* ta_el = NULL;   /* owned element decoded from a TypedArray index key */
+			var_t* valvar;
+			if(node != NULL) {
+				/* Skip only the INTERNAL invisable slots. A plain object's
+				 * "prototype" is now a legitimate enumerable data property (its
+				 * [[Prototype]] moved to FPROTO), so it must serialize like any
+				 * other key; var_own_keys already filters invisable nodes, this
+				 * guard is belt-and-braces for the callable instance template. */
+				if((strcmp(key, PROTOTYPE) == 0 && node->invisable) || strcmp(key, "_ARRAY_") == 0)
+					continue;
+				valvar = node->var;
 			}
+			else if(var_is_typedarray(var)) {
+				/* TypedArray index keys "0".."len-1" live in the backing buffer, not as
+				 * named members, so decode them here or JSON.stringify(u8) drops every
+				 * element and emits "{}" instead of {"0":..,"1":..}. */
+				ta_el = var_typedarray_get_at(var->vm, var, (int64_t)strtoll(key, NULL, 10));
+				valvar = ta_el;
+			}
+			else {
+				continue;
+			}
+
+			/* ES SerializeJSONObject: an own property whose value is
+			 * undefined, a function or a symbol is OMITTED entirely (the
+			 * key never appears). Emitting `"k":undefined` produced invalid
+			 * JSON - Pinterest's resource endpoints rejected the query string
+			 * with HTTP 400 code 15 ("Unexpected token 'u' ... is not valid
+			 * JSON"), so the onboarding/feed data never loaded. Display mode
+			 * (compact==false, the var_to_str fallback) still shows every
+			 * member. The comma/first bookkeeping below runs only for emitted
+			 * properties, so a skipped one never leaves a dangling separator. */
+			if(compact && (valvar == NULL || valvar->type == V_UNDEF ||
+				valvar->is_func || var_is_symbol(valvar))) {
+				if(ta_el != NULL) var_unref(ta_el);
+				continue;
+			}
+
+			if(!first)
+				mstr_append(ret, compact ? "," : ",\n");
+			else
+				first = false;
+			if(!compact)
+				append_json_spaces(ret, level);
+			mstr_add(ret, '"');
+			mstr_append(ret, key);
+			mstr_add(ret, '"');
+			mstr_append(ret, compact ? ":" : ": ");
+			mstr_t* value_str = mstr_new("");
+			if(valvar != NULL)
+				var_to_json_str(valvar, value_str, level + 1, compact);
+			else
+				mstr_append(value_str, "null");
+			mstr_append(ret, value_str->cstr);
+			mstr_free(value_str);
+			if(ta_el != NULL) var_unref(ta_el);
 		}
+		var_unref(keys);
 
 		// if there are no properties, make sure the format is still correct
 		if (!compact) {
@@ -5683,20 +6172,74 @@ node_t* vm_find(vm_t* vm, const char* name) {
 	return var_find_own_member(var, name);	
 }
 
+static inline bool var_is_accessor(var_t* v);
+static inline var_t* var_accessor_getter(var_t* v);
+static inline var_t* var_accessor_setter(var_t* v);
+
 /* Walk one prototype chain looking for `name`. Each hop follows the callable
  * rule: a callable's next link is its OWN [[Prototype]] (FPROTO, then
  * Function.prototype / Object.prototype) as ES does for statics, anything else
  * follows its `.prototype` member - which is how instance prototypes are linked.
- * A non-function hit is cloned onto `var` and flagged inherited, so the next
- * lookup is a direct own hit. */
-static node_t* find_in_proto_chain_ex(var_t* var, var_t* start, const char* name, bool static_only) {
+ * A non-function hit is cloned onto `var` and flagged inherited; var_find_member
+ * revalidates that copy on every later read (inherited_refresh), which is the
+ * `noclone` caller: it wants the chain's own node, not another copy. */
+static node_t* find_in_proto_chain_ex(var_t* var, var_t* start, const char* name, bool static_only, bool noclone, int depth) {
 	/* A cyclic prototype chain (a class linked, directly or through a mixin,
 	 * as its own ancestor) would spin here forever; bound the walk so a
 	 * pathological chain degrades to a miss instead of freezing the engine. */
 	int hops = 0;
 	var_t* proto = start;
 	while(proto != NULL && hops++ < 4096) {
-		node_t* ret = var_find_own_member(proto, name);
+		/* A plain callable's public `.prototype` is its instance template, not its
+		 * static [[Prototype]]. mario still walks that template first because class
+		 * static methods live there, but its terminal Object.prototype must NOT
+		 * outrank Function.prototype: in a real engine the order is
+		 *   C -> Function.prototype -> Object.prototype.
+		 * Otherwise an `Object.prototype.apply = function(){}` installed by a page
+		 * shadows Function.prototype.apply on an ordinary Base function; Babel's
+		 * derived constructor then runs `Base.apply(this, args)` as a no-op and the
+		 * base initializer never executes. Consult Function.prototype at this hop,
+		 * after any class-owned static has already had a chance to match. */
+		if(!static_only && var != NULL && (var->is_func || var->is_class) &&
+		   var->vm != NULL && strcmp(name, "name") != 0 && strcmp(name, "length") != 0) {
+			var_t* object_ctor = var->vm->builtin_vars.var_Object;
+			var_t* function_ctor = var->vm->builtin_vars.var_Function;
+			if(object_ctor != NULL && function_ctor != NULL &&
+			   proto == var_get_prototype(object_ctor)) {
+				node_t* fn = proto_own_live(var_get_prototype(function_ctor), name, depth);
+				if(fn != NULL && fn->var != NULL)
+					return fn;
+			}
+		}
+		node_t* ret = proto_own_live(proto, name, depth);
+		/* The callable's public `.prototype` is an instance template, not a
+		 * static [[Prototype]] hop. mario keeps class static methods/accessors
+		 * there, so those genuine is_static members must still win; an ordinary
+		 * instance member with the same name as a Function.prototype method must
+		 * not. In particular Babel bases can carry Base.prototype.apply while the
+		 * constructor call Base.apply(this,args) must still reach the native
+		 * Function.prototype.apply, exactly as it does in a browser. */
+		if(ret != NULL && !static_only && var != NULL &&
+		   (var->is_func || var->is_class) && var->vm != NULL &&
+		   proto == var_get_prototype(var) &&
+		   strcmp(name, "name") != 0 && strcmp(name, "length") != 0) {
+			func_t* tf = (ret->var != NULL && ret->var->is_func)
+				? var_get_func(ret->var) : NULL;
+			if(tf == NULL && ret->var != NULL && var_is_accessor(ret->var)) {
+				var_t* acc = var_accessor_getter(ret->var);
+				if(acc == NULL)
+					acc = var_accessor_setter(ret->var);
+				if(acc != NULL && acc->is_func)
+					tf = var_get_func(acc);
+			}
+			if(tf == NULL || !tf->is_static) {
+				var_t* function_ctor = var->vm->builtin_vars.var_Function;
+				node_t* fn = function_ctor != NULL
+					? proto_own_live(var_get_prototype(function_ctor), name, depth) : NULL;
+				if(fn != NULL && fn->var != NULL)
+					return fn;
+			}
+		}
 		if(ret != NULL) {
 			if(!static_only) {
 				/* Object's constructor statics (is/keys/values/entries/assign/create/
@@ -5727,6 +6270,8 @@ static node_t* find_in_proto_chain_ex(var_t* var, var_t* start, const char* name
 				} else if(ret->var != NULL && ret->var->is_func) {
 					return ret;
 				} else {
+					if(noclone)
+						return ret;
 					ret = var_add(var, name, var_clone(ret->var));
 					ret->be_inherited = 1;
 					return ret;
@@ -5772,7 +6317,7 @@ static node_t* find_in_proto_chain_ex(var_t* var, var_t* start, const char* name
 	return NULL;
 }
 
-node_t* vm_find_in_class(var_t* var, const char* name) {
+static node_t* vm_find_in_class_ex(var_t* var, const char* name, bool noclone, int depth) {
 	if(var == NULL)
 		return NULL;
 	/* A callable whose [[Prototype]] was set explicitly (Object.setPrototypeOf or
@@ -5783,7 +6328,7 @@ node_t* vm_find_in_class(var_t* var, const char* name) {
 	if(var->is_func || var->is_class) {
 		var_t* fproto = var_get_callable_proto(var);
 		if(fproto != NULL) {
-			node_t* ret = find_in_proto_chain_ex(var, fproto, name, false);
+			node_t* ret = find_in_proto_chain_ex(var, fproto, name, false, noclone, depth);
 			if(ret != NULL)
 				return ret;
 			/* mario stores a class's static METHODS on the class var's instance
@@ -5795,11 +6340,11 @@ node_t* vm_find_in_class(var_t* var, const char* name) {
 			 * core-js's typed-array constructors) never exposes instance accessors as
 			 * statics. */
 			if(var->is_class && var_find_own_member(var, "@super") != NULL)
-				return find_in_proto_chain_ex(var, var_get_prototype(var), name, true);
+				return find_in_proto_chain_ex(var, var_get_prototype(var), name, true, noclone, depth);
 			return NULL;
 		}
 	}
-	node_t* ret = find_in_proto_chain_ex(var, var_get_prototype(var), name, false);
+	node_t* ret = find_in_proto_chain_ex(var, var_get_prototype(var), name, false, noclone, depth);
 	if(ret != NULL)
 		return ret;
 	/* A plain function's real [[Prototype]] is Function.prototype, but mario
@@ -5819,11 +6364,15 @@ node_t* vm_find_in_class(var_t* var, const char* name) {
 	if((var->is_func || var->is_class) && var->vm != NULL &&
 	   var->vm->builtin_vars.var_Function != NULL &&
 	   strcmp(name, "name") != 0 && strcmp(name, "length") != 0) {
-		node_t* fn = var_find_own_member(var_get_prototype(var->vm->builtin_vars.var_Function), name);
+		node_t* fn = proto_own_live(var_get_prototype(var->vm->builtin_vars.var_Function), name, depth);
 		if(fn != NULL && fn->var != NULL)
 			return fn;
 	}
 	return NULL;
+}
+
+node_t* vm_find_in_class(var_t* var, const char* name) {
+	return vm_find_in_class_ex(var, name, false, 0);
 }
 
 bool var_instanceof(var_t* var, var_t* proto) {
@@ -6296,6 +6845,16 @@ void vm_report_uncaught(vm_t* vm) {
 	char tagsfx[160] = {0};
 	if(vm->dbg_tag != NULL) snprintf(tagsfx, sizeof(tagsfx)-1, "  [%s]", vm->dbg_tag);
 	mario_printf("Uncaught %s%s\n", es->cstr, tagsfx);
+	if(getenv("MARIO_ERRSTACK") != NULL) {
+		var_t* stv = var_find_member_var(err, "stack");
+		if(stv != NULL) {
+			mstr_t* ss = mstr_new("");
+			var_to_str(stv, ss);
+			if(ss->cstr != NULL && ss->cstr[0] != '\0')
+				mario_printf("[errstack] %.1200s\n", ss->cstr);
+			mstr_free(ss);
+		}
+	}
 	if(s_throw_loc != NULL && s_throw_loc->len > 0) {
 		mario_printf("%s", s_throw_loc->cstr);
 		mstr_reset(s_throw_loc);
@@ -6317,11 +6876,23 @@ static void mario_throw_trace(vm_t* vm, const char* tag, const char* message) {
 	if(!s_on) return;
 	fprintf(stderr, "[throwall] %s pc=%u msg=%s\n", tag, (unsigned)vm->pc,
 	        (message != NULL) ? message : "");
+	{
+		const char* turl = NULL; int tln = 0, tcl = 0;
+		if(bc_srcmap_locate_v8(&vm->bc, vm->pc, &turl, &tln, &tcl))
+			fprintf(stderr, "[throwall]   at %s:%d:%d\n", turl ? turl : "-", tln, tcl);
+	}
 	scope_t* sc = vm_get_scope(vm);
 	int hop = 0;
 	while(sc != NULL && hop++ < 6) {
-		if(sc->is_func && sc->func != NULL)
-			fprintf(stderr, "[throwall]   frame[%d] entrypc=%u\n", hop, (unsigned)sc->func->pc);
+		if(sc->is_func && sc->func != NULL) {
+			const char* furl = NULL; int fln = 0, fcl = 0;
+			char floc[512];
+			if(bc_srcmap_locate_v8(&vm->bc, sc->func->pc, &furl, &fln, &fcl))
+				snprintf(floc, sizeof floc, "%s:%d:%d", furl ? furl : "-", fln, fcl);
+			else
+				snprintf(floc, sizeof floc, "<nosrc>");
+			fprintf(stderr, "[throwall]   frame[%d] entrypc=%u at %s\n", hop, (unsigned)sc->func->pc, floc);
+		}
 		sc = sc->prev;
 	}
 	fflush(stderr);
@@ -6716,6 +7287,21 @@ static var_t* var_new_func(vm_t* vm, func_t* func) {
 	 * reads var_get_prototype(func)), which now correctly points at f's own
 	 * prototype rather than the shared one. */
 	var_t* proto = var_new_obj(vm, obj_proto, NULL, NULL);
+	/* ES: F.prototype.constructor === F. Materializing an OWN "constructor"
+	 * member here was tried and rejected: handle_call's ctor_from_base probe
+	 * (var_find_own_member_var(protoV, CONSTRUCTOR)) would flip true for every
+	 * plain-function base and reroute super()/construction dispatch, breaking
+	 * React mounting. Instead tag the template with a hidden back-pointer and
+	 * synthesize the read in do_get ONLY - own-member probes stay NULL, so all
+	 * internal dispatch keeps its current semantics. Without the read fix the
+	 * chain fell through to Object.prototype.constructor (=Object) and the
+	 * jQuery++ guard `this.constructor!==$.Range?new $.Range(e):...` re-entered
+	 * itself on every `new` until the call-depth guard fired (web.wechat.com's
+	 * vendor bundle aborted with RangeError). */
+	{
+		node_t* pon = var_add(proto, "@@proto_owner", var);
+		if(pon != NULL) { pon->invisable = 1; pon->be_unenumerable = 1; }
+	}
 	var_set_prototype(var, proto);
 	return var;
 }
@@ -7154,7 +7740,7 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num, bool i
 	 * so a same-named parameter still shadows the function, matching ES scope order.
 	 * Without this the React flight reader's tail `u.read().then(t)` (where `t` is the
 	 * reader's own NFE name) passed undefined and the RSC stream stalled after 2 reads. */
-	if(func->nfe_name != NULL && !var_empty(env) &&
+	if(func->nfe_name != NULL && !func->no_self_bind && !var_empty(env) &&
 	   var_find_own_member(env, func->nfe_name) == NULL)
 		var_add(env, func->nfe_name, func_var);
 
@@ -7630,7 +8216,15 @@ static var_t* func_def(vm_t* vm, int regular, bool is_static) {
 				struct st_bc_fspan_ent* e = &vm->bc.fspans[i];
 				if(e->src < vm->bc.srcs.size) {
 					const char* src = (const char*)vm->bc.srcs.items[e->src];
-					size_t src_len = strlen(src);
+					/* Every evaluation of a function expression lands here, and the
+					 * source is the whole script: a strlen per closure made closure-
+					 * heavy code in a big bundle pay O(script size) each time (the
+					 * 208KB wcinfo CHAOS VM spent ~1/5 of its run in it). */
+					if(src != s_fspan_src) {
+						s_fspan_src_len = strlen(src);
+						s_fspan_src = src;
+					}
+					size_t src_len = s_fspan_src_len;
 					if(e->start < src_len && e->end < src_len && e->end >= e->start) {
 						uint32_t len = e->end - e->start + 1;
 						func->src_text = (char*)mario_malloc(len + 1);
@@ -7732,6 +8326,27 @@ static bool arrlen_slot_write(vm_t* vm, node_t* n, var_t* val) {
 	}
 	var_delete_own_member(n->var, ARRLEN_SLOT_ARR);
 	return true;
+}
+
+/* Resolve the CURRENT length of the array behind an @@arrlen write-target. An
+ * array's length is virtual, so do_get(for_write) can not hand back a writable
+ * member node and instead pushes the @@arrlen sentinel whose ->var is an
+ * UNDEFINED placeholder. A plain `arr.length = n` never reads it, but a compound
+ * `arr.length -= n` / a step `arr.length++` must use the real length as the left
+ * operand: reading the undefined placeholder made the arithmetic NaN, and
+ * arrlen_slot_write's ToUint32(NaN)==0 then resized the array to zero - silently
+ * clearing it (this broke the JD h5st CryptoJS VMP operand stack, whose
+ * `k.length-=2`/`-=3` pops wiped the whole stack). Returns a fresh owned int var
+ * (one ref, matching the popped-operand contract), or NULL if not an @@arrlen. */
+static inline var_t* arrlen_slot_current(vm_t* vm, node_t* n) {
+	if(!is_arrlen_slot(n))
+		return NULL;
+	var_t* arr = var_find_own_member_var(n->var, ARRLEN_SLOT_ARR);
+	uint32_t sz = (arr != NULL && arr->is_array) ? var_array_size(arr) : 0u;
+	var_t* v = (sz <= 2147483647u) ? var_new_int(vm, (int)sz)
+	                               : var_new_int64(vm, (int64_t)sz);
+	var_ref(v);   /* one owned ref, dropped by the trailing var_unref(v1/v) */
+	return v;
 }
 
 /* ---- Proxy write sentinel (Phase 5) ----
@@ -8309,6 +8924,25 @@ return;
 
 	//do string + 
 	if(op == INSTR_PLUS || op == INSTR_PLUSEQ) {
+		/* string + string: build the result in one allocation. The generic lane
+		 * below copies the left operand three times (into the mstr, again when the
+		 * append reallocs, again into the var), which is what an accumulator loop
+		 * `s += ch` over a 100KB+ string spends its time on. */
+		if(v1->type == V_STRING && v2->type == V_STRING &&
+				v1->size <= 0x3fffffffu && v2->size <= 0x3fffffffu) {
+			uint32_t l1 = (v1->value != NULL) ? v1->size : 0;
+			uint32_t l2 = (v2->value != NULL) ? v2->size : 0;
+			char* buf = (char*)mario_malloc(l1 + l2 + 1);
+			if(l1 > 0) memcpy(buf, v1->value, l1);
+			if(l2 > 0) memcpy(buf + l1, v2->value, l2);
+			buf[l1 + l2] = 0;
+			var_t* v = var_new(vm);
+			v->type = V_STRING;
+			v->size = l1 + l2;
+			v->value = buf;
+			math_result(vm, op, n, v);
+			return;
+		}
 		/* Convert the left operand to a string properly. Casting v1->value to
 		 * char* directly produced garbage when v1 was a non-string, e.g.
 		 * `5 + "x"` read the int's raw bytes as a C string. */
@@ -8704,6 +9338,50 @@ static int mstr_utf16_length_n(const char* s, uint32_t bytes) {
 	return units;
 }
 
+/* UTF-16 length memo for big non-ASCII strings. A byte-buffer string (atob /
+ * String.fromCharCode output, a base64-decoded bytecode blob) holds bytes >=
+ * 0x80, so the pure-ASCII `.length` shortcut never applies and every read
+ * re-walks the whole UTF-8 buffer: a `for(c=0;c<S.length;c++)` scan is O(n^2)
+ * (the Tencent CHAOS VM loads its ~150KB program this way, which held
+ * web.wechat.com's QR code back for most of a minute). Keyed like the ASCII
+ * memo - (vm, var pointer, incarnation serial) - plus the buffer pointer and
+ * size; entries are only compared, never dereferenced. Fully associative with
+ * round-robin eviction so two big strings read alternately cannot evict each
+ * other; small strings bypass it (their walk is already cheap and the
+ * temporaries a scan produces would churn the table). */
+#define STR_UNITS_MEMO_N   4
+#define STR_UNITS_MEMO_MIN 256
+typedef struct {
+	var_t*          vp;
+	struct st_vm*   vm;
+	uint64_t        serial;
+	const void*     value;
+	uint32_t        size;
+	int32_t         units;
+} str_units_memo_t;
+static str_units_memo_t s_str_units_memo[STR_UNITS_MEMO_N];
+static uint32_t s_str_units_memo_next = 0;
+
+/* UTF-16 length of a string / boxed String var (callers take the pure-ASCII
+ * shortcut first). */
+static int var_str_units(var_t* v) {
+	const char* s = var_get_str(v);
+	if(v->type != V_STRING || v->value == NULL || v->size < STR_UNITS_MEMO_MIN)
+		return mstr_utf16_length_n(s, v->size);
+	int i;
+	for(i = 0; i < STR_UNITS_MEMO_N; i++) {
+		str_units_memo_t* m = &s_str_units_memo[i];
+		if(m->vp == v && m->vm == v->vm && m->serial == v->serial &&
+				m->value == (const void*)v->value && m->size == v->size)
+			return m->units;
+	}
+	str_units_memo_t* m = &s_str_units_memo[s_str_units_memo_next++ % STR_UNITS_MEMO_N];
+	m->vp = v; m->vm = v->vm; m->serial = v->serial;
+	m->value = (const void*)v->value; m->size = v->size;
+	m->units = mstr_utf16_length_n(s, v->size);
+	return m->units;
+}
+
 /* ES: a canonical numeric STRING key indexes a string's characters, so str["1"]
  * === str[1] (and the same for a boxed String object, whose primitive lives in
  * ->value). mario stores strings as UTF-8, so this mirrors the numeric-key path
@@ -8755,6 +9433,22 @@ void do_get(vm_t* vm, var_t* v, const char* name, bool for_write) {
 				(v->type == V_NULL) ? "null" : "undef", name, (unsigned)vm->pc,
 				vm->dbg_tag != NULL ? "  [" : "", vm->dbg_tag != NULL ? vm->dbg_tag : "");
 	}
+	/* Chrome parity (MARIO_STRICTGET): a property READ on an undefined/null
+	 * base throws TypeError, exactly like Chrome, so site try/catch fallbacks
+	 * (wx flash detection: plugins["Shockwave Flash"].description) engage.
+	 * The legacy lenient read let the chain slip past the try and abort on
+	 * e.match() outside it. Writes keep the legacy path pending parity audit. */
+	static int s_strictget = -1;
+	if(s_strictget < 0) {
+		const char* sg = getenv("MARIO_STRICTGET");
+		/* Default ON (Chrome parity); =0 opts back into legacy lenient reads. */
+		s_strictget = (sg != NULL && strcmp(sg, "0") == 0) ? 0 : 1;
+	}
+	if(s_strictget && !for_write && v != NULL && (v->type == V_UNDEF || v->type == V_NULL)) {
+		vm_throw(vm, "Cannot read properties of %s (reading '%s')",
+			(v->type == V_NULL) ? "null" : "undefined", name != NULL ? name : "");
+		return;
+	}
 	/* Proxy intercept: `p.name` routes the get trap (read) or pushes a @@proxyslot
 	 * write-target (assignment). One hash miss for every non-proxy, so the plain
 	 * path below is untouched. */
@@ -8772,7 +9466,13 @@ void do_get(vm_t* vm, var_t* v, const char* name, bool for_write) {
 		return;
 	}
 	if(strcmp(name, "length") == 0 && (v->type == V_STRING || var_is_string_obj(v))) {
-		int len = mstr_utf16_length_n(var_get_str(v), v->size);
+		/* Pure-ASCII strings: UTF-16 code units == bytes, so .length is just the
+		 * stored byte size (O(1)). var_str_is_ascii memoizes the verdict per var,
+		 * so a loop reading .length on a big string stays O(1) per read instead of
+		 * an O(n) UTF-8 walk. Non-ASCII / boxed strings use the exact code-unit
+		 * count (astral code points count 2). */
+		int len = var_str_is_ascii(v) ? (int)v->size
+		                              : var_str_units(v);
 		vm_push(vm, var_new_int(vm, len));
 		return;
 	}
@@ -8909,6 +9609,28 @@ void do_get(vm_t* vm, var_t* v, const char* name, bool for_write) {
 			return;
 		}
 	}
+	/* [[Prototype]] is stored as a hidden invisable member literally named
+	 * "prototype" (see var_set_prototype). For a CALLABLE that name is the
+	 * script-visible instance template (Array.prototype, f.prototype) and must be
+	 * returned. For a NON-callable plain object there is no `.prototype` property
+	 * in JS - `({}).prototype` is undefined - so the internal slot must be hidden.
+	 * Leaking it made core-js's `expProto = exports.prototype || (exports.prototype
+	 * = {})` read Object.prototype (truthy) for its fresh `core[name] = {}`
+	 * namespace, short-circuit the `|| {}`, and then `expProto[key] = impl` hung
+	 * every patched Array/String/Function method onto Object.prototype as an
+	 * ENUMERABLE own property, polluting for-in/for-of and Object.keys site-wide.
+	 * Internal [[Prototype]] resolution uses var_get_prototype()/get_obj() (not this
+	 * script read path), so hiding the slot here does not affect the engine. */
+	/* A plain object's [[Prototype]] now lives in the hidden FPROTO slot, so hide
+	 * that name from script reads too (obj["@@fproto"] must be undefined, exactly
+	 * like the legacy invisable "prototype" slot it replaces). */
+	if(!for_write && n != NULL && n->invisable &&
+	   name != NULL && !v->is_func && !v->is_class &&
+	   ((name[0] == 'p' && strcmp(name, PROTOTYPE) == 0) ||
+	    (name[0] == '@' && strcmp(name, FPROTO) == 0))) {
+		vm_push(vm, var_new(vm));
+		return;
+	}
 	if(n != NULL && var_is_accessor(n->var)) {
 		if(for_write) {
 			vm_push(vm, v);        //object for the setter's `this`
@@ -8927,6 +9649,33 @@ void do_get(vm_t* vm, var_t* v, const char* name, bool for_write) {
 		return;
 	}
 
+	/* F.prototype.constructor === F, synthesized at READ time (see var_new_func's
+	 * @@proto_owner tag). Fires only when the chain resolved nothing or the
+	 * inherited Object.prototype.constructor - an own/assigned constructor always
+	 * wins. No own member is created, so ctor_from_base / @@ctor dispatch and
+	 * for-in/Object.keys stay exactly as before. The receiver may be an INSTANCE
+	 * (`new F()`): the member walk terminates at Object.prototype.constructor
+	 * before any synthesis could run on the intermediate template, so climb the
+	 * receiver's own prototype chain and take the NEAREST tagged template whose
+	 * owner still points at it (a replaced `F.prototype = {...}` orphan keeps a
+	 * stale tag but fails the identity check and is skipped). */
+	if(!for_write && name != NULL && strcmp(name, CONSTRUCTOR) == 0 &&
+	   v != NULL && !v->is_func && !v->is_class &&
+	   (n == NULL ||
+	    (vm->builtin_vars.var_Object != NULL &&
+	     n == var_find_own_member(var_get_prototype(vm->builtin_vars.var_Object), CONSTRUCTOR)))) {
+		var_t* walk = v;
+		int guard = 0;
+		while(walk != NULL && guard++ < 64) {
+			node_t* pon = var_find_own_member(walk, "@@proto_owner");
+			var_t* owner = (pon != NULL) ? pon->var : NULL;
+			if(owner != NULL && owner->is_func && var_get_prototype(owner) == walk) {
+				vm_push(vm, owner);
+				return;
+			}
+			walk = var_get_prototype(walk);
+		}
+	}
 	if(n == NULL) {
 		/* A READ of a missing member yields undefined and must NOT materialize an
 		 * own property: `typeof o.then` used to leave a real `then` member behind,
@@ -9759,8 +10508,20 @@ var_t* vm_new_class(vm_t* vm, const char* cls) {
  * component-stack instrumentation. */
 var_t* vm_new_namespace(vm_t* vm, const char* name) {
 	var_t* cls = vm_new_class(vm, name);
-	if(cls != NULL)
+	if(cls != NULL) {
 		cls->is_class = 0;
+		/* callable->plain transition: vm_new_class linked the static-bearing
+		 * prototype into PROTOTYPE (the callable instance-template slot). A plain
+		 * object reads [[Prototype]] from FPROTO, so migrate the link or Math.abs /
+		 * JSON.stringify etc. (installed on that prototype by vm_reg_static AFTER
+		 * this returns) would resolve through a NULL chain and vanish. Drop the
+		 * PROTOTYPE node so `Math.prototype` reads undefined like a real engine. */
+		node_t* pn = var_find_own_member(cls, PROTOTYPE);
+		if(pn != NULL && pn->var != NULL) {
+			var_set_prototype(cls, pn->var);
+			var_delete_own_member(cls, PROTOTYPE);
+		}
+	}
 	return cls;
 }
 
@@ -10587,8 +11348,9 @@ static inline void handle_neg(vm_t* vm, PC ins, opr_code_t instr, uint32_t offse
 
 /* Bitwise NOT `~x`: ToInt32(x) then invert. A BigInt operand yields -(x+1)
  * (still a BigInt). Non-numeric operands coerce like JS ToNumber: bool/null ->
- * 0/1, a numeric string -> its value, anything else (undefined, object, junk
- * string) -> NaN, and ToInt32(NaN) == 0, so ~NaN == -1. */
+ * 0/1, a numeric string -> its value, an object runs the full ToPrimitive
+ * (number hint) chain, undefined/junk string -> NaN, and ToInt32(NaN) == 0,
+ * so ~NaN == -1. */
 static inline void handle_bnot(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
 	var_t* v = vm_pop2(vm);
 	if(v == NULL) {
@@ -10616,15 +11378,18 @@ static inline void handle_bnot(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 		case V_STRING: {
 			const char* s = var_get_str(v);
 			while(s != NULL && (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r')) s++;
-			char* end = NULL;
-			d = (s != NULL && *s != 0) ? strtod(s, &end) : 0.0;
-			if(end != NULL) {
-				while(*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r') end++;
-				if(*end != 0) d = NAN; // trailing junk -> NaN
-			}
+			d = (s != NULL && *s != 0) ? es_str_to_number(s) : 0.0;
 			break;
 		}
-		default:        d = NAN; break; // V_UNDEF, V_OBJECT
+		case V_OBJECT:
+			/* ToInt32 begins with ToNumber(ToPrimitive(x, number)): run the
+			 * Symbol.toPrimitive / valueOf / toString chain exactly like
+			 * handle_pos, so `~date` inverts its epoch-ms timestamp (the
+			 * web.wechat.com checkLogin cache-buster `r=~new Date`) instead
+			 * of collapsing to ~NaN == -1. */
+			d = vm_to_number(vm, v);
+			break;
+		default:        d = NAN; break; // V_UNDEF
 	}
 	int32_t a;
 	if(isnan(d) || isinf(d)) {
@@ -10670,19 +11435,9 @@ static inline void handle_pos(vm_t* vm, PC ins, opr_code_t instr, uint32_t offse
 			vm_push(vm, var_new_int(vm, 0));
 			break;
 		case V_STRING: {
-			const char* s = var_get_str(v);
-			while(*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
-			if(*s == 0) {
-				vm_push(vm, var_new_int(vm, 0));
-				break;
-			}
-			char* end = NULL;
-			double d = strtod(s, &end);
-			while(end != NULL && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')) end++;
-			if(end != NULL && *end != 0)
-				vm_push(vm, var_new_float64(vm, NAN)); // trailing junk -> NaN
-			else
-				vm_push(vm, var_from_double(vm, d));
+			/* ES2015 StringNumericLiteral: the unsigned 0b/0o forms and the
+			 * signed-radix NaN rule apply to unary + exactly as to Number(). */
+			vm_push(vm, var_from_double(vm, es_str_to_number(var_get_str(v))));
 			break;
 		}
 		default: // V_UNDEF, V_OBJECT
@@ -10788,6 +11543,14 @@ static inline void handle_math(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 		v1 = proxy_get(vm, p, k, p);          // refs == baseline
 		var_ref(v1);                          // balance the trailing var_unref(v1)
 	}
+	/* Array `length` compound assign (`arr.length -= n`): the @@arrlen sentinel's
+	 * ->var is an undefined placeholder, not the current length, so the arithmetic
+	 * produced NaN and arrlen_slot_write cleared the array. Resolve the real length
+	 * as the left operand, mirroring the proxy slot above. */
+	if(is_compound_assign(instr) && is_arrlen_slot(n)) {
+		var_unref(v1);                        // discard the placeholder's stack ref
+		v1 = arrlen_slot_current(vm, n);      // fresh owned int (the real length)
+	}
 	/* In-place compound step for `x += <int>` / `x -= <int>` on a plain int
 	 * binding: the lvalue node is a real binding (not a synthetic @@sentinel)
 	 * holding the ONLY references to a boxed int (its own plus this
@@ -10803,6 +11566,7 @@ static inline void handle_math(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 			(instr == INSTR_PLUSEQ || instr == INSTR_MINUSEQ) &&
 			(v1->type == V_INT || v1->type == V_INT64) &&
 			v2 != NULL && (v2->type == V_INT || v2->type == V_INT64)) {
+		n->be_inherited = 0; /* a write, as node_replace would record it */
 		int64_t a = (v1->type == V_INT) ? *(int*)v1->value : *(int64_t*)v1->value;
 		int64_t b = (v2->type == V_INT) ? *(int*)v2->value : *(int64_t*)v2->value;
 		int64_t r;
@@ -10962,6 +11726,13 @@ static inline void vm_step_op(vm_t* vm, PC ins, node_t* n, var_t* v, int step, b
 		v = proxy_get(vm, p, k, p);            // refs == baseline
 		var_ref(v);                            // our own ref, dropped by var_unref(v) below
 	}
+	/* Array `length` step (`arr.length++` / `--arr.length`): resolve the real
+	 * length before stepping - the @@arrlen placeholder is undefined, which would
+	 * NaN the result and clear the array (see arrlen_slot_current). */
+	if(n != NULL && is_arrlen_slot(n)) {
+		var_unref(v);                          // discard the placeholder's stack ref
+		v = arrlen_slot_current(vm, n);        // fresh owned int (the real length)
+	}
 	/* In-place step for the discarded-result loop-counter idiom (`i++` in a
 	 * for head): when the stepped var is the binding's current value held ONLY
 	 * by its node and this instruction's stack alias (refs==2), and the POP
@@ -10980,6 +11751,7 @@ static inline void vm_step_op(vm_t* vm, PC ins, node_t* n, var_t* v, int step, b
 	   v == n->var && v->refs == 2 &&
 	   (v->type == V_INT || v->type == V_INT64) &&
 	   ((ins & INSTR_OPT_CACHE) != 0 || bc_pop_elidable(code, vm->pc))) {
+		n->be_inherited = 0; /* a write, as node_replace would record it */
 		int64_t base = (v->type == V_INT) ? *(int*)v->value : *(int64_t*)v->value;
 		int64_t r = base + (int64_t)step;
 		const int64_t SAFE = 9007199254740991LL; /* 2^53 - 1, as box_int_result */
@@ -11039,9 +11811,10 @@ static inline void vm_step_op(vm_t* vm, PC ins, node_t* n, var_t* v, int step, b
 	vm->gc.gc_defer--;
 }
 
-/* Only real numbers can be stepped; anything else yields the operand unchanged,
- * as before. Note the old code tested `v->value != NULL`, which treated a string
- * buffer as an int array and incremented its first four bytes. */
+/* Numbers (and BigInt) step in place through vm_step_op; every other operand
+ * is ToNumber'd first per ES ++/-- (see the tail below). Note the old code
+ * tested `v->value != NULL`, which treated a string buffer as an int array and
+ * incremented its first four bytes. */
 static inline void handle_step(vm_t* vm, PC ins, node_t* n, var_t* v, int step, bool prefix) {
 	/* An accessor target (`obj.x++`) reaches here as its accessor var, and a proxy
 	 * `@@proxyslot` sentinel (`p.x++`) as its lazy undefined placeholder - neither
@@ -11049,17 +11822,36 @@ static inline void handle_step(vm_t* vm, PC ins, node_t* n, var_t* v, int step, 
 	 * vm_step_op, which resolves the getter/setter or the get/set traps. (A
 	 * TypedArray's @@taslot already carries the decoded element, so it is numeric
 	 * and falls through to the normal path.) See vm_step_op()'s branches. */
-	if(n != NULL && (var_is_accessor(n->var) || is_proxy_slot(n))) {
+	if(n != NULL && (var_is_accessor(n->var) || is_proxy_slot(n) || is_arrlen_slot(n))) {
 		vm_step_op(vm, ins, n, v, step, prefix);
 		return;
 	}
 	if(v->type == V_INT || v->type == V_FLOAT ||
-	   v->type == V_INT64 || v->type == V_FLOAT64) {
+	   v->type == V_INT64 || v->type == V_FLOAT64 ||
+	   v->type == V_BIGINT) {
 		vm_step_op(vm, ins, n, v, step, prefix);
 		return;
 	}
-	vm_push(vm, v);
-	var_unref(v);
+	/* ES ++/-- applies ToNumber to the operand FIRST. Sizzle's super-matcher
+	 * starts its candidate index as the STRING d="0" and relies on d++ turning
+	 * it into the number 1 - the old no-op tail left a string unchanged, pinning
+	 * b[d] at index 0 so the matcher spun forever (web.wechat.com Angular
+	 * bootstrap hung 466s+). Same for "5"++ -> 6, null++ -> 1, true++ -> 2,
+	 * undefined++ -> NaN, and an object operand via ToPrimitive(number).
+	 * Convert to a numeric var holding the operand ref (as vm_pop2 transfers),
+	 * then reuse the proven numeric lane: postfix yields the ToNumber'd OLD
+	 * value, prefix the stepped one, and the write-back carries the number.
+	 * BigInt keeps its own var_step lane above. */
+	vm->gc.gc_defer++;
+	double d0 = vm_to_number(vm, v);
+	var_t* cv = (d0 == (double)(int64_t)d0 &&
+	             d0 >= -9007199254740991.0 && d0 <= 9007199254740991.0)
+	                ? box_int_result(vm, (int64_t)d0)
+	                : var_new_float64(vm, d0);
+	var_ref(cv);   /* claim the operand ref the numeric lane expects (fresh box is refs=0) */
+	var_unref(v);  /* release the original non-numeric operand's popped ref */
+	vm_step_op(vm, ins, n, cv, step, prefix);
+	vm->gc.gc_defer--;
 }
 
 static inline void handle_mminus_pre(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
@@ -11593,10 +12385,19 @@ static inline void handle_asign(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 static inline void handle_get(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
 	const char* s = bc_getstr(&vm->bc, offset);
 	var_t* v = vm_pop2(vm);
+	/* Chrome parity: reading a property of undefined/null is a TypeError.
+	 * The old lenient path (NULL base -> empty object, undefined base ->
+	 * undefined) let chained reads like plugins["Shockwave Flash"].description
+	 * silently produce {} and abort wx's flash-runtime webpack factory with
+	 * "can not find function 'match' on object{}", killing contact render. */
 	if(v == NULL) {
-		vm_push(vm, var_new(vm));
+		vm_throw(vm, "Cannot read properties of undefined (reading '%s')", s != NULL ? s : "");
 		return;
 	}
+	/* Named undefined/null bases are handled in do_get: Chrome-parity strict
+	 * read (default ON, MARIO_STRICTGET=0 opts out) throws TypeError so site
+	 * try/catch fallbacks engage; the taobao .enumerable gap was fixed at its
+	 * root (gOPD symbol-key resolution in native_Object.c). */
 	if(getenv("MARIO_MODDBG") != NULL && s != NULL &&
 	   strstr(s, "__webpack_modules__") != NULL) {
 		node_t* hn = (v->type == V_OBJECT) ? var_find_own_member(v, s) : NULL;
@@ -11627,10 +12428,19 @@ static inline void handle_get(vm_t* vm, PC ins, opr_code_t instr, uint32_t offse
 static inline void handle_getla(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
 	const char* s = bc_getstr(&vm->bc, offset);
 	var_t* v = vm_pop2(vm);
+	/* Chrome parity: reading a property of undefined/null is a TypeError.
+	 * The old lenient path (NULL base -> empty object, undefined base ->
+	 * undefined) let chained reads like plugins["Shockwave Flash"].description
+	 * silently produce {} and abort wx's flash-runtime webpack factory with
+	 * "can not find function 'match' on object{}", killing contact render. */
 	if(v == NULL) {
-		vm_push(vm, var_new(vm));
+		vm_throw(vm, "Cannot read properties of undefined (reading '%s')", s != NULL ? s : "");
 		return;
 	}
+	/* Named undefined/null bases are handled in do_get: Chrome-parity strict
+	 * read (default ON, MARIO_STRICTGET=0 opts out) throws TypeError so site
+	 * try/catch fallbacks engage; the taobao .enumerable gap was fixed at its
+	 * root (gOPD symbol-key resolution in native_Object.c). */
 	if(v->type == V_OBJECT && !v->is_array && !var_is_proxy(v) &&
 	   !var_is_string_obj(v) && v->refs > 1 && s != NULL &&
 	   strcmp(s, "length") != 0 && var_find_member(v, s) == NULL) {
@@ -12756,7 +13566,11 @@ static inline void handle_callx(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 	 * can sweep it mid-call. Park it as a C-side root for the whole handler. */
 	vm_push_c_root(vm, func);
 
-	if(func != NULL && (func->is_func || var_is_callable(func))) {
+	if(func != NULL && func->is_class && !func->is_func && !var_is_proxy(func)) {
+		var_t* ret = new_obj_with_ctor(vm, func, "value", arg_num, true);
+		vm_push(vm, ret != NULL ? ret : var_new(vm));
+	}
+	else if(func != NULL && (func->is_func || var_is_callable(func))) {
 		func_call(vm, obj, func, arg_num, false);
 	}
 	else {
@@ -12767,6 +13581,120 @@ static inline void handle_callx(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 			if(func != NULL && func->type == V_STRING)
 				fprintf(stderr, " str='%.80s'", var_get_str(func));
 			fprintf(stderr, "\n");
+			/* DIAG (MARIO_KTDUMP=<varname>): when the callee value is undefined,
+			 * walk the ENTIRE scope chain (module/closure scopes, not just func
+			 * frames) for <varname> and dump its shape + own members + prototype,
+			 * so a webpack namespace whose export resolves to undefined at an
+			 * indirect-call site can be told apart from an empty/failed module.
+			 * Read-only (no var_get_str / no array materialization) so it is safe
+			 * before gc_defer++ below. */
+			if(getenv("MARIO_KTDUMP") != NULL) {
+				const char* kn = getenv("MARIO_KTDUMP");
+				int found = 0;
+				for(int32_t si = vm->scope_stack_top - 1; si >= 0; si--) {
+					scope_t* ssc = vm->scope_stack[si];
+					if(ssc == NULL || var_empty(ssc->var)) continue;
+					var_t* kv = var_find_own_member_var(ssc->var, kn);
+					if(kv == NULL) continue;
+					found = 1;
+					fprintf(stderr, "[ktdump] '%s' scope[%d] is_func=%d type=%d v_is_func=%d v_is_array=%d proxy=%d ptr=%p\n",
+						kn, si, (int)ssc->is_func, (int)kv->type, (int)kv->is_func,
+						(int)kv->is_array, (int)var_is_proxy(kv), (void*)kv);
+					fprintf(stderr, "[ktdump]   members[cap=%u]:", (unsigned)kv->children.capacity);
+					int shown = 0;
+					for(uint32_t b = 0; b < kv->children.capacity && shown < 48; b++) {
+						for(hash_entry_t* he = kv->children.buckets[b]; he != NULL && shown < 48; he = he->next, ++shown) {
+							node_t* nd = (node_t*)he->value;
+							var_t* mv = (nd != NULL) ? nd->var : NULL;
+							fprintf(stderr, " %s:t%d/f%d", he->key,
+								(mv != NULL) ? (int)mv->type : -1, (mv != NULL) ? (int)mv->is_func : 0);
+						}
+					}
+					fprintf(stderr, "\n");
+					var_t* proto = var_get_prototype(kv);
+					fprintf(stderr, "[ktdump]   proto=%p own_rNE=%d\n", (void*)proto,
+						(proto != NULL && var_find_own_member(proto, "reportNewExpose") != NULL) ? 1 : 0);
+					fflush(stderr);
+				}
+				if(!found) {
+					fprintf(stderr, "[ktdump] '%s' NOT FOUND across %d scopes\n", kn, (int)vm->scope_stack_top);
+					fflush(stderr);
+				}
+				/* Also lay out the whole scope chain (index, is_func, var names)
+				 * so the module-level binding that SHOULD hold the exports object
+				 * can be located relative to the undefined inner one. */
+				if(getenv("MARIO_SCOPEDUMP") != NULL) {
+					for(int32_t si = vm->scope_stack_top - 1; si >= 0; si--) {
+						scope_t* ssc = vm->scope_stack[si];
+						if(ssc == NULL) { fprintf(stderr, "[scopedump] [%d] NULL\n", si); continue; }
+						fprintf(stderr, "[scopedump] [%d] is_func=%d empty=%d names:", si,
+							(int)ssc->is_func, (int)var_empty(ssc->var));
+						if(!var_empty(ssc->var)) {
+							int shown = 0;
+							for(uint32_t b = 0; b < ssc->var->children.capacity && shown < 40; b++) {
+								for(hash_entry_t* he = ssc->var->children.buckets[b]; he != NULL && shown < 40; he = he->next, ++shown) {
+									node_t* nd = (node_t*)he->value;
+									var_t* mv = (nd != NULL) ? nd->var : NULL;
+									fprintf(stderr, " %s(t%d)", he->key, (mv != NULL) ? (int)mv->type : -1);
+								}
+							}
+						}
+						fprintf(stderr, "\n");
+					}
+					fflush(stderr);
+				}
+				/* DIAG (MARIO_SRCDUMP=<srcid>:<from>:<to>): dump the raw retained
+				 * source char range once, so the assignment site of an undefined
+				 * local (e.g. `kt = ...`) can be read from the minified bundle
+				 * without re-downloading it. The full source text lives in
+				 * bc->srcs.items[] (see bc_srcmap_begin). */
+				if(getenv("MARIO_SRCDUMP") != NULL) {
+					static int srcdumped = 0;
+					if(!srcdumped) {
+						srcdumped = 1;
+						int sid = 0; unsigned from = 0, to = 0;
+						if(sscanf(getenv("MARIO_SRCDUMP"), "%d:%u:%u", &sid, &from, &to) == 3 &&
+							sid >= 0 && (uint32_t)sid < vm->bc.srcs.size) {
+							const char* sraw = (const char*)vm->bc.srcs.items[sid];
+							size_t L = strlen(sraw);
+							if(to > L) to = (unsigned)L;
+							fprintf(stderr, "[srcdump] src#%d [%u,%u) len=%zu\n", sid, from, to, L);
+							for(unsigned i = from; i < to && i < L; i++) {
+								char c = sraw[i];
+								fputc((c == '\n' || c == '\r' || c == '\t') ? ' ' : c, stderr);
+							}
+							fputc('\n', stderr);
+						}
+						fflush(stderr);
+					}
+				}
+				/* DIAG (MARIO_SRCWRITE=<srcid>:<path>): write the full retained
+				 * source of <srcid> to <path> once, so the whole minified bundle
+				 * can be grepped offline (e.g. for where an import binding such
+				 * as `kt` is assigned). */
+				if(getenv("MARIO_SRCWRITE") != NULL) {
+					static int srcwrote = 0;
+					if(!srcwrote) {
+						srcwrote = 1;
+						int sid = 0; char path[512]; path[0] = 0;
+						const char* colon = strchr(getenv("MARIO_SRCWRITE"), ':');
+						if(colon != NULL) {
+							sid = atoi(getenv("MARIO_SRCWRITE"));
+							snprintf(path, sizeof path, "%s", colon + 1);
+						}
+						if(path[0] != 0 && sid >= 0 && (uint32_t)sid < vm->bc.srcs.size) {
+							const char* sraw = (const char*)vm->bc.srcs.items[sid];
+							FILE* wf = fopen(path, "wb");
+							if(wf != NULL) {
+								fwrite(sraw, 1, strlen(sraw), wf);
+								fclose(wf);
+								fprintf(stderr, "[srcwrite] src#%d -> %s (%zu bytes)\n", sid, path, strlen(sraw));
+							} else fprintf(stderr, "[srcwrite] fopen FAILED %s\n", path);
+						}
+						fflush(stderr);
+					}
+				}
+			}
 			{ /* dump the listener array `e` from R's function env.
 			   * vm_get_scope_var returns the innermost for-loop BLOCK scope, which
 			   * does not hold R's `e` param, so walk the scope stack up to the
@@ -12886,10 +13814,30 @@ static inline void handle_callxo(vm_t* vm, PC ins, opr_code_t instr, uint32_t of
 	vm_push_c_root(vm, func);
 	vm_push_c_root(vm, obj);
 
-	if(func != NULL && (func->is_func || var_is_callable(func))) {
+	if(func != NULL && func->is_class && !func->is_func && !var_is_proxy(func)) {
+		var_t* ret = new_obj_with_ctor(vm, func, "computed", arg_num, true);
+		vm_push(vm, ret != NULL ? ret : var_new(vm));
+	}
+	else if(func != NULL && (func->is_func || var_is_callable(func))) {
 		func_call(vm, obj, func, arg_num, false);
 	}
 	else {
+		if(getenv("MARIO_RSDBG") != NULL) {
+			fprintf(stderr, "[rsdbg] CALLXO non-func pc=%u tag=%s func=%p(t%d f%d) obj=%p(t%d f%d)\n",
+				(unsigned)vm->pc, vm->dbg_tag != NULL ? vm->dbg_tag : "-",
+				(void*)func, func != NULL ? (int)func->type : -1,
+				func != NULL ? (int)func->is_func : 0,
+				(void*)obj, obj != NULL ? (int)obj->type : -1,
+				obj != NULL ? (int)obj->is_func : 0);
+			if(func != NULL && func->type == V_STRING)
+				fprintf(stderr, "[rsdbg]   func str='%.120s'\n", var_get_str(func));
+			if(obj != NULL && obj->type == V_STRING)
+				fprintf(stderr, "[rsdbg]   obj str='%.120s'\n", var_get_str(obj));
+			mstr_t* loc = mstr_new("");
+			if(bc_srcmap_locate(&vm->bc, vm->pc, loc))
+				fprintf(stderr, "[rsdbg]   callsite %s\n", loc->cstr);
+			mstr_free(loc);
+		}
 		vm->gc.gc_defer++; //func/obj are bare C pointers while the args are popped and the throw unwinds
 		while(arg_num > 0) {
 			vm_pop(vm);
@@ -13015,7 +13963,8 @@ static inline void handle_func(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 		/* ES named function expression: stash the function's own name so func_call
 		 * can bind it into each call's env (self-reference visible inside the body
 		 * only). The name rides this instruction's string operand. */
-		if(instr == INSTR_FUNC_NAMED || instr == INSTR_FUNC_GEN_NAMED) {
+		if(instr == INSTR_FUNC_NAMED || instr == INSTR_FUNC_GEN_NAMED ||
+		   instr == INSTR_FUNC_DECLNAME || instr == INSTR_FUNC_GEN_DECLNAME) {
 			const char* nm = bc_getstr(&vm->bc, offset);
 			if(nm != NULL && nm[0] != 0) {
 				func_t* f = var_get_func(v);
@@ -13025,6 +13974,13 @@ static inline void handle_func(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 					if(f->nfe_name != NULL)
 						memcpy(f->nfe_name, nm, nlen + 1);
 				}
+				/* A DECLARATION records its name for `.name`/Error.stack parity but
+				 * must NOT self-bind it into the per-call env (see func_call): the
+				 * enclosing INSTR_MEMBERN binding is the one a body `name = ...`
+				 * (self-memoizing idiom) has to rebind. Flag it so func_call skips. */
+				if(f != NULL &&
+				   (instr == INSTR_FUNC_DECLNAME || instr == INSTR_FUNC_GEN_DECLNAME))
+					f->no_self_bind = 1;
 			}
 		}
 		/* ES named-class-expression self-binding: a method / constructor / field
@@ -13056,7 +14012,7 @@ static inline void handle_func(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 		/* Mark ES6 arrow / generator functions so the runtime can enforce their
 		 * special semantics (arrows are not constructible; generators suspend at
 		 * `yield` instead of running straight through). */
-		if(instr == INSTR_FUNC_ARROW || instr == INSTR_FUNC_GEN || instr == INSTR_FUNC_GEN_NAMED) {
+		if(instr == INSTR_FUNC_ARROW || instr == INSTR_FUNC_GEN || instr == INSTR_FUNC_GEN_NAMED || instr == INSTR_FUNC_GEN_DECLNAME) {
 			func_t* f = var_get_func(v);
 			if(f != NULL) {
 				if(instr == INSTR_FUNC_ARROW) {
@@ -14318,20 +15274,27 @@ static inline void handle_arr_spread(vm_t* vm, PC ins, opr_code_t instr, uint32_
 		var_unref(src);
 }
 
-typedef struct {
-	var_t* target;
-} obj_spread_data;
-
-static void obj_spread_cb(const char* key, void* value, void* user_data) {
-	(void)key;
-	obj_spread_data* d = (obj_spread_data*)user_data;
-	node_t* node = (node_t*)value;
-	if(node != NULL &&
-			node->be_inherited == 0 &&
-			node->invisable == 0 &&
-			!node->be_unenumerable) {
-		var_add(d->target, node->name, node->var);
+static void obj_spread_copy(vm_t* vm, var_t* src, var_t* target) {
+	var_t* keys = var_new_array(vm);
+	var_own_keys(vm, src, keys, true);
+	vm->gc.gc_defer++;
+	uint32_t count = var_array_size(keys);
+	for(uint32_t i = 0; i < count; i++) {
+		var_t* key = var_array_get_var(keys, (int32_t)i);
+		if(key == NULL || key->type != V_STRING)
+			continue;
+		const char* name = var_get_str(key);
+		node_t* node = var_find_own_member(src, name);
+		if(node == NULL && src->is_array) {
+			var_t* elements = var_find_own_member_var(src, "_ARRAY_");
+			if(elements != NULL)
+				node = var_find_own_member(elements, name);
+		}
+		if(node != NULL)
+			var_add(target, name, node->var);
 	}
+	vm->gc.gc_defer--;
+	var_unref(keys);
 }
 
 /* ES6 object literal spread: {...src}. Copy src's own enumerable members into
@@ -14339,11 +15302,8 @@ static void obj_spread_cb(const char* key, void* value, void* user_data) {
 static inline void handle_obj_spread(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
 	var_t* src = vm_pop2(vm);
 	var_t* target = vm_get_scope_var(vm);
-	if(src != NULL && target != NULL) {
-		obj_spread_data d;
-		d.target = target;
-		hash_map_iterate(&src->children, obj_spread_cb, &d);
-	}
+	if(src != NULL && target != NULL)
+		obj_spread_copy(vm, src, target);
 	if(src != NULL)
 		var_unref(src);
 }
@@ -14726,7 +15686,13 @@ static void array_at_push(vm_t* vm, var_t* v1, var_t* v2, bool for_write) {
 			return;
 		}
 		if(!for_write && (v1->type == V_STRING || var_is_string_obj(v1))) {
-			int len = mstr_utf16_length_n(var_get_str(v1), v1->size);
+			/* Same pure-ASCII O(1) shortcut as do_get's `.length`: a JS MD5's
+			 * str2binl reads the length via a COMPUTED key (`e["length"]`) once per
+			 * iteration, so this path - not do_get - is the one that made hashing a
+			 * large canvas-fingerprint string O(n^2). var_str_is_ascii memoizes the
+			 * verdict per var; boxed / non-ASCII strings use the exact code-unit count. */
+			int len = var_str_is_ascii(v1) ? (int)v1->size
+			                               : var_str_units(v1);
 			vm_push(vm, var_new_int(vm, len));
 			var_unref(v1);
 			var_unref(v2);
@@ -14801,6 +15767,19 @@ static void array_at_push(vm_t* vm, var_t* v1, var_t* v2, bool for_write) {
 		const char* s = var_get_str(v1);
 		uint32_t bytes = (s != NULL) ? v1->size : 0;
 		if(s != NULL && at >= 0) {
+			/* Pure-ASCII: code-unit index == byte index, so the character at `at` is
+			 * the single byte s[at] - O(1) instead of walking `at` UTF-8 code points
+			 * (a `s[i]` scan loop over a big string was O(n^2), same class of bug as
+			 * charCodeAt/.length). Non-ASCII falls through to the code-unit walk. */
+			if(var_str_is_ascii(v1)) {
+				if((uint32_t)at < bytes)
+					vm_push(vm, var_new_str_bin(vm, s + at, 1));
+				else
+					vm_push(vm, var_new(vm));
+				var_unref(v1);
+				var_unref(v2);
+				return;
+			}
 			/* Code-unit index (consistent with .length / charCodeAt / at), NUL-safe:
 			 * walk the stored byte length, not strlen, so an embedded 0x00 is a real
 			 * code unit and a multi-byte code point is returned whole. */
@@ -14839,6 +15818,16 @@ static void array_at_push(vm_t* vm, var_t* v1, var_t* v2, bool for_write) {
 			mstr_free(ks);
 		}
 	}
+	/* Hide the internal [[Prototype]] slot from a computed READ exactly as do_get
+	 * does: a plain object's invisable "prototype"/FPROTO member is internal state,
+	 * not a script property, so `o["@@fproto"]` / `o["prototype"]` must be undefined.
+	 * var_find_member resolves invisable nodes; the named do_get path hides them at
+	 * its own guard, but this computed path pushed n->var directly and leaked the
+	 * slot (now widespread since FPROTO lives on every plain object). */
+	if(!for_write && n != NULL && n->invisable && n->name != NULL &&
+	   !v1->is_func && !v1->is_class &&
+	   (strcmp(n->name, PROTOTYPE) == 0 || strcmp(n->name, FPROTO) == 0))
+		n = NULL;
 	/* Accessor via computed key (`navigator["userAgent"]`, `obj[k]` where k names
 	 * a getter property): the string/symbol path above resolves the member node
 	 * but, unlike do_get, never invoked the getter - core-js reads builtins
@@ -15120,6 +16109,14 @@ static inline void handle_class_end(vm_t* vm, PC ins, opr_code_t instr, uint32_t
 			 * the real class prototype. var_set_prototype's node_replace refs
 			 * protoV and releases the orphaned empty template. */
 			var_set_prototype(cn->var, protoV);
+			/* Keep the read-time constructor synthesis (do_get) working through
+			 * the rewire: the class prototype now doubles as c's visible
+			 * .prototype, so tag it with c as owner. A class's own explicit
+			 * prototype.constructor member still outranks the synthesis. */
+			{
+				node_t* pon = var_add(protoV, "@@proto_owner", cn->var);
+				if(pon != NULL) { pon->invisable = 1; pon->be_unenumerable = 1; }
+			}
 		}
 	}
 	vm_push(vm, cls);
@@ -15584,34 +16581,11 @@ static var_t* call_with_args(vm_t* vm, var_t* thisArg, var_t* func, var_t* argsN
 	return res;
 }
 
-/* Collect the OWN property keys of a plain object/array (no prototype chain).
- * Array elements live in the nested _ARRAY_ store, so indices come from there. */
-typedef struct { vm_t* vm; var_t* keys; bool enum_only; hash_map_t* seen; } proxy_keys_ctx;
-static void proxy_keys_cb(const char* key, void* value, void* ud) {
-	(void)key;
-	proxy_keys_ctx* d = (proxy_keys_ctx*)ud;
-	node_t* node = (node_t*)value;
-	if(node == NULL || node->be_inherited || node->invisable)
-		return;
-	if(d->enum_only && node->be_unenumerable)
-		return;
-	if(hash_map_get(d->seen, node->name) != NULL)
-		return;
-	hash_map_add(d->seen, node->name, (void*)"");
-	var_array_add(d->keys, var_new_str(d->vm, node->name));
-}
+/* Default Proxy ownKeys forwards to the same ordinary key ordering used by
+ * Object.keys, object spread and JSON.stringify. */
 static var_t* own_keys_default(vm_t* vm, var_t* obj, bool enum_only) {
 	var_t* keys = var_new_array(vm);
-	if(obj == NULL)
-		return keys;
-	vm->gc.gc_defer++;   // keys is unrooted here
-	hash_map_t* seen = hash_map_new();
-	proxy_keys_ctx d; d.vm = vm; d.keys = keys; d.enum_only = enum_only; d.seen = seen;
-	var_t* cont = obj->is_array ? var_find_own_member_var(obj, "_ARRAY_") : obj;
-	if(cont != NULL)
-		hash_map_iterate(&cont->children, proxy_keys_cb, &d);
-	hash_map_free(seen, mario_free, NULL);
-	vm->gc.gc_defer--;
+	var_own_keys(vm, obj, keys, enum_only);
 	return keys;   // refs=0
 }
 
@@ -16115,7 +17089,17 @@ static void diag_scan_cb(const char* key, void* value, void* user_data) {
 }
 
 var_t* mario_apply_var(vm_t* vm, var_t* func, var_t* thisArg, var_t* argsNatural) {
-	if(func == NULL || !var_is_callable(func)) {
+	/* Native builtin constructors (String/Array/Number/...) have [[Call]] even
+	 * though their class wrapper deliberately keeps is_func clear for `new`.
+	 * Accept only a class whose pinned constructor is native: an ES6 script class
+	 * remains non-callable through call/apply, as required by the specification. */
+	bool native_class_call = false;
+	if(func != NULL && func->is_class && !func->is_func && !var_is_proxy(func)) {
+		var_t* ctor = var_find_own_member_var(func, "@@ctor");
+		func_t* cf = (ctor != NULL) ? var_get_func(ctor) : NULL;
+		native_class_call = (cf != NULL && cf->native != NULL);
+	}
+	if(func == NULL || (!var_is_callable(func) && !native_class_call)) {
 		/* TEMP taobao diag: scope chain + pc of the non-callable apply. */
 		if(getenv("MARIO_APPLYDBG")) {
 			scope_t* sc = vm_get_scope(vm);
@@ -16155,6 +17139,48 @@ var_t* mario_apply_var(vm_t* vm, var_t* func, var_t* thisArg, var_t* argsNatural
 			if(thisArg != NULL)
 				fprintf(stderr, "[mario-diag]   thisArg type=%u is_func=%u\n",
 					(unsigned)thisArg->type, (unsigned)thisArg->is_func);
+			/* fireye's VMP reaches apply through
+			 * `n=(n=l[p])[l[z]], v=l[p], B=o(n,v,x=t)`. Preserve the
+			 * actual receiver and computed key at the failing call; logging only
+			 * the final undefined target cannot distinguish a bad register from
+			 * a missing member on an otherwise valid receiver. */
+			if(getenv("MARIO_APPLYWIN")) {
+				node_t* ln = vm_find_in_scopes(vm, "l");
+				node_t* pn = vm_find_in_scopes(vm, "p");
+				node_t* zn = vm_find_in_scopes(vm, "z");
+				node_t* nn = vm_find_in_scopes(vm, "n");
+				var_t* lv = (ln != NULL) ? ln->var : NULL;
+				var_t* pv = (pn != NULL) ? pn->var : NULL;
+				var_t* zv = (zn != NULL) ? zn->var : NULL;
+				int pi = (pv != NULL) ? var_get_int(pv) : -1;
+				int zi = (zv != NULL) ? var_get_int(zv) : -1;
+				var_t* recv = (lv != NULL && lv->is_array) ? var_array_get_var(lv, pi) : NULL;
+				var_t* key = (lv != NULL && lv->is_array) ? var_array_get_var(lv, zi) : NULL;
+				fprintf(stderr, "[mario-vmp] l=%p(t%u a%u n%u) p=%d(t%u) z=%d(t%u) n=%p(t%u f%u)\n",
+					(void*)lv, (unsigned)(lv != NULL ? lv->type : 999u),
+					(unsigned)(lv != NULL ? lv->is_array : 0u),
+					(unsigned)(lv != NULL ? var_array_size(lv) : 0u),
+					pi, (unsigned)(pv != NULL ? pv->type : 999u),
+					zi, (unsigned)(zv != NULL ? zv->type : 999u),
+					(void*)(nn != NULL ? nn->var : NULL),
+					(unsigned)(nn != NULL && nn->var != NULL ? nn->var->type : 999u),
+					(unsigned)(nn != NULL && nn->var != NULL ? nn->var->is_func : 0u));
+				fprintf(stderr, "[mario-vmp] recv=%p(t%u f%u members=%u) key=%p(t%u) keystr=[%s] keyint=%lld\n",
+					(void*)recv, (unsigned)(recv != NULL ? recv->type : 999u),
+					(unsigned)(recv != NULL ? recv->is_func : 0u),
+					(unsigned)(recv != NULL ? hash_map_size(&recv->children) : 0u),
+					(void*)key, (unsigned)(key != NULL ? key->type : 999u),
+					(key != NULL && key->type == V_STRING) ? var_get_str(key) : "-",
+					(long long)(key != NULL ? var_get_int64(key) : -1));
+				if(recv != NULL && key != NULL && key->type == V_STRING) {
+					var_t* member = var_find_member_var(recv, var_get_str(key));
+					var_t* own = var_find_own_member_var(recv, var_get_str(key));
+					fprintf(stderr, "[mario-vmp] member=%p(t%u f%u) own=%p proto=%p\n",
+						(void*)member, (unsigned)(member != NULL ? member->type : 999u),
+						(unsigned)(member != NULL ? member->is_func : 0u),
+						(void*)own, (void*)var_get_prototype(recv));
+				}
+			}
 			{
 				int d;
 				for(d = apply_depth - 6; d <= apply_depth; ++d) {
@@ -16609,11 +17635,8 @@ static inline void handle_export_value(vm_t* vm, PC ins, opr_code_t instr, uint3
  * skips inherited / invisable / non-enumerable members. */
 static inline void handle_export_star(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
 	var_t* src = vm_pop2(vm);
-	if(vm->cur_module != NULL && src != NULL) {
-		obj_spread_data d;
-		d.target = vm->cur_module;
-		hash_map_iterate(&src->children, obj_spread_cb, &d);
-	}
+	if(vm->cur_module != NULL && src != NULL)
+		obj_spread_copy(vm, src, vm->cur_module);
 	if(src != NULL)
 		var_unref(src);
 }
@@ -16854,6 +17877,8 @@ static void init_instr_table(void) {
 	instr_table[INSTR_FUNC_GEN] = handle_func;
 	instr_table[INSTR_FUNC_NAMED] = handle_func;
 	instr_table[INSTR_FUNC_GEN_NAMED] = handle_func;
+	instr_table[INSTR_FUNC_DECLNAME] = handle_func;
+	instr_table[INSTR_FUNC_GEN_DECLNAME] = handle_func;
 	instr_table[INSTR_CALL] = handle_call;
 	instr_table[INSTR_CALLO] = handle_call;
 	instr_table[INSTR_CALLX] = handle_callx;
@@ -17569,6 +18594,35 @@ bool vm_load_run_native(vm_t* vm, const char* s) {
 	return ret;
 }
 
+/* ES CreateDynamicFunction: a Function-constructor body is compiled and run in
+ * the GLOBAL scope and is ALWAYS sloppy, regardless of the strictness of the
+ * code that called `new Function`. A native call does not push a JS scope
+ * frame, so the caller's strict scope (e.g. a VMP signer declared 'use strict')
+ * is still reachable via vm_get_scope; the wrapper assignment `KEY = function`
+ * to an undeclared name would then hit vm_get_strict_scope and throw
+ * "'KEY' undefined!" instead of creating the hidden global. Temporarily
+ * neutralize the strict flag on the live scope chain up to (and including) the
+ * outermost function boundary - exactly the scopes vm_get_strict_scope walks -
+ * run the wrapper, then restore. The generated function keeps its OWN
+ * strictness (fixed by its body at compile time), so this only affects where
+ * the wrapper binding lands, matching Chrome. */
+bool vm_load_run_native_sloppy(vm_t* vm, const char* s) {
+	scope_t* saved[16];
+	int nsaved = 0;
+	for(scope_t* sc = vm_get_scope(vm); sc != NULL && nsaved < 16; sc = sc->prev) {
+		if(sc->is_strict) {
+			saved[nsaved++] = sc;
+			sc->is_strict = false;
+		}
+		if(sc->is_func)
+			break;
+	}
+	bool ret = vm_load_run_native(vm, s);
+	for(int i = 0; i < nsaved; i++)
+		saved[i]->is_strict = true;
+	return ret;
+}
+
 typedef struct st_native_init {
 	void (*func)(void*);
 	void *data;
@@ -17614,7 +18668,6 @@ void vm_close(vm_t* vm) {
 
 	var_unref(vm->root);
 	vm->root = NULL;
-	bc_release(&vm->bc);
 	vm->stack_top = 0;
 
 	/* Drain the WANCHOR trio pool before the final gc: each trio dies through
@@ -17634,7 +18687,23 @@ void vm_close(vm_t* vm) {
 	}
 
 	weak_registry_free(vm); // Phase 6: release weak cells (unref held/callback) before the final sweep
+	/* Drain never_gc into gc_vars before the final forced sweep: the leaf guard
+	 * keeps object vars off gc_vars at runtime (C-held vars without a registered
+	 * root must not be swept opportunistically), which also hides reference-cycle
+	 * garbage from every collection - wx.qq.com QR reloads retained ~5M var/node
+	 * cells (~430MB) per reload, leaks showed ROOT CYCLE malloc<112> <->
+	 * malloc<176>. Here the VM is dying: roots are already dropped above, so the
+	 * forced sweep below reclaims the cycles with the same cascade semantics as
+	 * any gc_vars member (stale C unrefs hit the var_empty/vm==NULL sentinels). */
+	while(vm->gc.never_gc != NULL)
+		add_to_gc(vm->gc.never_gc);
 	gc(vm, true);
+	/* Release the bytecode string table ONLY AFTER the final sweep: member
+	 * node names can borrow bc string-table entries (bc_getstrindex), and the
+	 * sweep above now also reclaims never_gc cycle garbage whose nodes were
+	 * never torn down before - freeing the table first left node_free reading
+	 * a dangling name (ASan heap-use-after-free on taobao teardown). */
+	bc_release(&vm->bc);
 	/* Drain the numeric-box pool: the final sweep just recycled every numeric
 	 * payload into it, and the vm struct itself is freed below. */
 	while(vm->nbox_free != NULL) {

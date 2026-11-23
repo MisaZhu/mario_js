@@ -434,8 +434,10 @@ typedef struct st_bytecode {
 #define INSTR_FUNCLOC      0x0A4 // FUNCLOC name : function-header metadata between the FUNC* opcode and its JMP sentinel (never executed: the sentinel skips the whole header region, and func_def consumes it while scanning). Declares one hoisted `var` local of the body; func_def appends `name` to func->locals so scope_fill_pslots can pre-create the env binding and alias it into the param-slot cache right after the true parameters (slot k <-> (args ++ locals)[k]).
 #define INSTR_FUNCARGU     0x0A5 // FUNCARGU "arguments" : function-header metadata (same never-executed region as FUNCLOC). Marks that the body references `arguments` (a bare read/write, a template interpolation, a default-value initialiser, or a rest parameter, which compiles to arguments.slice) - func_def sets func->uses_arguments so func_call can skip materializing the arguments array for bodies that provably never read it.
 #define INSTR_CLASS_EXPR   0x0A6 // CLASS_EXPR name : a NAMED class EXPRESSION (`x = class N {...}`). Like INSTR_CLASS but the self-name N is bound ONLY inside the class body (a fresh, distinct class var under a unique internal binding, never reusing/clobbering an enclosing `N`), so several `class N` expressions in one scope stay distinct and `new N` inside a method resolves to the right class. Handled by handle_class.
+#define INSTR_FUNC_DECLNAME 0x0A7 // FUNC_DECLNAME name : a function DECLARATION's own name. Like INSTR_FUNC_NAMED it stashes the operand into func_t.nfe_name (so `.name` and Error.stack frames report the declared name), but it ALSO sets func_t.no_self_bind so func_call does NOT bind the name into the per-call env. A declaration's name is already bound in the ENCLOSING scope (the INSTR_MEMBERN emitted right after), so a body self-assignment `f = ...` (the javascript-obfuscator self-memoizing string-array rotation JD's pc-tk.js relies on) must rebind that outer declaration, not a shadowing local copy - otherwise the decoder array is never rotated and the checksum loop spins forever on NaN.
+#define INSTR_FUNC_GEN_DECLNAME 0x0A8 // FUNC_GEN_DECLNAME name : the generator form of INSTR_FUNC_DECLNAME (`function* name(){}` declaration): sets nfe_name + no_self_bind and marks is_generator, but creates no in-body self-binding.
 
-#define INSTR_MAX          0x0A7 // Instruction-table size / opcode guard: one past the highest defined opcode (INSTR_CLASS_EXPR).
+#define INSTR_MAX          0x0A9 // Instruction-table size / opcode guard: one past the highest defined opcode (INSTR_FUNC_GEN_DECLNAME).
 
 /* vm_t.pending_op: the kind of control transfer parked while a `finally` block
  * runs (see the pending_value comment in the vm struct). */
@@ -689,6 +691,7 @@ typedef struct st_func {
 	int8_t              is_generator: 4; // ES6 `function*` / generator method
 	int8_t              is_arrow: 4;     // ES6 arrow function: lexical `this`, no `prototype`, not constructible
 	int8_t              is_async: 4;     // ES2017 `async function`: called as a coroutine (see the async driver in mario.c)
+	int8_t              no_self_bind: 4; // function DECLARATION name (INSTR_FUNC_DECLNAME / _GEN_): nfe_name is recorded for .name/Error.stack parity ONLY; func_call must NOT bind it into the per-call env, so a body `name = ...` rebinds the enclosing declaration instead of a shadowing local self-copy
 	PC                  pc;
 	void*               data;
 	/* ES named-function-expression self-binding: for `var f = function name(){...}`
@@ -1175,6 +1178,18 @@ typedef struct st_vm {
 		var_t*          gc_vars;
 		var_t*          gc_vars_tail;
 		uint32_t        gc_vars_num;
+		/* Live vars that never joined gc_vars (the leaf guard keeps object vars
+		 * off the gc list so opportunistic sweeps can not reclaim C-held vars
+		 * that have no registered root). They ride this second list via the same
+		 * prev/next pointers - a var is on exactly ONE of gc_vars / never_gc /
+		 * free_var_buffer at any time, and its status tells which (V_ST_GC /
+		 * V_ST_GC_FREE = gc_vars, V_ST_REF = never_gc, V_ST_FREE = pool), so
+		 * list membership must be read from status, never from prev/next alone.
+		 * Invisible to opportunistic gc; vm_close drains it into gc_vars so the
+		 * final forced sweep reclaims reference-cycle garbage (wx.qq.com reloads
+		 * otherwise retained ~430MB per cycle). */
+		var_t*          never_gc;
+		var_t*          never_gc_tail;
 		/* C-side roots: vars a running native holds only in C locals. The collector
 		 * walks the var graph, the value stack, the scope stack and the caches - it
 		 * can NOT see the C stack - so such a var looks unreachable and gets swept in
@@ -1284,6 +1299,7 @@ node_t*     var_add(var_t* var, const char* name, var_t* add);
 node_t*     var_add_head(var_t* var, const char* name, var_t* add);
 node_t*     var_find_own_member(var_t* var, const char*name);
 var_t*      var_find_own_member_var(var_t* var, const char*name);
+void        var_own_keys(vm_t* vm, var_t* var, var_t* keys_var, bool enum_only);
 node_t*     var_find_member_create(var_t* var, const char*name);
 node_t*     var_get(var_t* var, int32_t index);
 
@@ -1323,6 +1339,12 @@ var_t*      var_new_str2(vm_t* vm, const char* s, uint32_t len);
  * byte buffers. Sets size=len and NUL-terminates at [len] for C compat. */
 var_t*      var_new_str_bin(vm_t* vm, const char* s, uint32_t len);
 const char* var_get_str(var_t* var);
+/* Pure-ASCII verdict for a V_STRING var, memoized per (vm, pointer, serial).
+ * A string whose bytes are all < 0x80 has UTF-16 code-unit index == byte index,
+ * so .length == byte count and charCodeAt(i) == (unsigned char)s[i] become O(1)
+ * instead of an O(n) UTF-8 rescan per call. Returns 0 for non-V_STRING (boxed
+ * String objects, NULL) so callers fall back to the general UTF-8 walk. */
+int         var_str_is_ascii(var_t* var);
 var_t*      var_set_str(var_t* var, const char* v);
 int         var_get_int(var_t* var);
 var_t*      var_set_int(var_t* var, int v);
@@ -1338,6 +1360,10 @@ var_t*      var_set_float64(var_t* var, double v);
 /* ToNumber per ECMA-262 (objects reduced via ToPrimitive(number): Symbol.toPrimitive,
  * valueOf, toString). For natives that must coerce a value exactly once. */
 double      vm_to_number(vm_t* vm, var_t* v);
+/* ES2015 StringNumericLiteral grammar (7.1.4.1.1): decimal with full-consumption
+ * validation plus the unsigned 0x/0b/0o literal forms; signed radix literals and
+ * any trailing garbage yield NaN. Shared by vm_to_number and Number(str). */
+double      es_str_to_number(const char* s);
 var_t*      var_new_bigint(vm_t* vm, bignum_t* b); // takes ownership of b (freed via bn_free)
 bignum_t*   var_get_bigint(var_t* var);            // NULL unless var is a V_BIGINT
 bool        var_is_number(var_t* var);
@@ -1468,6 +1494,12 @@ vm_t*       vm_from(vm_t* vm);
 bool        vm_load(vm_t* vm, const char* s);
 bool        vm_load_run(vm_t* vm, const char* s);
 bool        vm_load_run_native(vm_t* vm, const char* s);
+/* Like vm_load_run_native but forces sloppy evaluation: neutralizes the caller's
+ * strict scope flags up to the outermost function frame for the duration of the
+ * run, then restores them. Needed by the Function constructor (ES CreateDynamic
+ * Function) so a `new Function` body compiles/runs in the global sloppy scope
+ * regardless of whether the calling code is strict. */
+bool        vm_load_run_native_sloppy(vm_t* vm, const char* s);
 /* Run a top-level ES module body AND register its namespace in the module
  * registry under `spec` (its absolute URL), so a later `import` of the same
  * URL hits the cache and shares this evaluation's state (webpack/rspack keep

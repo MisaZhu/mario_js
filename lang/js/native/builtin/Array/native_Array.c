@@ -93,6 +93,23 @@ var_t* ch = var_new_str2(vm, s + idx, (uint32_t)n);
 var_array_add(tmp, ch);
 idx += n;
 }
+} else if(var_is_typedarray(t)) {
+/* A TypedArray keeps its elements in the backing buffer, not as named
+ * "0","1",.. members, so the generic object path below reads every index as a
+ * hole and `Array.prototype.slice.call(new Uint8Array([226,3,..]))` collapses
+ * to [null,null,..]. That broke CryptoJS WordArray->bytes->hex (digest bytes
+ * come back as an array of holes -> Hex format emits all '0' -> invalid h5st
+ * signature -> jd.com CSR data 403 -> gray blocks). Read the length member
+ * then materialise each element via the etype-aware accessor. */
+var_t* talenv = var_find_own_member_var(t, "length");
+int64_t tan = (talenv != NULL) ? var_get_int64(talenv) : 0;
+int64_t tai;
+if(tan > ARRAY_RECV_MAX) tan = ARRAY_RECV_MAX;
+if(tan > 100000) mario_mapdbg("array_recv ta", (uint32_t)tan, 0);
+for(tai=0; tai<tan; ++tai) {
+var_t* el = var_typedarray_get_at(vm, t, tai);
+var_array_add(tmp, el != NULL ? el : var_new(vm));
+}
 } else if(t->type == V_OBJECT) {
 var_t* lenv = var_find_member_var(t, "length");
 int32_t n = (lenv != NULL) ? (int32_t)var_get_float(lenv) : 0;
@@ -120,11 +137,13 @@ var_t* native_Array_toString(vm_t* vm, var_t* env, void* data) {
 	uint32_t sz = var_array_size(arr);
 	uint32_t i;
 	for(i=0; i<sz; ++i) {
+		/* toString delegates to join(","): same undefined/null->"" rule. */
+		if(i > 0)
+			mstr_add(ret, ',');
 		node_t* n = var_array_get(arr, i);
-		if(n != NULL) {
-			var_to_str(n->var, str);
-			if(i > 0)
-				mstr_add(ret, ',');
+		var_t* el = (n != NULL) ? n->var : NULL;
+		if(el != NULL && el->type != V_UNDEF && el->type != V_NULL) {
+			var_to_str(el, str);
 			mstr_append(ret, str->cstr);
 		}
 	}
@@ -151,11 +170,16 @@ var_t* native_Array_join(vm_t* vm, var_t* env, void* data) {
 	uint32_t sz = var_array_size(arr);
 	uint32_t i;
 	for(i=0; i<sz; ++i) {
+		/* ES2015 22.1.3.12 step 7: the separator goes between EVERY pair of
+		 * slots (holes included), and undefined/null elements render as the
+		 * empty string - var_to_str would emit "undefined"/"null" and corrupt
+		 * zero-pad helpers like new Array(2).join("0") (wx time filter). */
+		if(i > 0)
+			mstr_append(ret, j);
 		node_t* n = var_array_get(arr, i);
-		if(n != NULL) {
-			var_to_str(n->var, str);
-			if(i > 0)
-				mstr_append(ret, j);
+		var_t* el = (n != NULL) ? n->var : NULL;
+		if(el != NULL && el->type != V_UNDEF && el->type != V_NULL) {
+			var_to_str(el, str);
 			mstr_append(ret, str->cstr);
 		}
 	}
@@ -224,14 +248,29 @@ var_t* native_Array_toLocaleString(vm_t* vm, var_t* env, void* data) {
  * add_to_gc() during the callback sweeps them (use-after-free / heap
  * corruption). Every callback native below opens such a window. */
 
-/* Call f(element, index, arr); returns the owned result (caller unrefs) or NULL. */
+/* Call f(element, index, arr); returns the owned result (caller unrefs) or NULL.
+ * The callback receiver is the caller-supplied thisArg: every method routed
+ * through here (forEach/map/filter/find/findIndex/findLast/findLastIndex/
+ * flatMap/some/every and Array.from's mapFn) declares an optional trailing
+ * `thisArg` per spec, so read it straight off env. When it is absent the
+ * receiver is undefined. mario used to bind the native's own `env` (the
+ * arguments object) as `this` and ignore thisArg entirely, so `list.forEach(fn,
+ * ctx)` ran fn with the wrong receiver. regeneratorRuntime's Context does
+ * `tryLocs.forEach(pushTryEntry, this)`; pushTryEntry then executed
+ * `this.tryEntries.push(...)` against a non-array and threw "can not find
+ * function 'push' on object{}", which made EVERY transpiled async function
+ * reject at once - jd.com's colorRequestWithRetry died before issuing its
+ * request, so pchome_firstScreenSoa / pc_home_feed never fired and the whole
+ * first screen + feed stayed as empty skeleton (gray blocks). */
 static var_t* array_call_cb(vm_t* vm, var_t* env, var_t* f, var_t* el, uint32_t i, var_t* arr) {
 	var_t* args = var_new_array(vm);
 	var_array_add(args, el != NULL ? el : var_new(vm));
 	var_array_add(args, var_new_int(vm, (int)i));
 	var_array_add(args, arr);
 	var_array_reverse(args);
-	var_t* res = call_m_func(vm, env, f, args);
+	var_t* thisArg = get_obj(env, "thisArg");
+	var_t* thisv = (thisArg != NULL && thisArg->type != V_UNDEF) ? thisArg : NULL;
+	var_t* res = call_m_func(vm, thisv, f, args);
 	var_unref(args);
 	return res;
 }
@@ -423,7 +462,29 @@ var_t* native_Array_reduce(vm_t* vm, var_t* env, void* data) {
 }
 
 var_t* native_Array_reverse(vm_t* vm, var_t* env, void* data) {
-	(void)vm; (void)data;
+	(void)data;
+	/* Array.prototype.reverse is generic: applied to a TypedArray receiver it must
+	 * reverse the backing buffer IN PLACE and return that receiver (real engines
+	 * route the indexed Set/Get through the view). array_recv() would materialise a
+	 * throwaway COPY, so `Array.prototype.reverse.call(u8)` left `u8` untouched -
+	 * which silently no-op'd the byte-order reversal in the h5st hash path (digest
+	 * little/big-endian flip) and contributed to the degenerate tk fingerprint that
+	 * got jd.com's high-value feed endpoints 403'd. Reverse the view directly. */
+	var_t* recv = get_obj(env, THIS);
+	if(recv != NULL && var_is_typedarray(recv)) {
+		int64_t len = var_get_int64(var_find_own_member_var(recv, "length"));
+		vm->gc.gc_defer++;
+		for(int64_t i = 0, j = len - 1; i < j; i++, j--) {
+			var_t* a = var_typedarray_get_at(vm, recv, i);
+			var_t* b = var_typedarray_get_at(vm, recv, j);
+			if(a != NULL) var_typedarray_set_at(vm, recv, j, a);
+			if(b != NULL) var_typedarray_set_at(vm, recv, i, b);
+			if(a != NULL) var_unref(a);
+			if(b != NULL) var_unref(b);
+		}
+		vm->gc.gc_defer--;
+		return recv;
+	}
 	var_t* arr = array_recv(vm, env);
 	var_array_reverse(arr);
 	return arr;
@@ -473,23 +534,73 @@ var_t* native_Array_concat(vm_t* vm, var_t* env, void* data) {
 
 var_t* native_Array_push(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* arr = array_recv(vm, env);
-	/* A dangling/freed `arr` (refcount underflow via nested bound-call chains)
-	 * must not be returned: the caller var_ref()s and pushes it, resurrecting a
-	 * freed var. The is_array identity bit also rejects recycled garbage whose
-	 * reused block reads as status-live. Deliver a fresh undefined instead so
-	 * the frame unwinds safely. */
-	if(arr == NULL || arr->status <= V_ST_GC_FREE || !arr->is_array)
+	var_t* recv = get_obj(env, THIS);
+	/* Reject only a dangling/freed receiver (a refcount underflow via nested
+	 * bound-call chains can leave `this` pointing at a recycled block; the
+	 * caller var_ref()s and pushes the return, resurrecting a freed var). A
+	 * live non-array object is a legitimate generic receiver and must NOT be
+	 * rejected here - see the V_OBJECT branch below. */
+	if(recv == NULL || recv->status <= V_ST_GC_FREE)
 		return var_new(vm);
 	uint32_t args_num = get_func_args_num(env);
 	uint32_t i;
-	for(i=0; i<args_num; ++i) {
-		var_t* arg = get_func_arg(env, i);
-		var_array_add(arr, arg);
+	if(recv->is_array) {
+		for(i=0; i<args_num; ++i)
+			var_array_add(recv, get_func_arg(env, i));
+		/* Spec: push yields the new length. Returning the borrowed receiver here
+		 * used to leak a stack ref through call/apply chains (mario_apply_var). */
+		return var_new_int(vm, (int)var_array_size(recv));
 	}
-	/* Spec: push yields the new length. Returning the borrowed receiver here used
-	 * to leak a stack ref through call/apply chains (see mario_apply_var). */
-	return var_new_int(vm, (int)var_array_size(arr));
+	if(recv->type == V_OBJECT && !var_is_typedarray(recv)) {
+		/* Generic array-like receiver (a jQuery results object, `arguments`, a
+		 * NodeList, any {length,0,1,..}). Array.prototype.push is intentionally
+		 * generic (ECMA-262 23.1.3.18): len=ToLength(O.length); then for each arg
+		 * Set(O,ToString(len+i),arg); finally Set(O,"length",len+argc) and return
+		 * it. array_recv() would materialise a throwaway COPY and mutate that
+		 * instead, leaving the caller's object untouched - which silently emptied
+		 * every Sizzle `results.push.apply(results, nodes)` (jQuery 1.6.4's p()
+		 * helper), so all jQuery class/tag selectors on www.jd.com returned 0:
+		 * $(".logo_extend")[0] was undefined, the ro master-init generator threw
+		 * inside preact render("undefined should be a DOM Element") at case 0, and
+		 * the header/search/nav/toolbar never rendered. Mutate IN PLACE. */
+		var_t* lenv = var_find_member_var(recv, "length");
+		double dl = (lenv != NULL) ? var_get_float(lenv) : 0.0;
+		if(!(dl > 0.0)) dl = 0.0;   /* undefined/NaN/negative -> +0 (ToLength) */
+		uint32_t len = (dl > 4294967295.0) ? 4294967295U : (uint32_t)dl;
+		for(i=0; i<args_num; ++i) {
+			char key[32];
+			snprintf(key, sizeof(key), "%u", len + i);
+			var_add(recv, key, get_func_arg(env, i));
+		}
+		len += args_num;
+		var_add(recv, "length", var_new_int(vm, (int)len));
+		return var_new_int(vm, (int)len);
+	}
+	/* Strings / TypedArrays / other exotic receivers: an immutable or
+	 * fixed-length receiver cannot grow, so keep the historical array_recv copy
+	 * path (its result length approximates the spec no-op return). */
+	if(var_is_typedarray(recv)) {
+		/* Spec: push does Set(O, ToString(len+i), arg, Throw=true). A TypedArray
+		 * has a fixed length, so any element append targets an out-of-bounds index
+		 * and MUST throw TypeError (real engines: "Attempted to assign to readonly
+		 * property"). Silently half-applying to a throwaway copy diverged from every
+		 * browser and could corrupt feature-detection probes. With no args there is
+		 * no Set, so just report the length. */
+		if(args_num > 0) {
+			vm_throw_type_native(vm, "TypeError", "Cannot push onto a fixed-length TypedArray");
+			return var_new(vm);
+		}
+		var_t* tl = var_find_own_member_var(recv, "length");
+		return var_new_int(vm, (tl != NULL) ? (int)var_get_int64(tl) : 0);
+	}
+	{
+		var_t* arr = array_recv(vm, env);
+		if(arr == NULL || arr->status <= V_ST_GC_FREE || !arr->is_array)
+			return var_new(vm);
+		for(i=0; i<args_num; ++i)
+			var_array_add(arr, get_func_arg(env, i));
+		return var_new_int(vm, (int)var_array_size(arr));
+	}
 }
 
 var_t* native_Array_unshift(vm_t* vm, var_t* env, void* data) {
@@ -551,6 +662,68 @@ var_t* native_Array_pop(vm_t* vm, var_t* env, void* data) {
 	return ret;
 }
 
+/* Decimal element key ("0", "1", ..), byte-identical to the snprintf("%u")
+ * the var_array_* helpers format. */
+static inline void array_index_key(char* key, uint32_t i) {
+	char tmp[12];
+	int n = 0;
+	do { tmp[n++] = (char)('0' + (i % 10)); i /= 10; } while(i != 0);
+	while(n > 0) *key++ = tmp[--n];
+	*key = 0;
+}
+
+/* In-place shift for a dense array: every key 0..sz-1 present, holding a live
+ * value on a plain (writable, enumerable) node. The element nodes stay where
+ * they are; each takes its right neighbour's value through node_replace (which
+ * keeps value-stack aliases balanced) and only the tail node is unlinked, the
+ * way pop() does. The rebuild below costs ~5 hash operations plus a node
+ * alloc/free per element on every call, which made draining a queue with
+ * shift() quadratic with a huge constant: the Tencent CHAOS VM loader empties
+ * a ~5.8K entry patch table this way and spent most of its run here, holding
+ * back the web.wechat.com QR code. Anything that is not plainly dense returns
+ * false untouched and takes the rebuild, so its behaviour is unchanged. */
+#define ARRAY_SHIFT_STACK_N     64
+#define ARRAY_SHIFT_INPLACE_MAX (1u << 24)
+static bool array_shift_inplace(var_t* arr, uint32_t sz, var_t** out) {
+	var_t* store = var_find_own_member_var(arr, "_ARRAY_");
+	if(store == NULL || sz == 0 || sz > ARRAY_SHIFT_INPLACE_MAX)
+		return false;
+	node_t* stack_nodes[ARRAY_SHIFT_STACK_N];
+	node_t** nodes = stack_nodes;
+	if(sz > ARRAY_SHIFT_STACK_N) {
+		nodes = (node_t**)mario_malloc((uint32_t)(sizeof(node_t*) * sz));
+		if(nodes == NULL)
+			return false;
+	}
+	bool dense = true;
+	uint32_t i;
+	char key[16];
+	for(i=0; i<sz; ++i) {
+		array_index_key(key, i);
+		node_t* n = (node_t*)hash_map_get(&store->children, key);
+		if(n == NULL || n->var == NULL || n->var->status <= V_ST_GC_FREE ||
+				n->be_const || n->be_unenumerable || n->invisable || n->be_inherited) {
+			dense = false;
+			break;
+		}
+		nodes[i] = n;
+	}
+	if(dense) {
+		/* The guard ref keeps the head value alive once node 0 lets go of it;
+		 * every later value is held by both neighbours while it moves. */
+		var_t* ret = var_ref(nodes[0]->var);
+		for(i=0; i+1<sz; ++i)
+			node_replace(nodes[i], nodes[i+1]->var);
+		node_free(var_array_remove(arr, (int32_t)(sz-1)));
+		if(ret->refs > 0)
+			ret->refs--; /* drop our guard ref; caller roots the return value */
+		*out = ret;
+	}
+	if(nodes != stack_nodes)
+		mario_free(nodes);
+	return dense;
+}
+
 var_t* native_Array_shift(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* arr = array_recv(vm, env);
@@ -558,10 +731,16 @@ var_t* native_Array_shift(vm_t* vm, var_t* env, void* data) {
 	if(sz == 0)
 		return NULL;
 
-	/* Removal never re-indexes the remaining keys (see the splice comment
-	 * below), so shift rebuilds: keep elements 1..sz-1 in a temp, empty the
-	 * array, then re-append them at 0..sz-2. */
 	vm->gc.gc_defer++;
+	var_t* shifted = NULL;
+	if(array_shift_inplace(arr, sz, &shifted)) {
+		vm->gc.gc_defer--;
+		return shifted;
+	}
+
+	/* Removal never re-indexes the remaining keys (see the splice comment
+	 * below), so a non-dense array rebuilds: keep elements 1..sz-1 in a temp,
+	 * empty the array, then re-append them at 0..sz-2. */
 	var_t* first = var_array_get_var(arr, 0);
 	var_t* ret = (first != NULL) ? var_ref(first) : NULL;
 	var_t* rest = var_new_array(vm);
@@ -695,6 +874,15 @@ var_t* native_Array_reduceRight(vm_t* vm, var_t* env, void* data) {
  * allocations below. */
 var_t* native_Array_splice(vm_t* vm, var_t* env, void* data) {
 	(void)data;
+	var_t* srecv = get_obj(env, THIS);
+	/* Spec: splice re-indexes and Set(O,"length",..) with Throw=true; on a
+	 * fixed-length TypedArray any delete/insert/length write fails and MUST throw
+	 * TypeError (real engines: "Unable to delete property"). The old array_recv copy
+	 * path silently half-worked on a throwaway, diverging from every browser. */
+	if(srecv != NULL && var_is_typedarray(srecv)) {
+		vm_throw_type_native(vm, "TypeError", "Cannot splice a fixed-length TypedArray");
+		return var_new_array(vm);
+	}
 	var_t* arr = array_recv(vm, env);
 	if(arr == NULL || !arr->is_array)
 		return var_new_array(vm);
@@ -1267,6 +1455,48 @@ static int array_sort_compare(vm_t* vm, var_t* env, var_t* f, var_t* x, var_t* y
  * failed and it force-installed its own polyfill over the working native. */
 var_t* native_Array_sort(vm_t* vm, var_t* env, void* data) {
 	(void)data;
+	var_t* recv = get_obj(env, THIS);
+	/* Generic receiver: a TypedArray must be sorted IN PLACE through its backing
+	 * buffer (real engines do), not via array_recv's throwaway copy. Uses the same
+	 * Array default/comparator semantics (string-codepoint order when no callable
+	 * comparator), matching `Array.prototype.sort.call(u8)` in a browser. */
+	if(recv != NULL && var_is_typedarray(recv)) {
+		var_t* tf = get_obj(env, "f");
+		bool t_native_ctor = tf != NULL && tf->is_class && !tf->is_func && !var_is_proxy(tf);
+		bool t_callable = var_is_callable(tf) || t_native_ctor;
+		if(tf != NULL && tf->type != V_UNDEF && !t_callable) {
+			vm_throw(vm, "TypeError: The comparison function must be either a function or undefined");
+			return var_new(vm);
+		}
+		int64_t tlen = var_get_int64(var_find_own_member_var(recv, "length"));
+		if(tlen < 2)
+			return recv;
+		var_t* tcmpf = (tf != NULL && tf->type != V_UNDEF && t_callable) ? tf : NULL;
+		var_t** titems = (var_t**)mario_malloc((uint32_t)(sizeof(var_t*) * tlen));
+		if(titems == NULL)
+			return recv;
+		vm->gc.gc_defer++;
+		for(int64_t i = 0; i < tlen; i++) {
+			var_t* el = var_typedarray_get_at(vm, recv, i);
+			titems[i] = (el != NULL) ? el : var_new(vm);
+		}
+		for(int64_t i = 1; i < tlen; i++) {
+			var_t* elem = titems[i];
+			int64_t j = i - 1;
+			while(j >= 0 && array_sort_compare(vm, env, tcmpf, titems[j], elem) > 0) {
+				titems[j + 1] = titems[j];
+				j--;
+			}
+			titems[j + 1] = elem;
+		}
+		for(int64_t i = 0; i < tlen; i++) {
+			var_typedarray_set_at(vm, recv, i, titems[i]);
+			var_unref(titems[i]);
+		}
+		mario_free(titems);
+		vm->gc.gc_defer--;
+		return recv;
+	}
 	var_t* arr = array_recv(vm, env);
 	/* Strict method: `this` must be coercible to an object. core-js's
 	 * arrayMethodIsStrict('sort') calls [].sort.call(null, fn, 1) and requires a
@@ -1276,16 +1506,20 @@ var_t* native_Array_sort(vm_t* vm, var_t* env, void* data) {
 		return var_new(vm);
 	}
 	var_t* f = get_obj(env, "f");
+	/* Callable proxies and native constructors use the same callback path as
+	 * ordinary functions; call_m_func preserves their apply/plain-call semantics. */
+	bool native_ctor = f != NULL && f->is_class && !f->is_func && !var_is_proxy(f);
+	bool callable = var_is_callable(f) || native_ctor;
 	/* A comparator that is present but not callable (sort(null), sort(1)) is a
 	 * TypeError; only `undefined` selects the default string order. */
-	if(f != NULL && f->type != V_UNDEF && !f->is_func) {
+	if(f != NULL && f->type != V_UNDEF && !callable) {
 		vm_throw(vm, "TypeError: The comparison function must be either a function or undefined");
 		return var_new(vm);
 	}
 	uint32_t sz = var_array_size(arr);
 	if(sz < 2)
 		return arr;
-	var_t* cmpf = (f != NULL && f->is_func) ? f : NULL;
+	var_t* cmpf = (f != NULL && f->type != V_UNDEF && callable) ? f : NULL;
 	var_t** tmp = (var_t**)mario_malloc(sizeof(var_t*) * sz);
 	if(tmp == NULL)
 		return arr;
@@ -1350,9 +1584,9 @@ void reg_native_Array(vm_t* vm) {
   var_t* cls = vm_new_class(vm, CLS_ARRAY);
 	vm_reg_native(vm, cls, "constructor()#1", native_Array_constructor, NULL);
 	vm_reg_native(vm, cls, "toString()", native_Array_toString, NULL); 
-	vm_reg_native(vm, cls, "forEach(f)", native_Array_forEach, NULL); 
-	vm_reg_native(vm, cls, "map(f)", native_Array_map, NULL);
-	vm_reg_native(vm, cls, "filter(f)", native_Array_filter, NULL);
+	vm_reg_native(vm, cls, "forEach(f, thisArg)#1", native_Array_forEach, NULL); 
+	vm_reg_native(vm, cls, "map(f, thisArg)#1", native_Array_map, NULL);
+	vm_reg_native(vm, cls, "filter(f, thisArg)#1", native_Array_filter, NULL);
 	vm_reg_native(vm, cls, "reduce(f, initial)#1", native_Array_reduce, NULL);
 	vm_reg_native(vm, cls, "reduceRight(f, initial)#1", native_Array_reduceRight, NULL);
 	vm_reg_native(vm, cls, "splice(start, deleteCount)", native_Array_splice, NULL);
@@ -1377,10 +1611,10 @@ void reg_native_Array(vm_t* vm) {
 	vm_reg_static(vm, cls, "of()", native_Array_of, NULL);
 
 	/* ES6 prototype methods */
-	vm_reg_native(vm, cls, "find(f)", native_Array_find, NULL);
-	vm_reg_native(vm, cls, "findIndex(f)", native_Array_findIndex, NULL);
-	vm_reg_native(vm, cls, "findLast(f)", native_Array_findLast, NULL);
-	vm_reg_native(vm, cls, "findLastIndex(f)", native_Array_findLastIndex, NULL);
+	vm_reg_native(vm, cls, "find(f, thisArg)#1", native_Array_find, NULL);
+	vm_reg_native(vm, cls, "findIndex(f, thisArg)#1", native_Array_findIndex, NULL);
+	vm_reg_native(vm, cls, "findLast(f, thisArg)#1", native_Array_findLast, NULL);
+	vm_reg_native(vm, cls, "findLastIndex(f, thisArg)#1", native_Array_findLastIndex, NULL);
 	vm_reg_native(vm, cls, "includes(search, fromIndex)#1", native_Array_includes, NULL);
 	vm_reg_native(vm, cls, "indexOf(search, fromIndex)#1", native_Array_indexOf, NULL);
 	vm_reg_native(vm, cls, "lastIndexOf(search, fromIndex)#1", native_Array_lastIndexOf, NULL);
@@ -1390,9 +1624,9 @@ void reg_native_Array(vm_t* vm) {
 	vm_reg_native(vm, cls, "keys()", native_Array_keys, NULL);
 	vm_reg_native(vm, cls, "values()", native_Array_values, NULL);
 	vm_reg_native(vm, cls, "flat(depth)#0", native_Array_flat, NULL);
-	vm_reg_native(vm, cls, "flatMap(f)", native_Array_flatMap, NULL);
-	vm_reg_native(vm, cls, "some(f)", native_Array_some, NULL);
-	vm_reg_native(vm, cls, "every(f)", native_Array_every, NULL);
+	vm_reg_native(vm, cls, "flatMap(f, thisArg)#1", native_Array_flatMap, NULL);
+	vm_reg_native(vm, cls, "some(f, thisArg)#1", native_Array_some, NULL);
+	vm_reg_native(vm, cls, "every(f, thisArg)#1", native_Array_every, NULL);
 	vm_reg_native(vm, cls, "sort(f)", native_Array_sort, NULL);
 	vm_reg_native(vm, cls, "at(index)", native_Array_at, NULL);
 }

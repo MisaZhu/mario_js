@@ -123,7 +123,7 @@ static var_t* json_parse_int(vm_t* vm, const char* str, bool neg) {
 	return var_new_int(vm, (int)ll);
 }
 
-static var_t* json_parse_factor(vm_t* vm, lex_t *l) {
+static var_t* json_parse_factor(vm_t* vm, lex_t *l, bool* failed) {
 	/* JSON numbers may carry a leading sign, but the lexer emits '-' / '+' as a
 	 * standalone char token rather than folding it into the numeric literal.
 	 * Without this branch the sign is never consumed: object parsing bails to
@@ -144,6 +144,7 @@ static var_t* json_parse_factor(vm_t* vm, lex_t *l) {
 			lex_json_chkread(l, LEX_FLOAT);
 			return r;
 		}
+		if(failed) *failed = true;
 		return var_new(vm);
 	}
 	if (l->tk==LEX_R_TRUE) {
@@ -164,6 +165,11 @@ static var_t* json_parse_factor(vm_t* vm, lex_t *l) {
 		return var_new_bool(vm, false);
 	}
 	else if (l->tk==LEX_R_NULL) {
+		/* NOTE: intentionally returns var_new (V_UNDEF), NOT var_new_null. mario
+		 * broadly conflates null/undefined internally (many natives return var_new
+		 * for null-ish); returning V_NULL here flipped `=== undefined` branches in
+		 * page code and regressed JD's render (content fetchers never fired).
+		 * JSON `null`->undefined is a known lenient deviation, kept deliberately. */
 		lex_json_chkread(l, LEX_R_NULL);
 		return var_new(vm);
 	}
@@ -190,9 +196,14 @@ static var_t* json_parse_factor(vm_t* vm, lex_t *l) {
 		return ret;
 	}
 	else if(l->tk==LEX_R_FUNCTION) {
+		/* A bare `function` token is NOT valid JSON. ES 25.5.1.1 requires
+		 * JSON.parse to throw a SyntaxError here; silently returning undefined
+		 * defeated JD's `try{JSON.parse(algo)}catch{eval(algo)}` fallback - the
+		 * h5st signer never got its algorithm function, retried cactus 6x, then
+		 * produced a bad signature -> api.m.jd.com 403 -> home-page gray
+		 * skeletons. Flag it so native_json_parse throws instead. */
 		lex_json_chkread(l, LEX_R_FUNCTION);
-		//TODO
-		mario_printf("Error: Can not parse json function item!\n");
+		if(failed) *failed = true;
 		return var_new(vm);
 	}
 	else if (l->tk=='[') {
@@ -200,7 +211,7 @@ static var_t* json_parse_factor(vm_t* vm, lex_t *l) {
 		var_t* arr = var_new_array(vm);
 		lex_json_chkread(l, '[');
 		while (l->tk != ']') {
-			var_t* v = json_parse_factor(vm, l);
+			var_t* v = json_parse_factor(vm, l, failed);
 			/* Array elements must go through var_array_add so they land in the
 			 * hidden "_ARRAY_" member that var_array_size/stringify read. The old
 			 * var_add(arr, "", v) attached them to the object itself, so a parsed
@@ -228,12 +239,14 @@ static var_t* json_parse_factor(vm_t* vm, lex_t *l) {
 				if(!lex_json_chkread(l, LEX_STR)) {
 					mstr_free(id);
 					var_unref(obj);
+					if(failed) *failed = true;
 					return var_new(vm);
 				}
 			} else {
 				if(!lex_json_chkread(l, LEX_ID)) {
 					mstr_free(id);
 					var_unref(obj);
+					if(failed) *failed = true;
 					return var_new(vm);
 				}
 			}
@@ -241,14 +254,16 @@ static var_t* json_parse_factor(vm_t* vm, lex_t *l) {
 			if(!lex_json_chkread(l, ':')) {
 				mstr_free(id);
 				var_unref(obj);
+				if(failed) *failed = true;
 				return var_new(vm);
 			}
-			var_t* v = json_parse_factor(vm, l);
+			var_t* v = json_parse_factor(vm, l, failed);
 			var_add(obj, id->cstr, v);
 			mstr_free(id);
 			if(l->tk != '}') {
 				if(!lex_json_chkread(l, ',')) {
 					var_unref(obj);
+					if(failed) *failed = true;
 					return var_new(vm);
 				}
 			}
@@ -256,16 +271,19 @@ static var_t* json_parse_factor(vm_t* vm, lex_t *l) {
 		lex_json_chkread(l, '}');
 		return obj;
 	}
+	if(failed) *failed = true;
 	return var_new(vm);
 }
 
-var_t* json_parse(vm_t* vm, const char* str) {
+var_t* json_parse(vm_t* vm, const char* str, bool* failed) {
 	lex_t lex;
 	lex_init(&lex, str);
 	lex_json_get_next_token(&lex);
 
-	var_t* ret = json_parse_factor(vm, &lex);
+	bool local_failed = false;
+	var_t* ret = json_parse_factor(vm, &lex, &local_failed);
 	lex_release(&lex);
+	if(failed) *failed = local_failed;
 	return ret;
 }
 

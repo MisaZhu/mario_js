@@ -78,6 +78,14 @@ struct re_prog {
 	char*     names[RE_MAXGROUPS]; /* (?<name>...) per group index, NULL if unnamed */
 	bool      icase, mline, dotall, global, sticky;
 	bool      cached;    /* owned by the shared memo cache; re_free must not free */
+	/* Compile-time first-byte filter: bitmap of bytes a consuming match can
+	 * start with. re_match() skips start offsets whose byte is outside it,
+	 * turning the leftmost scan over huge input (Angular's /[\}\]]\s*$/ gate
+	 * on a 572KB webwxinit body) from O(n) VM runs into a byte scan. Disabled
+	 * when the pattern can match empty or begins with an unpredictable atom
+	 * (backref/lookahead), so leftmost/sticky/split semantics stay exact. */
+	uint8_t   first_set[32];
+	bool      first_ok;
 };
 
 /**====== pattern AST ======*/
@@ -858,6 +866,8 @@ static bool emit_node(reemit_t* e, renode_t* n, bool* err) {
 
 /**====== public compile / free ======*/
 
+static void re_first_set(re_prog_t* p);   /* defined with the matcher helpers below */
+
 static re_prog_t* re_compile_uncached(const char* pattern, const char* flags, char* err, int errlen) {
 	if(pattern == NULL)
 		pattern = "";
@@ -929,6 +939,7 @@ static re_prog_t* re_compile_uncached(const char* pattern, const char* flags, ch
 	}
 	p->code = e.code;
 	p->ncode = e.n;
+	re_first_set(p);
 	return p;
 }
 
@@ -1062,6 +1073,8 @@ typedef struct {
 	int* caps;   /* 2*(ngroups+1) */
 	int  lsp[RE_MAXLOOPDEPTH]; /* zero-width guard scratch (body-entry sp per loop depth) */
 	int  steps;
+	int  budget;   /* per-call step cap, scaled with input length in re_match */
+	int  btmax;    /* per-call backtrack-stack cap, scaled likewise (greedy loops) */
 	int  ladepth;
 	int  lb_end;    /* RI_LBEND target offset; -1 outside a lookbehind sub-run */
 } rexec_t;
@@ -1069,6 +1082,94 @@ typedef struct {
 static inline bool re_isword(int c) {
 	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
 	       (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+/* ECMA-262 Assertion $ (non-multiline): also matches immediately before the
+ * LAST LineTerminator of the input. True when s[sp..slen) is exactly one
+ * terminator sequence: \n, \r, \r\n, U+2028/U+2029 (UTF-8 E2 80 A8/A9).
+ * web.wechat.com's Angular transformResponse gate /[\}\]]\s*$/ must accept
+ * a JSON body ending "}\n" - without this branch the gate returned false on
+ * the real 572KB webwxinit response and the app never parsed it. */
+static bool re_end_before_lt(const char* s, int slen, int sp) {
+	int rem = slen - sp;
+	if(rem == 1)
+		return s[sp] == '\n' || s[sp] == '\r';
+	if(rem == 2)
+		return s[sp] == '\r' && s[sp + 1] == '\n';
+	if(rem == 3)
+		return (uint8_t)s[sp] == 0xE2 && (uint8_t)s[sp + 1] == 0x80 &&
+		       ((uint8_t)s[sp + 2] == 0xA8 || (uint8_t)s[sp + 2] == 0xA9);
+	return false;
+}
+
+/* Walk the instruction graph from pc 0 collecting the bytes a match can
+ * consume first. Zero-width ops (anchors, word boundaries, saves, lookbehind
+ * entry) are transparent; RI_SPLIT explores both alternatives; reaching
+ * RI_MATCH without consuming means an empty match is possible, which disables
+ * the filter (empty matches are legal at every offset). Anything unpredictable
+ * (backref, lookahead) disables it too. Sound by construction: a skipped
+ * offset can never start a match, so leftmost ordering is preserved. */
+static void re_first_set(re_prog_t* p) {
+	uint8_t* seen = (uint8_t*)calloc((size_t)p->ncode, 1);
+	int* stk = (int*)malloc((size_t)p->ncode * sizeof(int));
+	if(seen == NULL || stk == NULL) { free(seen); free(stk); return; }
+	int n = 0;
+	stk[n++] = 0;
+	bool ok = true;
+	while(n > 0 && ok) {
+		int pc = stk[--n];
+		if(pc < 0 || pc >= p->ncode || seen[pc]) continue;
+		seen[pc] = 1;
+		reinst_t* i = &p->code[pc];
+		switch(i->op) {
+		case RI_CHAR: {
+			int c = (int)i->ch;
+			cls_set(p->first_set, c, false);
+			if(p->icase) {
+				if(c >= 'a' && c <= 'z') cls_set(p->first_set, c - 32, false);
+				if(c >= 'A' && c <= 'Z') cls_set(p->first_set, c + 32, false);
+			}
+			break;
+		}
+		case RI_CLASS: {
+			int c;
+			for(c = 0; c < 256; c++) {
+				if(cls_has(i->cls, c)) {
+					cls_set(p->first_set, c, false);
+					if(p->icase) {
+						if(c >= 'a' && c <= 'z') cls_set(p->first_set, c - 32, false);
+						if(c >= 'A' && c <= 'Z') cls_set(p->first_set, c + 32, false);
+					}
+				}
+			}
+			break;
+		}
+		case RI_ANY:
+			memset(p->first_set, 0xFF, 32);
+			if(!p->dotall) cls_set(p->first_set, '\n', true);
+			break;
+		case RI_SAVE: case RI_BOL: case RI_EOL: case RI_WB: case RI_NWB:
+		case RI_EMPCHK: case RI_LB:
+			stk[n++] = pc + 1;   /* zero-width at this offset: look through */
+			break;
+		case RI_JMP:
+			stk[n++] = i->x;
+			break;
+		case RI_SPLIT:
+			stk[n++] = i->x;
+			stk[n++] = i->y;
+			break;
+		case RI_MATCH:
+			ok = false;   /* empty match possible: filter must stay off */
+			break;
+		default:
+			ok = false;   /* RI_BREF / RI_LA / RI_LAEND / RI_LBEND: unpredictable */
+			break;
+		}
+	}
+	p->first_ok = ok;
+	free(seen);
+	free(stk);
 }
 
 /* Run the program from startpc/sp. Ends at RI_MATCH (top level) or RI_LAEND
@@ -1082,7 +1183,7 @@ static bool re_run(rexec_t* x, int startpc, int sp_in) {
 	bool matched = false;
 
 	for(;;) {
-		if(++x->steps > RE_MAXSTEPS)
+		if(++x->steps > x->budget)
 			break;
 		reinst_t* i = &x->p->code[pc];
 		bool fail = false;
@@ -1108,7 +1209,7 @@ static bool re_run(rexec_t* x, int startpc, int sp_in) {
 			pc = i->x;
 			break;
 		case RI_SPLIT:
-			if(nbt >= RE_MAXBT) { fail = true; break; }
+			if(nbt >= x->btmax) { fail = true; break; }
 			if(nbt >= cbt) {
 				int nc = cbt == 0 ? 128 : cbt * 2;
 				re_bt_t* nb = (re_bt_t*)realloc(bt, nc * sizeof(re_bt_t));
@@ -1162,6 +1263,7 @@ static bool re_run(rexec_t* x, int startpc, int sp_in) {
 			break;
 		case RI_EOL:
 			if(sp == x->slen || (x->p->mline && x->s[sp] == '\n')) pc++;
+			else if(!x->p->mline && re_end_before_lt(x->s, x->slen, sp)) pc++;
 			else fail = true;
 			break;
 		case RI_WB: case RI_NWB: {
@@ -1218,7 +1320,7 @@ static bool re_run(rexec_t* x, int startpc, int sp_in) {
 			int s2;
 			for(s2 = hi; s2 >= lo; s2--) {
 				if(re_run(x, pc + 1, s2)) { ok = true; break; }
-				if(x->steps > RE_MAXSTEPS) break;
+				if(x->steps > x->budget) break;
 			}
 			x->ladepth--;
 			x->lb_end = save_lb;
@@ -1260,6 +1362,71 @@ done:
 	return matched;
 }
 
+/* ---- Annex B.2.2 legacy static RegExp properties -------------------------
+ * Every real browser updates RegExp.input/$_, .lastMatch/$&, .lastParen/$+,
+ * .leftContext/$`, .rightContext/$' and .$1..$9 as a side effect of ANY
+ * successful match (test/exec/match/replace/search/split). Obfuscated bundles
+ * rely on them heavily -- notably JD's h5st date formatter, which does
+ * `if(/(y+)/.test(p)) p = p.replace(RegExp.$1, year)`; without the snapshot
+ * RegExp.$1 reads undefined, the tokens are never substituted and the emitted
+ * h5st carries the literal "yyyyMMddhhmmssSSS" template, so the server rejects
+ * the signature. We snapshot the most recent SUCCESSFUL match here (the VM is
+ * single-threaded, so a file-scope struct is correct). A FAILED match leaves
+ * the snapshot intact, exactly per spec. The stored input is capped at
+ * RE_LM_MAXIN bytes to bound the per-match copy cost for pathological global
+ * loops over huge documents; a group whose offsets fall beyond the cap yields
+ * "" (an Annex-B legacy corner no realistic consumer exercises). */
+#define RE_LM_MAXIN   65536
+#define RE_LM_GROUPS  9
+static struct {
+	char* buf;          /* grow-only NUL-terminated copy of the matched input */
+	int   cap;          /* allocated bytes of buf */
+	int   len;          /* stored bytes = min(slen, RE_LM_MAXIN) */
+	int   full_len;     /* true input length */
+	int   caps[2 * (RE_LM_GROUPS + 1)]; /* group 0..9 byte offsets; -1 unset */
+	int   ngroups;      /* min(p->ngroups, RE_LM_GROUPS) */
+	int   lp_start, lp_end; /* lastParen ($+) group span; -1 when none */
+	int   valid;        /* a successful match has been recorded */
+} g_re_lm;
+
+static void re_lm_free(void) {
+	free(g_re_lm.buf);
+	g_re_lm.buf = NULL;
+	g_re_lm.cap = 0;
+}
+
+static void re_record_lastmatch(const char* s, int slen, int ngroups, const int* caps) {
+	int ng = ngroups < RE_LM_GROUPS ? ngroups : RE_LM_GROUPS;
+	int store = slen < RE_LM_MAXIN ? slen : RE_LM_MAXIN;
+	if(g_re_lm.buf == NULL || g_re_lm.cap < store + 1) {
+		int ncap = store + 1;
+		if(g_re_lm.cap > ncap) ncap = g_re_lm.cap;   /* grow-only */
+		char* nb = (char*)realloc(g_re_lm.buf, (size_t)ncap);
+		if(nb == NULL) return;   /* OOM: keep the previous snapshot */
+		g_re_lm.buf = nb;
+		g_re_lm.cap = ncap;
+	}
+	memcpy(g_re_lm.buf, s, (size_t)store);
+	g_re_lm.buf[store] = 0;
+	g_re_lm.len = store;
+	g_re_lm.full_len = slen;
+	g_re_lm.ngroups = ng;
+	int g;
+	for(g = 0; g <= RE_LM_GROUPS; g++) {
+		if(g <= ng) { g_re_lm.caps[g * 2] = caps[g * 2]; g_re_lm.caps[g * 2 + 1] = caps[g * 2 + 1]; }
+		else        { g_re_lm.caps[g * 2] = -1;           g_re_lm.caps[g * 2 + 1] = -1; }
+	}
+	/* highest-numbered participating group (Annex B lastParen / $+); scan the
+	 * caller's full caps array so groups beyond 9 are honoured too. */
+	int lp = 0;
+	for(g = 1; g <= ngroups; g++) {
+		if(caps[g * 2] >= 0 && caps[g * 2 + 1] >= caps[g * 2]) lp = g;
+	}
+	g_re_lm.lp_start = (lp > 0) ? caps[lp * 2] : -1;
+	g_re_lm.lp_end   = (lp > 0) ? caps[lp * 2 + 1] : -1;
+	g_re_lm.valid = 1;
+}
+
 bool re_match(re_prog_t* p, const char* s, int slen, int startpos, int* caps) {
 	if(p == NULL || s == NULL)
 		return false;
@@ -1272,20 +1439,89 @@ bool re_match(re_prog_t* p, const char* s, int slen, int startpos, int* caps) {
 	x.slen = slen;
 	x.p = p;
 	x.caps = caps;
+	/* Scale the step budget with input length: the leftmost scan itself costs
+	 * O(slen) steps even for empty-match patterns (/\s*$/ on a 125KB+ body
+	 * blew the fixed 500K cap and silently returned false). 16 steps/byte
+	 * covers the scan plus real work; the hard cap keeps pathological
+	 * backtracking from freezing the UI. */
+	int64_t bud = (int64_t)RE_MAXSTEPS + 16 * (int64_t)(slen > 0 ? slen : 0);
+	if(bud > 64000000) bud = 64000000;
+	x.budget = (int)bud;
+	/* A greedy repeat pushes one backtrack entry per consumed byte, so the
+	 * fixed RE_MAXBT(64K) made /\s*$/ fail on any whitespace run > 64K (the
+	 * SPLIT refused, then the cascade burned the whole step budget). Scale the
+	 * stack with the input; 12 bytes/entry keeps even multi-MB runs modest. */
+	int64_t btm = (int64_t)RE_MAXBT + (int64_t)(slen > 0 ? slen : 0) + 64;
+	if(btm > 4000000) btm = 4000000;
+	x.btmax = (int)btm;
 	int ncaps = (p->ngroups + 1) * 2;
 	int start;
 	for(start = startpos; start <= slen; start++) {
+		/* First-byte filter: skip offsets that cannot start a consuming
+		 * match. Empty matches stay legal at slen (and everywhere when the
+		 * filter is off), preserving split/replace leftmost semantics. */
+		if(p->first_ok && start < slen && !cls_has(p->first_set, (uint8_t)s[start])) {
+			if(p->sticky)
+				break;   /* sticky tries exactly startpos: a filtered byte is a miss */
+			continue;
+		}
 		int i;
 		for(i = 0; i < ncaps; i++)
 			caps[i] = -1;
-		if(re_run(&x, 0, start))
+		if(re_run(&x, 0, start)) {
+			re_record_lastmatch(s, slen, p->ngroups, caps);   /* Annex B statics */
 			return true;
+		}
 		if(p->sticky)
 			break;
-		if(x.steps > RE_MAXSTEPS)
+		if(x.steps > x.budget)
 			break;   /* budget blown: bail out instead of freezing the UI */
 	}
 	return false;
+}
+
+/* Extract [start,end) from the recorded input snapshot as a fresh JS string.
+ * Offsets beyond the capped buffer clamp to it; an unset/invalid span yields
+ * the empty string, matching a browser's "" for a non-participating group. */
+static var_t* re_lm_slice(vm_t* vm, int start, int end) {
+	if(!g_re_lm.valid || g_re_lm.buf == NULL || start < 0 || end < start)
+		return var_new_str(vm, "");
+	if(start > g_re_lm.len)
+		return var_new_str(vm, "");
+	if(end > g_re_lm.len)
+		end = g_re_lm.len;
+	return var_new_str2(vm, g_re_lm.buf + start, (uint32_t)(end - start));
+}
+
+/* The Annex-B static accessor selector carried in `data`. */
+enum {
+	RE_LMA_INPUT = 0,   /* input  / $_ */
+	RE_LMA_LASTMATCH,   /* lastMatch / $& */
+	RE_LMA_LASTPAREN,   /* lastParen / $+ */
+	RE_LMA_LEFTCTX,     /* leftContext / $` */
+	RE_LMA_RIGHTCTX,    /* rightContext / $' */
+	RE_LMA_G1           /* $1 .. $9 (RE_LMA_G1 + k - 1) */
+};
+
+static var_t* native_re_static_acc(vm_t* vm, var_t* env, void* data) {
+	(void)env;
+	int idx = (int)(intptr_t)data;
+	if(idx >= RE_LMA_G1) {
+		int g = idx - RE_LMA_G1 + 1;   /* 1..9 */
+		if(!g_re_lm.valid || g > g_re_lm.ngroups)
+			return var_new_str(vm, "");
+		return re_lm_slice(vm, g_re_lm.caps[g * 2], g_re_lm.caps[g * 2 + 1]);
+	}
+	if(!g_re_lm.valid)
+		return var_new_str(vm, "");
+	switch(idx) {
+	case RE_LMA_INPUT:      return var_new_str2(vm, g_re_lm.buf, (uint32_t)g_re_lm.len);
+	case RE_LMA_LASTMATCH:  return re_lm_slice(vm, g_re_lm.caps[0], g_re_lm.caps[1]);
+	case RE_LMA_LASTPAREN:  return re_lm_slice(vm, g_re_lm.lp_start, g_re_lm.lp_end);
+	case RE_LMA_LEFTCTX:    return re_lm_slice(vm, 0, g_re_lm.caps[0]);
+	case RE_LMA_RIGHTCTX:   return re_lm_slice(vm, g_re_lm.caps[1], g_re_lm.full_len);
+	}
+	return var_new_str(vm, "");
 }
 
 /**====== RegExp JS class ======*/
@@ -1323,6 +1559,21 @@ var_t* native_RegExpConstructor(vm_t* vm, var_t* env, void* data) {
 	char err[64];
 	re_prog_t* p = re_compile(src, flg, err, sizeof(err));
 	if(p == NULL) {
+		/* DIAG (MARIO_REDBG=1): a flags string no browser would reject usually
+		 * means the flags ARGUMENT misresolved at runtime (e.g. a number like
+		 * Infinity stringifying to 'I'...), not a bad literal - dump both
+		 * operands plus the script tag so the callsite is greppable offline. */
+		if(getenv("MARIO_REDBG") != NULL) {
+			fprintf(stderr, "[redbg] RegExp ctor fail [%s] err=%s src=%.160s flg=%.40s\n",
+					(vm->dbg_tag != NULL) ? vm->dbg_tag : "-", err,
+					(src != NULL) ? src : "(null)", (flg != NULL) ? flg : "(null)");
+			void bc_dump_window(bytecode_t* bc, PC center, PC radius);
+			bc_dump_window(&vm->bc, vm->pc, 14);
+			const char* rurl = NULL; int rline = 0, rcol = 0;
+			if(bc_srcmap_locate_v8(&vm->bc, vm->pc, &rurl, &rline, &rcol))
+				fprintf(stderr, "[redbg]   at %s:%d:%d\n",
+						(rurl != NULL) ? rurl : "?", rline, rcol);
+		}
 		vm_throw_type_native(vm, "SyntaxError", "Invalid regular expression: %s", err);
 		return this_v;
 	}
@@ -1521,6 +1772,35 @@ void reg_native_RegExp(vm_t* vm) {
 			snprintf(decl, sizeof(decl), "get %s()", re_proto_acc[i]);
 			vm_reg_native(vm, cls, decl, native_RegExp_get_acc, (void*)(intptr_t)i);
 		}
+	}
+	/* Annex B.2.2 legacy static RegExp properties, installed as OWN accessors of
+	 * the constructor object (`cls`), not the prototype, so `RegExp.$1`,
+	 * `RegExp["$&"]`, `RegExp.input` etc. read the last successful match. $1-$9
+	 * and $_ are dot-accessible (valid identifiers); $& $+ $` $' are reached via
+	 * bracket notation, which resolves the same own member. */
+	{
+		static const struct { const char* decl; int idx; } re_statics[] = {
+			{"get input()",        RE_LMA_INPUT},
+			{"get $_()",           RE_LMA_INPUT},
+			{"get lastMatch()",    RE_LMA_LASTMATCH},
+			{"get $&()",           RE_LMA_LASTMATCH},
+			{"get lastParen()",    RE_LMA_LASTPAREN},
+			{"get $+()",           RE_LMA_LASTPAREN},
+			{"get leftContext()",  RE_LMA_LEFTCTX},
+			{"get $`()",           RE_LMA_LEFTCTX},
+			{"get rightContext()", RE_LMA_RIGHTCTX},
+			{"get $'()",           RE_LMA_RIGHTCTX},
+		};
+		size_t i;
+		int g;
+		for(i = 0; i < sizeof(re_statics) / sizeof(re_statics[0]); i++)
+			vm_reg_native_on(vm, cls, re_statics[i].decl, native_re_static_acc, (void*)(intptr_t)re_statics[i].idx);
+		for(g = 1; g <= 9; g++) {
+			char decl[16];
+			snprintf(decl, sizeof(decl), "get $%d()", g);
+			vm_reg_native_on(vm, cls, decl, native_re_static_acc, (void*)(intptr_t)(RE_LMA_G1 + g - 1));
+		}
+		atexit(re_lm_free);
 	}
 }
 

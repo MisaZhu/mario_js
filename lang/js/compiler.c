@@ -763,7 +763,7 @@ static bool defer_replay_one(lex_t* l, bytecode_t* bc, const defer_func_t* rec) 
          * yields "" and the VM aborts via al("") -> empty-name ReferenceError, so
          * et_f.js never runs to completion and never emits the bx-ua token that
          * mtop.relationrecommend requires (feed stays a grey skeleton). */
-        g_func_selfname = 1;
+        g_func_selfname = 2; /* DECLARATION: record .name, no in-body self-binding */
         ok = factor_def_func(l, bc, fname);
         g_func_selfname = 0;
         if (ok) {
@@ -1544,6 +1544,13 @@ static void pslot_scan_decl(lex_t* l, pslot_frame_t* f, uint32_t* prev, pslot_fr
                     return; // `{let: x}` / `let:` - a key or label, not a binding
                 /* (inside a pattern a ':' introduces the value sub-pattern:
                  * keep scanning or `let {a, p: [q], r}` would miss q and r) */
+                if (l->tk == LEX_R_IN && dd == 0)
+                    return; /* `for (let x in EXPR)`: `in` directly follows the
+                             * single bare loop binding - the declarator list is
+                             * over and the for-in RHS is a pure expression whose
+                             * identifiers/comma operators must never be disabled
+                             * as lexical bindings. (`let x = a in b` is unaffected:
+                             * there `in` does not directly follow the name.) */
                 if (l->tk == ',' && dd == 0) {
                     /* `let a, b`: the comma continues the declarator list -
                      * keep bind armed, or the next binding is never disabled
@@ -1716,6 +1723,17 @@ static void pslot_scan_var(lex_t* l, pslot_frame_t* f, uint32_t* prev, pslot_fra
                 }
                 if (l->tk == ':')
                     return; // `{var: x}` - a key, not a binding
+                if (l->tk == LEX_R_IN && dd == 0)
+                    return; /* `for (var x in EXPR)`: `in` directly follows the
+                             * bare loop-variable declarator, so the declarator
+                             * list ends here. The for-in RHS is a pure expression;
+                             * scanning on let its comma operator re-arm `bind` and
+                             * collect expression identifiers as phantom hoisted
+                             * locals (the JD `for(var Je in (0,kt.reportNewExpose)
+                             * (Re),(0,kt.reportSpmExposeWithBatch)(..))` case, where
+                             * a phantom `kt` slot shadowed the real closure `kt` and
+                             * resolved to undefined). `var x = a in b` is unaffected:
+                             * there `in` does not directly follow the name. */
                 if (l->tk == ',' && dd == 0) {
                     /* `var a, b`: the inner advance landed on the declarator
                      * list's comma - keep bind armed for the next name. Without
@@ -3111,8 +3129,18 @@ bool factor_def_func(lex_t* l, bytecode_t* bc, mstr_t* name) {
          * such as GitHub's protobuf walker `function* e(t){... yield* e(n) ...}` can
          * self-reference; without the binding `e(n)` resolved to an outer shadowing `e`
          * and yield* threw "target is not iterable". */
-        else if (g_func_selfname && !is_static && name->cstr[0] != 0)
-            bc_gen_str(bc, is_gen ? INSTR_FUNC_GEN_NAMED : INSTR_FUNC_NAMED, name->cstr);
+        else if (g_func_selfname && !is_static && name->cstr[0] != 0) {
+            /* g_func_selfname==2 marks a DECLARATION: record the name for
+             * .name/Error.stack parity but emit the DECLNAME variant, which sets
+             * func_t.no_self_bind so func_call does NOT shadow the enclosing
+             * declaration binding (a body `name = ...` self-memoizing reassign
+             * must rebind the outer declaration). ==1 is a named function
+             * EXPRESSION, which keeps the ES in-body self-binding. */
+            if (g_func_selfname == 2)
+                bc_gen_str(bc, is_gen ? INSTR_FUNC_GEN_DECLNAME : INSTR_FUNC_DECLNAME, name->cstr);
+            else
+                bc_gen_str(bc, is_gen ? INSTR_FUNC_GEN_NAMED : INSTR_FUNC_NAMED, name->cstr);
+        }
         else
             bc_gen(bc, is_gen ? INSTR_FUNC_GEN : (is_static ? INSTR_FUNC_STC : INSTR_FUNC));
     }
@@ -7357,14 +7385,32 @@ bool stmt_for(lex_t* l, bytecode_t* bc) {
             tmp_mstr_return(l->tk_str);
             *l = saved;                     // not for-in/of: full restore
         }
-        // Standard for loop init statement. statement() consumes the init's
-        // own ';' terminator, so the token that follows belongs to the
-        // CONDITION clause; eating another ';' here would swallow the
-        // condition separator of `for (i = 1;;)` and strand the parse.
-        if (!statement(l, bc)) {
-            return false;
+        /* for-init is an Expression (or a declaration list): a leading
+         * `function` here is a function *expression* - typically an IIFE such
+         * as jQuery's `for(function(e,t){...}(props,easing);a>o;o++)` - never
+         * a declaration. statement() would parse it as a declaration and
+         * strand the call arguments into the condition clause, so compile the
+         * init as an expression sequence and consume its ';' here. */
+        if (l->tk == LEX_R_FUNCTION) {
+            if (!expr_seq(l, bc)) {
+                return false;
+            }
+            bc_gen(bc, INSTR_POP);
+            if (l->tk != ';') {
+                return false;
+            }
+            lex_chkread(l, ';');
+            lex_skip_empty(l);
+        } else {
+            // Standard for loop init statement. statement() consumes the init's
+            // own ';' terminator, so the token that follows belongs to the
+            // CONDITION clause; eating another ';' here would swallow the
+            // condition separator of `for (i = 1;;)` and strand the parse.
+            if (!statement(l, bc)) {
+                return false;
+            }
+            lex_skip_empty(l);
         }
-        lex_skip_empty(l);
     }
     
     /* A for-in/for-of loop variable is re-bound on every iteration, so it must
@@ -7593,7 +7639,7 @@ bool stmt_function(lex_t* l, bytecode_t* bc) {
         return false;
     }
     mstr_t* fname = mstr_new("");
-    g_func_selfname = 1; /* declaration: record .name for Error.stack parity (see defer_replay_one) */
+    g_func_selfname = 2; /* DECLARATION: record .name for Error.stack parity, but NO in-body self-binding so a body `fname = ...` rebinds this declaration (see defer_replay_one) */
     factor_def_func(l, bc, fname);
     g_func_selfname = 0;
     bc_gen_str(bc, INSTR_MEMBERN, fname->cstr);
@@ -7960,7 +8006,7 @@ bool stmt_export(lex_t* l, bytecode_t* bc) {
             mstr_free(fname);
             return false;
         }
-        g_func_selfname = 1; /* exported declaration: record .name (see defer_replay_one) */
+        g_func_selfname = 2; /* exported DECLARATION: record .name, no in-body self-binding (see defer_replay_one) */
         if (!factor_def_func(l, dbc, fname)) {
             g_func_selfname = 0;
             mstr_free(fname);
@@ -8001,7 +8047,7 @@ bool stmt_export(lex_t* l, bytecode_t* bc) {
             return false;
         }
         g_async_pending = 1;
-        g_func_selfname = 1; /* exported async declaration: record .name (see defer_replay_one) */
+        g_func_selfname = 2; /* exported async DECLARATION: record .name, no in-body self-binding (see defer_replay_one) */
         if (!factor_def_func(l, dbc, fname)) {
             g_async_pending = 0;
             g_func_selfname = 0;
@@ -8974,7 +9020,7 @@ bool statement(lex_t* l, bytecode_t* bc) {
                 }
                 mstr_t* fname = mstr_new("");
                 g_async_pending = 1;
-                g_func_selfname = 1; /* async declaration: record .name (see defer_replay_one) */
+                g_func_selfname = 2; /* async DECLARATION: record .name, no in-body self-binding (see defer_replay_one) */
                 factor_def_func(l, dbc, fname);
                 g_func_selfname = 0;
                 bc_gen_str(dbc, INSTR_MEMBERN, fname->cstr);

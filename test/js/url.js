@@ -30,6 +30,8 @@ var usp2 = new URLSearchParams("?x=hello+world&y=a%20b");
 eq(usp2.get("x"), "hello world", "usp decodes '+' as space");
 eq(usp2.get("y"), "a b", "usp decodes %20");
 eq(usp2.toString(), "x=hello+world&y=a+b", "usp re-encodes space as '+'");
+eq(decodeURIComponent("cna=a+b%2Bc"), "cna=a+b+c", "decodeURIComponent preserves literal plus");
+eq(decodeURI("a+b%2Bc"), "a+b%2Bc", "decodeURI preserves plus and reserved escape");
 
 var usp3 = new URLSearchParams([["k", "v"], ["k2", "v2"]]);
 eq(usp3.get("k"), "v", "usp array-of-pairs init");

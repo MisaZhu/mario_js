@@ -34,5 +34,34 @@ Function.prototype.marker = 123;
 function K2() {}
 eq(K2.marker, 123, "data member on Function.prototype resolves on a function");
 
+// Function.prototype precedes Object.prototype for callable static lookup, while
+// class-owned statics and the function's own prototype members still win first.
+var nativeApply = Function.prototype.apply;
+Object.prototype.apply = function () {};
+Object.prototype.marker = 456;
+function ApplyBase() {
+    this._config = { enabled: this.constructor.Default.enableItemValueList };
+}
+ApplyBase.prototype.apply = function () {};
+function ApplySub() {
+    return ApplyBase.apply(this, arguments);
+}
+ApplySub.prototype = Object.create(ApplyBase.prototype, {
+    constructor: { value: ApplySub, writable: true, configurable: true }
+});
+Object.setPrototypeOf(ApplySub, ApplyBase);
+Object.defineProperty(ApplySub, "Default", {
+    get: function () { return { enableItemValueList: ["item", "tmall"] }; }
+});
+eq(ApplyBase.apply, nativeApply, "Object.prototype.apply does not shadow Function.prototype.apply");
+eq(ApplyBase["apply"], nativeApply, "computed lookup uses the same Function-before-Object order");
+var applyValue = new ApplySub();
+eq(applyValue._config.enabled.join(","), "item,tmall", "Babel super fallback executes the base initializer");
+eq(K2.marker, 123, "Function.prototype data member also precedes Object.prototype");
+class StaticApply { static apply() { return "class-own"; } }
+eq(StaticApply.apply(), "class-own", "class-owned static apply still wins over Function.prototype");
+delete Object.prototype.apply;
+delete Object.prototype.marker;
+
 console.log(failed === 0 ? "__FNPROTO_OK__" : ("__FNPROTO_FAIL__ " + failed));
 console.log("Function.prototype member lookup: " + passed + " passed, " + failed + " failed");
