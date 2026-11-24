@@ -78,7 +78,12 @@ static var_t* native_bound_call(vm_t* vm, var_t* env, void* data) {
 		var_array_add(args, (a != NULL) ? a : var_new(vm));
 	}
 
+	/* Same contract as native_Function_call: this fresh refs==0 args array is a
+	 * bare C local across the inner vm_run, so anchor it for the call. */
+	bool args_rooted = vm_push_c_root(vm, args);
 	var_t* res = mario_apply_var(vm, target, thisArg, args);
+	if(args_rooted)
+		vm_pop_c_roots(vm, 1);
 	var_unref(args);
 	var_unref(preArgs);
 	var_unref(thisArg);
@@ -112,7 +117,14 @@ var_t* native_Function_call(vm_t* vm, var_t* env, void* data) {
 		var_t* a = get_func_arg(env, i);
 		var_array_add(args, (a != NULL) ? a : var_new(vm));
 	}
+	/* `args` is a fresh refs==0 array held only by this C local across the inner
+	 * vm_run (call_m_func roots its OWN rebuilt array, not this one). Anchor it
+	 * so an opportunistic gc inside the callee cannot sweep it before the
+	 * trailing var_unref. */
+	bool args_rooted = vm_push_c_root(vm, args);
 	var_t* res = mario_apply_var(vm, target, thisArg, args);
+	if(args_rooted)
+		vm_pop_c_roots(vm, 1);
 	var_unref(args);
 	return res;
 }
@@ -277,8 +289,9 @@ var_t* native_Function_toString(vm_t* vm, var_t* env, void* data) {
 	}
 	func_t* f = var_get_func(self);
 	/* Source text available: return verbatim (browser parity). */
-	if(f != NULL && f->src_text != NULL)
-		return var_new_str(vm, f->src_text);
+	var_t* src = func_source_var(vm, f);
+	if(src != NULL)
+		return src;
 	const char* nm = "";
 	var_t* nv = var_find_own_member_var(self, "name");
 	if(nv != NULL && nv->type == V_STRING)

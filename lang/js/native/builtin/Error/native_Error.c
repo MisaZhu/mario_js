@@ -89,10 +89,21 @@ static var_t* cs_toString(vm_t* vm, var_t* env, void* d) {
 	return var_new_str(vm, buf);
 }
 
-/* Shared CallSite method table, built once and kept alive by a permanent ref. */
+/* Shared CallSite method table, built once PER VM and kept alive by a ref that
+ * lasts as long as that VM. The table is a var of the VM that built it, so it
+ * dies in vm_close(): an embedder that closes the VM and opens another (every
+ * page navigation) must not hand the old table to the new VM - that was a
+ * dangling prototype on every CallSite built after the first navigation. */
 static var_t* g_cs_proto = NULL;
+static vm_t*  g_cs_vm = NULL;
+static void callsite_vm_close(void* data) {
+	if(g_cs_vm == (vm_t*)data) {
+		g_cs_proto = NULL;
+		g_cs_vm = NULL;
+	}
+}
 static var_t* callsite_proto(vm_t* vm) {
-	if(g_cs_proto != NULL)
+	if(g_cs_proto != NULL && g_cs_vm == vm)
 		return g_cs_proto;
 	var_t* objcls = var_find_member_var(vm->root, "Object");
 	var_t* objproto = (objcls != NULL) ? var_get_prototype(objcls) : NULL;
@@ -114,8 +125,10 @@ static var_t* callsite_proto(vm_t* vm) {
 	var_add(p, "isAsync",          var_new_native_func(vm, cs_bool, NULL));
 	var_add(p, "isPromiseAll",     var_new_native_func(vm, cs_bool, NULL));
 	var_add(p, "toString",         var_new_native_func(vm, cs_toString, NULL));
-	var_ref(p);   /* permanent anchor; the GC is refcount-based */
+	var_ref(p);   /* anchor for the VM's lifetime; the GC is refcount-based */
 	g_cs_proto = p;
+	g_cs_vm = vm;
+	vm_reg_close(vm, callsite_vm_close, vm);
 	return p;
 }
 

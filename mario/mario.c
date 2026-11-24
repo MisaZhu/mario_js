@@ -86,7 +86,12 @@ inline void mario_printf(const char *format, ...) {
 
 /**======hash map functions======*/
 
-#define HASH_MAP_INITIAL_CAPACITY 16
+/* Most objects are small (a page census showed ~60% of member maps holding
+ * <= 4 entries), so maps start at 4 slots and grow at load factor 1: the
+ * chains are embedded in the nodes, a longer chain costs no extra block. */
+#define HASH_MAP_INITIAL_CAPACITY 4
+#define HASH_MAP_NEEDS_GROW(map) \
+	((map)->capacity < HASH_MAP_MAX_CAPACITY && (map)->size >= (map)->capacity)
 
 // Hash function for strings
 static uint32_t hash_string(const char* key) { 
@@ -105,7 +110,73 @@ static uint32_t hash_string(const char* key) {
  * bypasses the pool entirely. */
 #define NODE_POOL_MAX 4096
 #define HENTRY_POOL_MAX 8192
-#define BUCKETS_POOL_MAX 1024 /* 128B initial bucket arrays: bounds at 128KB per VM */
+#define BUCKETS_POOL_MAX 1024 /* 32B initial bucket arrays: bounds at 32KB per VM */
+
+/* Body slabs (see mario_slab_t). Chunks are big enough for the platform
+ * allocator to hand their pages straight back on free. Body sizes are all
+ * multiples of 16, so the 16-byte chunk header keeps every body aligned. */
+#define SLAB_CHUNK_BYTES (64u * 1024u)
+#define SLAB_CHUNK_HEAD  16u
+
+#ifdef MARIO_SLAB
+static inline void* slab_alloc(mario_slab_t* s, uint32_t body_size) {
+	void* p = s->free;
+	if(p != NULL) {
+		s->free = *(void**)p;
+		return p;
+	}
+	if(s->bump_left == 0) {
+		void* c = mario_malloc(SLAB_CHUNK_BYTES);
+		if(c == NULL)
+			return NULL;
+		*(void**)c = s->chunks;
+		s->chunks = c;
+		s->bump = (uint8_t*)c + SLAB_CHUNK_HEAD;
+		s->bump_left = (SLAB_CHUNK_BYTES - SLAB_CHUNK_HEAD) / body_size;
+	}
+	p = s->bump;
+	s->bump += body_size;
+	s->bump_left--;
+	return p;
+}
+
+static inline void slab_free(mario_slab_t* s, void* p) {
+	*(void**)p = s->free;
+	s->free = p;
+}
+
+/* Hand every chunk back. Only valid once no body of the slab is referenced
+ * any more (vm_close, after the final sweep and the pool drains). */
+static void slab_release(mario_slab_t* s) {
+	while(s->chunks != NULL) {
+		void* c = s->chunks;
+		s->chunks = *(void**)c;
+		mario_free(c);
+	}
+	s->free = NULL;
+	s->bump = NULL;
+	s->bump_left = 0;
+}
+#endif
+
+/* var_t body: slab-backed per VM (var_new always has a VM). */
+static inline var_t* var_body_alloc(vm_t* vm) {
+#ifdef MARIO_SLAB
+	return (var_t*)slab_alloc(&vm->var_slab, sizeof(var_t));
+#else
+	(void)vm;
+	return (var_t*)mario_malloc(sizeof(var_t));
+#endif
+}
+
+static inline void var_body_free(vm_t* vm, var_t* v) {
+#ifdef MARIO_SLAB
+	slab_free(&vm->var_slab, v);
+#else
+	(void)vm;
+	mario_free(v);
+#endif
+}
 
 static inline node_t* node_pool_alloc(vm_t* vm) {
 	if(vm != NULL && vm->node_pool != NULL) {
@@ -114,11 +185,21 @@ static inline node_t* node_pool_alloc(vm_t* vm) {
 		vm->node_pool_num--;
 		return p;
 	}
+#ifdef MARIO_SLAB
+	if(vm != NULL)
+		return (node_t*)slab_alloc(&vm->node_slab, sizeof(node_t));
+#endif
 	return (node_t*)mario_malloc(sizeof(node_t));
 }
 
 static inline void node_pool_release(vm_t* vm, node_t* n) {
+#ifdef MARIO_SLAB
+	/* Slab bodies never go back to the platform one by one: the pool is the
+	 * slab's free list and is unbounded. */
+	if(vm != NULL) {
+#else
 	if(vm != NULL && vm->node_pool_num < NODE_POOL_MAX) {
+#endif
 		*(void**)n = vm->node_pool;
 		vm->node_pool = n;
 		vm->node_pool_num++;
@@ -127,7 +208,12 @@ static inline void node_pool_release(vm_t* vm, node_t* n) {
 		mario_free(n);
 }
 
-static inline hash_entry_t* hentry_alloc(hash_map_t* map) {
+/* HASH_KEYS_NODE maps (var children) store node_t values whose embedded `hent`
+ * is the entry itself: nothing to allocate here and nothing to release below.
+ * hent.key aliases node->name, which the insert sites pass as the key. */
+static inline hash_entry_t* hentry_alloc(hash_map_t* map, void* value) {
+	if(map->keys_borrowed == HASH_KEYS_NODE)
+		return (value != NULL) ? &((node_t*)value)->hent : NULL;
 	vm_t* vm = (vm_t*)map->owner;
 	if(vm != NULL && vm->hentry_pool != NULL) {
 		hash_entry_t* p = (hash_entry_t*)vm->hentry_pool;
@@ -146,6 +232,10 @@ static inline hash_entry_t* hentry_alloc(hash_map_t* map) {
 }
 
 static inline void hentry_release(hash_map_t* map, hash_entry_t* e) {
+	/* Embedded entry: it lives and dies with its node (hash_map_clean has
+	 * already run free_value on it by now), so it must not be touched. */
+	if(map->keys_borrowed == HASH_KEYS_NODE)
+		return;
 	vm_t* vm = (vm_t*)map->owner;
 	if(vm != NULL && vm->hentry_pool_num < HENTRY_POOL_MAX) {
 		*(void**)e = vm->hentry_pool;
@@ -193,8 +283,6 @@ hash_map_t* hash_map_new(void) {
 void hash_map_init(hash_map_t* map) {
     map->capacity = HASH_MAP_INITIAL_CAPACITY;
     map->size = 0;
-    map->load_factor_num = 3;   // 分子：3
-    map->load_factor_den = 4;   // 分母：4（3/4 = 0.75）
     map->owner = NULL;
     map->keys_borrowed = 0;
     map->buckets = (hash_entry_t**)mario_malloc(sizeof(hash_entry_t*) * map->capacity);
@@ -211,7 +299,7 @@ void hash_map_init(hash_map_t* map) {
     }
 }
 
-/* Bucket-array pool (paired with the hentry pool above): the 16-slot initial
+/* Bucket-array pool (paired with the hentry pool above): the initial-size
  * bucket array is malloc'd+freed once per VM-owned children map birth/death
  * (every function env, every memberful var). Only INITIAL_CAPACITY arrays are
  * pooled; resized arrays diverge in size and go straight to mario_free. The
@@ -220,8 +308,14 @@ void hash_map_init(hash_map_t* map) {
  * NULLs them; resize re-links every entry out). */
 static inline void buckets_release(hash_map_t* map, hash_entry_t** buckets, uint32_t capacity) {
     vm_t* vm = (vm_t*)map->owner;
+#ifdef MARIO_SLAB
+    /* Initial-size arrays of VM-owned maps are slab bodies (see
+     * hash_map_ensure_buckets): the pool is their free list, unbounded. */
+    if (vm != NULL && capacity == HASH_MAP_INITIAL_CAPACITY) {
+#else
     if (vm != NULL && capacity == HASH_MAP_INITIAL_CAPACITY &&
         vm->buckets_pool_num < BUCKETS_POOL_MAX) {
+#endif
         *(void**)buckets = vm->buckets_pool;
         vm->buckets_pool = buckets;
         vm->buckets_pool_num++;
@@ -242,19 +336,38 @@ static inline void hash_map_ensure_buckets(hash_map_t* map) {
     void* owner = map->owner;
     uint32_t borrowed = map->keys_borrowed;
     vm_t* vm = (vm_t*)owner;
+    hash_entry_t** b = NULL;
     if (vm != NULL && vm->buckets_pool != NULL) {
-        hash_entry_t** b = (hash_entry_t**)vm->buckets_pool;
+        b = (hash_entry_t**)vm->buckets_pool;
         vm->buckets_pool = *(void**)b;
         vm->buckets_pool_num--;
+    }
+#ifdef MARIO_SLAB
+    else if (vm != NULL) {
+        b = (hash_entry_t**)slab_alloc(&vm->bucket_slab,
+                sizeof(hash_entry_t*) * HASH_MAP_INITIAL_CAPACITY);
+    }
+    if (vm != NULL) {
+        /* OOM leaves the map empty (buckets NULL, capacity 0), like
+         * hash_map_init; the add paths drop the insert. */
+        map->size = 0;
+        map->buckets = b;
+        map->capacity = (b != NULL) ? HASH_MAP_INITIAL_CAPACITY : 0;
+        uint32_t i;
+        for (i = 0; i < map->capacity; i++)
+            b[i] = NULL;
+    }
+#else
+    if (b != NULL) {
         map->capacity = HASH_MAP_INITIAL_CAPACITY;
         map->size = 0;
-        map->load_factor_num = 3;
-        map->load_factor_den = 4;
         map->buckets = b;
         uint32_t i;
         for (i = 0; i < HASH_MAP_INITIAL_CAPACITY; i++)
             b[i] = NULL;
-    } else {
+    }
+#endif
+    else {
         hash_map_init(map);
     }
     map->owner = owner;
@@ -298,8 +411,7 @@ void hash_map_add(hash_map_t* map, const char* key, void* value) {
     if (map->buckets == NULL || map->capacity == 0)
         return;
     // Check if we need to resize
-    if (map->capacity < HASH_MAP_MAX_CAPACITY &&
-        map->size * map->load_factor_den > map->capacity * map->load_factor_num) {
+    if (HASH_MAP_NEEDS_GROW(map)) {
         // Resize the hash map
         uint32_t new_capacity = map->capacity * 2;
         if (new_capacity >= (1u << 20)) mario_mapdbg("map resize add", map->size, new_capacity);
@@ -335,21 +447,36 @@ void hash_map_add(hash_map_t* map, const char* key, void* value) {
     uint32_t hash = hash_string(key) % map->capacity;
     
     // Check if key already exists
-    hash_entry_t* entry = map->buckets[hash];
+    hash_entry_t** link = &map->buckets[hash];
+    hash_entry_t* entry = *link;
     while (entry) {
         if (strcmp(entry->key, key) == 0) {
             // Key exists, update value
+            if (map->keys_borrowed == HASH_KEYS_NODE) {
+                /* The entry is embedded in the node being replaced: splice the
+                 * new node's own entry into its chain position instead. */
+                hash_entry_t* ne = hentry_alloc(map, value);
+                if (ne != NULL && ne != entry) {
+                    ne->value = value;
+                    ne->next = entry->next;
+                    *link = ne;
+                }
+                return;
+            }
             entry->value = value;
             return;
         }
+        link = &entry->next;
         entry = entry->next;
     }
     
     // Key doesn't exist, create new entry
-    entry = hentry_alloc(map);
+    entry = hentry_alloc(map, value);
     if (entry == NULL) /* OOM: drop the insert */
         return;
-    if (map->keys_borrowed) {
+    if (map->keys_borrowed == HASH_KEYS_NODE) {
+        /* entry->key is node->name already (the key passed in). */
+    } else if (map->keys_borrowed) {
         /* Caller guarantees key storage outlives the entry (children maps pass
          * node->name). No copy: kills one strdup per member add. */
         entry->key = (char*)key;
@@ -378,8 +505,7 @@ bool hash_map_add_fresh(hash_map_t* map, const char* key, void* value) {
     /* OOM: materialization failed - drop the insert instead of faulting. */
     if (map->buckets == NULL || map->capacity == 0)
         return false;
-    if (map->capacity < HASH_MAP_MAX_CAPACITY &&
-        map->size * map->load_factor_den > map->capacity * map->load_factor_num) {
+    if (HASH_MAP_NEEDS_GROW(map)) {
         uint32_t new_capacity = map->capacity * 2;
         if (new_capacity >= (1u << 20)) mario_mapdbg("map resize fresh", map->size, new_capacity);
         hash_entry_t** new_buckets = (hash_entry_t**)mario_malloc(sizeof(hash_entry_t*) * new_capacity);
@@ -405,10 +531,12 @@ bool hash_map_add_fresh(hash_map_t* map, const char* key, void* value) {
         }
     }
     uint32_t hash = hash_string(key) % map->capacity;
-    hash_entry_t* entry = hentry_alloc(map);
+    hash_entry_t* entry = hentry_alloc(map, value);
     if (entry == NULL) /* OOM: drop the insert */
         return false;
-    if (map->keys_borrowed) {
+    if (map->keys_borrowed == HASH_KEYS_NODE) {
+        /* entry->key is node->name already (the key passed in). */
+    } else if (map->keys_borrowed) {
         entry->key = (char*)key;
     } else {
         entry->key = (char*)mario_malloc(strlen(key) + 1);
@@ -1851,7 +1979,7 @@ void bc_init(bytecode_t* bc) {
 	 * re-init path. Zero-init keeps the buckets==NULL <=> capacity==0
 	 * invariant that get/clean/add already guard on. */
 	memset(&bc->mstr_index, 0, sizeof(bc->mstr_index));
-	bc->mstr_index.keys_borrowed = 1; /* keys owned by mstr_table (array_clean frees them) */
+	bc->mstr_index.keys_borrowed = HASH_KEYS_BORROWED; /* keys owned by mstr_table (array_clean frees them) */
 	bc->srcmap = NULL;
 	bc->srcmap_size = bc->srcmap_max = 0;
 	bc->srcmap_cur = 0;
@@ -4738,7 +4866,7 @@ static inline void gc_free_free_vars(vm_t* vm, uint32_t buffer_num) {
 			vm->gc.c_dead = v;
 		}
 		else {
-			mario_free(v);
+			var_body_free(vm, v);
 		}
 		vm->free_var_buffer = vtmp;
 		vm->free_var_buffer_num--;
@@ -4771,18 +4899,20 @@ static inline void gc_free_c_dead(vm_t* vm) {
 			keep = v;
 		}
 		else {
-			mario_free(v);
+			var_body_free(vm, v);
 		}
 		v = vtmp;
 	}
 	vm->gc.c_dead = keep;
 }
 
+
 static inline void gc(vm_t* vm, bool force) {
 	if(vm->gc.is_doing_gc)
 		return;
-	if(!force && vm->gc.gc_defer > 0) //a C frame holds bare var pointers right now
+	if(!force && vm->gc.gc_defer > 0) { //a C frame holds bare var pointers right now
 		return;
+	}
 	/* Two independent triggers: the gc_vars population (regular sweep) and the
 	 * never_gc population (mid-run cycle pass). Cycle garbage rides never_gc
 	 * with refs>0 and never inflates gc_vars_num, so a page that only builds
@@ -5250,8 +5380,7 @@ var_t* var_get_callable_proto(var_t* var) {
 inline var_t* var_new(vm_t* vm) {
 	var_t* var = get_from_free(vm);
 	if(var == NULL) {
-        uint32_t sz = sizeof(var_t);
-		var = (var_t*)mario_malloc(sz);
+		var = var_body_alloc(vm);
 		/* OOM: the heap can not expand. Flip the collector to bounded mode so
 		 * the next sweep reclaims C-held garbage instead of retaining it, and
 		 * return NULL - memset'ing a NULL body faulted at a small offset
@@ -5290,15 +5419,15 @@ inline var_t* var_new(vm_t* vm) {
 	 * this list, so C-held vars without a registered root stay safe; vm_close
 	 * drains it into gc_vars for the final cycle-collecting sweep. */
 	add_to_never_gc(var);
-	/* Children map stays LAZY: the 16-slot bucket array is only allocated by
+	/* Children map stays LAZY: the bucket array is only allocated by
 	 * hash_map_add's self-heal on the first member insert. Plain numeric/string
 	 * temporaries (the bulk of all vars) never grow members, so eager init here
-	 * cost one 128B malloc + free per var for nothing. Invariant relied upon
+	 * cost one malloc + free per var for nothing. Invariant relied upon
 	 * everywhere: buckets==NULL <=> capacity==0 (memset above, hash_map_clean's
 	 * teardown, and hash_map_init all maintain it); get/remove guard on it and
 	 * every raw walk loops `i < capacity`, so an un-initialized map is inert. */
 	var->children.owner = vm;      // entries recycle through this VM's pool
-	var->children.keys_borrowed = 1; // entry keys alias node->name (see hash_map_t)
+	var->children.keys_borrowed = HASH_KEYS_NODE; // entries are embedded in the member nodes (see hash_map_t)
 	return var;
 }
 
@@ -7928,10 +8057,6 @@ static void func_free(void* p) {
 		mario_free(func->cls_self_name);
 		func->cls_self_name = NULL;
 	}
-	if(func->src_text != NULL) {
-		mario_free(func->src_text);
-		func->src_text = NULL;
-	}
 	/* Release the JIT'd body (see jit/mario_jit.h): the machine-code region
 	 * and the pc2off map are owned by this func_t, independent of the var
 	 * graph. A no-op on targets with no JIT backend. */
@@ -8913,42 +9038,40 @@ static var_t* func_def(vm_t* vm, int regular, bool is_static) {
 	if(func == NULL) /* OOM: header consumed above, nothing to build */
 		return NULL;
 
-	/* Function.toString source span lookup: materialize the source slice so
-	 * native_Function_toString can return it verbatim (browser parity). */
-	if(func->pc != 0 && vm->bc.fspans_size > 0) {
-		uint32_t i;
-		for(i = 0; i < vm->bc.fspans_size; i++) {
-			if(vm->bc.fspans[i].entry_pc == func->pc) {
-				struct st_bc_fspan_ent* e = &vm->bc.fspans[i];
-				if(e->src < vm->bc.srcs.size) {
-					const char* src = (const char*)vm->bc.srcs.items[e->src];
-					/* Every evaluation of a function expression lands here, and the
-					 * source is the whole script: a strlen per closure made closure-
-					 * heavy code in a big bundle pay O(script size) each time (the
-					 * 208KB wcinfo CHAOS VM spent ~1/5 of its run in it). */
-					if(src != s_fspan_src) {
-						s_fspan_src_len = strlen(src);
-						s_fspan_src = src;
-					}
-					size_t src_len = s_fspan_src_len;
-					if(e->start < src_len && e->end < src_len && e->end >= e->start) {
-						uint32_t len = e->end - e->start + 1;
-						func->src_text = (char*)mario_malloc(len + 1);
-						if(func->src_text != NULL) {
-							memcpy(func->src_text, src + e->start, len);
-							func->src_text[len] = '\0';
-						}
-					}
-				}
-				break;
-			}
-		}
-	}
-
 	var_t* ret = var_new_func(vm, func);
 	if(ret == NULL) /* OOM: the var shell failed - release the orphan func_t */
 		func_free(func);
 	return ret;
+}
+
+/* Function.prototype.toString source text: the exact source slice of the
+ * function's definition, looked up by its entry pc in the bytecode's fspan
+ * table. Resolved on demand: materializing it in func_def gave every closure
+ * instance a private copy of its source (a React page held ~17k copies, 10MB)
+ * and made every function-expression evaluation scan the whole span table.
+ * Returns NULL for natives and for functions compiled from captured/sub-lexer
+ * text where span tracking is unavailable. */
+var_t* func_source_var(vm_t* vm, func_t* func) {
+	if(vm == NULL || func == NULL || func->native != NULL || func->pc == 0)
+		return NULL;
+	uint32_t i;
+	for(i = 0; i < vm->bc.fspans_size; i++) {
+		struct st_bc_fspan_ent* e = &vm->bc.fspans[i];
+		if(e->entry_pc != func->pc)
+			continue;
+		if(e->src >= vm->bc.srcs.size)
+			return NULL;
+		const char* src = (const char*)vm->bc.srcs.items[e->src];
+		if(src != s_fspan_src) {
+			s_fspan_src_len = strlen(src);
+			s_fspan_src = src;
+		}
+		size_t src_len = s_fspan_src_len;
+		if(e->start >= src_len || e->end >= src_len || e->end < e->start)
+			return NULL;
+		return var_new_str2(vm, src + e->start, e->end - e->start + 1);
+	}
+	return NULL;
 }
 
 static inline bool is_compound_assign(opr_code_t op) {
@@ -11053,25 +11176,17 @@ var_t* call_m_func(vm_t* vm, var_t* obj, var_t* func, var_t* args) {
 	//push args to stack.
 	int arg_num = 0;
 	/* `args` (and any hole-filler we create) is held only by this C frame while
-	 * the callee runs, so an opportunistic gc in the callee (vm_pop_scope) would
-	 * sweep it and the caller's var_unref(args) would become a UAF. Defer gc for
-	 * the whole call instead of anchoring args on the value stack: the old
-	 * vm_push/vm_pop anchor churned args->refs, and when a caller passed an args
-	 * array whose only live reference was the one it was about to release
-	 * (refs==0 on entry, e.g. handle_call_spread), the anchor pop freed args and
-	 * the caller's later var_unref(args) read freed memory. gc_defer protects
-	 * args without touching its refcount, leaving exactly one release (the
-	 * caller's). The elements still go on the value stack for func_call. */
-	vm->gc.gc_defer++;
-	/* gc_defer only gates OPPORTUNISTIC collections; an explicit gc() inside
-	 * the callee ignores it. The args array itself is held solely by the
-	 * native caller's C local (its elements go on the value stack below, the
-	 * array does not), so the mid-run never_gc cycle pass would classify it
-	 * garbage (refs==1, no internal in-edges - indistinguishable from a
-	 * self-cycle) and the caller's trailing var_unref(args) became a UAF
-	 * (es6_full promise drain). Root it for the whole call; c_root is a mark
-	 * anchor, not a ref, so the refs==0-on-entry contract (handle_call_spread)
-	 * and the single caller release stay intact. */
+	 * the callee runs. Anchor it as a c_root: a mark anchor, not a ref, so both
+	 * the regular sweep and the mid-run never_gc cycle pass keep it alive while
+	 * the refs==0-on-entry contract (handle_call_spread) and the single caller
+	 * release stay intact. The elements go on the value stack for func_call.
+	 *
+	 * Do NOT gc_defer for the call: deferring opportunistic GC for the whole
+	 * callee starved collection for the entire duration of every native callback
+	 * and call/apply/bound trampoline, so garbage piled up to several times the
+	 * live set (multi-GB page heaps). With args rooted, the callee's own vm_run
+	 * safe points collect normally and the caller's trailing var_unref(args) is
+	 * still the single release. */
 	bool args_rooted = vm_push_c_root(vm, args);
 	if(args != NULL) {
 		// Push arguments onto the stack
@@ -11115,14 +11230,12 @@ var_t* call_m_func(vm_t* vm, var_t* obj, var_t* func, var_t* args) {
 			var_unref(ret);
 		if(args_rooted)
 			vm_pop_c_roots(vm, 1);
-		vm->gc.gc_defer--;
 		return NULL;
 	}
 	if(ret != NULL && obj == ret)
 		ret->refs--;
 	if(args_rooted)
 		vm_pop_c_roots(vm, 1);
-	vm->gc.gc_defer--;
 	return ret;
 }
 
@@ -15435,14 +15548,29 @@ static var_t* gen_create(vm_t* vm, var_t* func_var, var_t* env) {
  * Nesting is counted so a pump inside a pump isolates only once. */
 static gen_state_t g_pump_gen;
 static var_t*      g_pump_anchor = NULL;
+/* The VM g_pump_anchor belongs to. The anchor is a var of that VM and dies in
+ * its vm_close(), so the owner is tracked here rather than read back through
+ * g_pump_anchor->vm: after a close that is a read of freed memory, and once
+ * the block is recycled as a var of the NEXT vm it compares equal and the
+ * pump parks its keep array on an unrelated object. */
+static vm_t*       g_pump_vm = NULL;
 static int         g_pump_active = 0;
+
+static void pump_vm_close(void* data) {
+	if(g_pump_vm == (vm_t*)data) {
+		g_pump_anchor = NULL;
+		g_pump_vm = NULL;
+	}
+}
 
 void vm_pump_suspend(vm_t* vm) {
 	if(g_pump_active++ > 0)
 		return;
 	memset(&g_pump_gen, 0, sizeof(g_pump_gen));
-	if(g_pump_anchor == NULL || g_pump_anchor->vm != vm) {
+	if(g_pump_anchor == NULL || g_pump_vm != vm) {
 		g_pump_anchor = var_new_obj(vm, var_get_prototype(vm->builtin_vars.var_Object), NULL, NULL);
+		g_pump_vm = vm;
+		vm_reg_close(vm, pump_vm_close, vm);
 		node_t* n = var_add(vm->root, "@@pump_anchor", g_pump_anchor);
 		if(n != NULL) { n->invisable = 1; n->be_unenumerable = 1; }
 		n = var_add(g_pump_anchor, GEN_KEEP, var_new_array(vm));
@@ -19596,7 +19724,7 @@ void vm_close(vm_t* vm) {
 	while(vm->gc.c_dead != NULL) {
 		var_t* dv = vm->gc.c_dead;
 		vm->gc.c_dead = dv->next;
-		mario_free(dv);
+		var_body_free(vm, dv);
 	}
 
 	// Pop and free all scopes
@@ -19656,24 +19784,38 @@ void vm_close(vm_t* vm) {
 	vm->nbox_free_num = 0;
 	/* Same drain for the node/entry pools: the final sweep recycled every
 	 * member node and hash entry into them; nothing can push past this point. */
+#ifdef MARIO_SLAB
+	/* Slab-backed bodies: the pools are just free lists into the chunks, so
+	 * drop the lists and hand the chunks back whole. Any var body still parked
+	 * on free_var_buffer / gc.c_dead lives in a chunk as well. */
+	vm->node_pool = NULL;
+	vm->buckets_pool = NULL;
+	vm->free_var_buffer = NULL;
+	vm->free_var_buffer_num = 0;
+	vm->gc.c_dead = NULL;
+	slab_release(&vm->node_slab);
+	slab_release(&vm->bucket_slab);
+	slab_release(&vm->var_slab);
+#else
 	while(vm->node_pool != NULL) {
 		void* p = vm->node_pool;
 		vm->node_pool = *(void**)p;
 		mario_free(p);
 	}
+	while(vm->buckets_pool != NULL) {
+		void* p = vm->buckets_pool;
+		vm->buckets_pool = *(void**)p;
+		mario_free(p);
+	}
+#endif
 	vm->node_pool_num = 0;
+	vm->buckets_pool_num = 0;
 	while(vm->hentry_pool != NULL) {
 		void* p = vm->hentry_pool;
 		vm->hentry_pool = *(void**)p;
 		mario_free(p);
 	}
 	vm->hentry_pool_num = 0;
-	while(vm->buckets_pool != NULL) {
-		void* p = vm->buckets_pool;
-		vm->buckets_pool = *(void**)p;
-		mario_free(p);
-	}
-	vm->buckets_pool_num = 0;
 	while(vm->scope_pool != NULL) {
 		void* p = vm->scope_pool;
 		vm->scope_pool = *(void**)p;

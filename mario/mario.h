@@ -69,18 +69,38 @@ typedef struct st_hash_map {
 	hash_entry_t**      buckets;
 	uint32_t            size;
 	uint32_t            capacity;
-	uint32_t            load_factor_num;   // 负载因子分子
-	uint32_t            load_factor_den;   // 负载因子分母
 	/* Entry-pool owner: when non-NULL (a var_t children map) entries are
 	 * recycled through the owning VM's hentry pool instead of mario_free.
 	 * Survives hash_map_clean and the lazy self-heal re-init in add. */
 	void*               owner;
-	/* When non-zero every entry->key is BORROWED from its node value
-	 * (node->name): add stores the pointer without strdup, remove/clean
-	 * skip the key free. Only var children maps set this; the key pointer
-	 * passed to hash_map_add must then be node->name (outlives entry). */
+	/* When non-zero every entry->key is BORROWED from its value: add stores
+	 * the pointer without strdup, remove/clean skip the key free; the key
+	 * pointer passed to hash_map_add must then outlive the entry.
+	 * HASH_KEYS_NODE (var children maps, set by var_new) additionally means
+	 * every value is a node_t whose embedded `hent` IS the entry: no entry
+	 * is allocated or released, the key is node->name. One member then costs
+	 * a single heap block instead of two - on allocators with a per-block
+	 * header (32 bytes on EwokOS) the separate 24-byte entry cost more in
+	 * header than in payload. */
 	uint32_t            keys_borrowed;
 } hash_map_t;
+#define HASH_KEYS_BORROWED 1
+#define HASH_KEYS_NODE     2
+
+/* Fixed-size body slab. A page keeps millions of small same-sized bodies
+ * alive (member nodes, vars, bucket arrays); one heap block each pays the
+ * platform allocator's per-block header (32 bytes on EwokOS, more than a
+ * third of a node) and scatters them over the whole heap, so the memory of
+ * a closed VM could not be handed back. A slab carves bodies out of large
+ * chunks: no per-body header, and releasing the chunks at vm_close returns
+ * the VM's memory in whole blocks. Build with MARIO_NO_SLAB to fall back to
+ * one block per body (lets ASan see each body's lifetime). */
+typedef struct st_mario_slab {
+	void*               chunks;    /* chunk list, first word links the next chunk */
+	void*               free;      /* recycled bodies, first word links the next */
+	uint8_t*            bump;      /* next never-used body in the newest chunk */
+	uint32_t            bump_left; /* bodies left in the newest chunk */
+} mario_slab_t;
 
 // Hash map functions
 hash_map_t* hash_map_new(void);
@@ -220,8 +240,8 @@ typedef struct st_bytecode {
 	bool                srcmap_on;
 	/* Function source spans for Function.prototype.toString parity: records
 	 * (body-entry-pc, src-index, start-offset, end-offset) for every function
-	 * compiled from the main source. func_def looks up the span by func->pc and
-	 * materializes the source slice into func_t.src_text. */
+	 * compiled from the main source. func_source_var looks up the span by
+	 * func->pc and slices the source on demand. */
 	struct st_bc_fspan_ent { PC entry_pc; uint32_t src; uint32_t start; uint32_t end; } *fspans;
 	uint32_t            fspans_size, fspans_max;
 	/* Compile dedup: byte-identical sources reuse the code already in code_buf
@@ -802,12 +822,6 @@ typedef struct st_func {
 	 * array only when this is set (JS functions; natives keep the arg_num>0
 	 * rule). Zeroed by func_new's memset. */
 	uint8_t             uses_arguments;
-	/* Function.prototype.toString source text: the exact source slice of this
-	 * function's definition (from `function`/`async` keyword through closing `}`).
-	 * Set by func_def from the bytecode's fspan table; owned (mario_malloc'd),
-	 * freed in func_free(). NULL for native functions and for functions compiled
-	 * from captured/sub-lexer text where span tracking is unavailable. */
-	char*               src_text;
 	void*               jit_code;
 } func_t;
 
@@ -838,7 +852,14 @@ typedef struct st_node {
 	 * death changes no object's shape. */
 	uint32_t            name_static : 1;
 	uint32_t            ncache_instr;
-	char*               name;
+	/* Children-map linkage, embedded (see HASH_KEYS_NODE): hent.key aliases
+	 * `name`, hent.value points back at this node and hent.next chains the
+	 * bucket. Kept behind the leading bitfield word: `magic` must stay at
+	 * offset 0, value-stack slots tell a node from a var by it. */
+	union {
+		hash_entry_t    hent;
+		char*           name;
+	};
 #define NODE_NAME_INLINE 24
 	/* Inline short-name storage: identifiers shorter than this live inside
 	 * the node body (name points here), saving a malloc/free pair per
@@ -1273,6 +1294,13 @@ typedef struct st_vm {
 	 * size, recycled per-VM, drained in vm_close with the sibling pools. */
 	void*               scope_pool;
 	uint32_t            scope_pool_num;
+	/* Body slabs (see mario_slab_t): var_t, node_t and initial-size bucket
+	 * arrays are carved out of per-VM chunks instead of one heap block each.
+	 * Freed bodies recycle through free_var_buffer / var_slab.free, node_pool
+	 * and buckets_pool; the chunks go back to the platform in vm_close. */
+	mario_slab_t        var_slab;
+	mario_slab_t        node_slab;
+	mario_slab_t        bucket_slab;
 	/* Member-shape epoch: bumped by node_free, by var_add when it creates a NEW
 	 * node, and by prototype-link writes (var_set_prototype /
 	 * var_set_callable_proto). Inline-cache entries are tagged with this epoch
@@ -1364,6 +1392,7 @@ var_t*      var_new_obj(vm_t* vm, var_t* proto, void*p, free_func_t fr);
 var_t*      var_new_float(vm_t* vm, float i);
 var_t*      var_new_str(vm_t* vm, const char* s);
 var_t*      var_new_str2(vm_t* vm, const char* s, uint32_t len);
+var_t*      func_source_var(vm_t* vm, func_t* func); /* Function.prototype.toString source slice, NULL when untracked */
 /* Binary-safe string ctor: copies exactly `len` bytes INCLUDING embedded NUL
  * (U+0000 is a valid code unit; String.fromCharCode/atob byte buffers rely on
  * it). var_new_str/var_new_str2 stop at the first NUL and must not be used for
