@@ -1,3 +1,9 @@
+/* glibc guards Dl_info/dladdr (MARIO_NATPROF) behind __USE_GNU; the browser
+ * build passes -std=c99 -D_POSIX_C_SOURCE, so request it here - before any
+ * header pulls in features.h. macOS exposes dladdr unconditionally. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 #include "mario.h"
 #include "jit/mario_jit.h"
 #include <stdlib.h>
