@@ -31,13 +31,22 @@ extern "C" {
 #endif
 
 /* ---- target capability detection (compile-time) ------------------------ */
-/* EwokOS has no dynamic code loading (no dlopen, no user-space W^X executable
- * mmap + I-cache flush path): the copy-and-patch JIT cannot run there, and its
- * __builtin___clear_cache lowers to an external __clear_cache the -nostdlib
- * runtime does not provide (EL0 dc civac/ic ivau would trap anyway, since the
- * kernel leaves SCTLR_EL1.UCI clear). Force the interpreter fallback. */
+/* EwokOS/aarch64 CAN run the copy-and-patch JIT: executable anonymous memory
+ * comes from the kernel dl-window (mmap + mprotect PROT_EXEC, the same W^X
+ * path the dlopen loader uses; the heap fallback is RW+X already), and the
+ * I-cache publish goes through libgloss __clear_cache -> SYS_CACHE_SYNC, which
+ * cleans the D-cache to PoU and broadcasts an I-cache invalidate from EL1
+ * (SCTLR_EL1.UCI is clear, so EL0 cannot do the maintenance itself). The
+ * generic POSIX branch in mario_jit_mem.c (mmap RW -> mprotect RX ->
+ * __builtin___clear_cache) therefore works here. Non-aarch64 EwokOS targets
+ * have no emission backend and stay on the interpreter. */
 #if defined(__ewokos__)
-#  define MARIO_JIT_SUPPORTED  0
+#  if defined(__aarch64__) || defined(__arm64__)
+#    define MARIO_JIT_ARCH_ARM64 1
+#    define MARIO_JIT_SUPPORTED  1
+#  else
+#    define MARIO_JIT_SUPPORTED  0
+#  endif
 #elif defined(__aarch64__) || defined(__arm64__)
 #  define MARIO_JIT_ARCH_ARM64 1
 #  define MARIO_JIT_SUPPORTED  1

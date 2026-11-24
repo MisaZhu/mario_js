@@ -8381,15 +8381,17 @@ static bool mario_jit_dbg(void) {
 	return dbg != 0;
 }
 
-/* Route-B specialization layers (see jit/mario_jit.h). Each defaults ON and is
- * independently disable-able for A/B and bisecting: MARIO_JIT_B1=0 turns the
- * type-feedback fast lanes off (the JIT emits only generic stubs + int fusion,
- * i.e. the exact pre-B1 behaviour). Read once and cached - the compile path
- * must not getenv() per function. B2/B3/B4 knobs are wired here ahead of their
- * layers so the cfg handover is stable. */
+/* Route-B specialization layers (see jit/mario_jit.h). Independently
+ * disable-able for A/B and bisecting. B1 (type-feedback fast lanes) defaults
+ * OFF: on real taobao JS it miscompiles a hot loop into a non-terminating
+ * spin (single thread pegged, image fetches starve, 0 decodes), while the
+ * generic-stub + int-fusion JIT (B1 off) loads the same page correctly and
+ * fast. Opt back in with MARIO_JIT_B1=1 once the lane is fixed. Read once
+ * and cached - the compile path must not getenv() per function. B2/B3/B4
+ * knobs are wired here ahead of their layers so the cfg handover is stable. */
 static bool mario_jit_b1(void) {
 	static int on = -1;
-	if(on < 0) { const char* e = getenv("MARIO_JIT_B1"); on = (e != NULL && e[0] == '0' && e[1] == 0) ? 0 : 1; }
+	if(on < 0) { const char* e = getenv("MARIO_JIT_B1"); on = (e != NULL && e[0] == '1' && e[1] == 0) ? 1 : 0; }
 	return on != 0;
 }
 static bool mario_jit_b2(void) {
