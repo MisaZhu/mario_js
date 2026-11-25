@@ -1937,6 +1937,39 @@ void bn_to_mstr(const bignum_t* b, int radix, mstr_t* out) {
  * of emitting aliased operands (which surface later as calls to the wrong
  * function name). */
 uint32_t bc_addstr(bytecode_t* bc, char* owned_str) {
+	return bc_addstr_n(bc, owned_str, (uint32_t)strlen(owned_str));
+}
+
+/* Record the full byte length of pool entry idx (parallel mstr_lens array).
+ * OOM degrades to the strlen fallback in bc_getstrlen: entries added while the
+ * array was short are backfilled on the next successful growth. */
+static void bc_record_len(bytecode_t* bc, uint32_t idx, uint32_t len) {
+	if(idx >= bc->mstr_lens_cap) {
+		uint32_t ncap = bc->mstr_lens_cap == 0 ? 256 : bc->mstr_lens_cap * 2;
+		while(ncap <= idx) ncap *= 2;
+		uint32_t* nl = (uint32_t*)mario_malloc(ncap * sizeof(uint32_t));
+		if(nl == NULL) /* OOM: keep the short array; strlen fallback applies */
+			return;
+		if(bc->mstr_lens != NULL) {
+			memcpy(nl, bc->mstr_lens, bc->mstr_lens_size * sizeof(uint32_t));
+			mario_free(bc->mstr_lens);
+		}
+		bc->mstr_lens = nl;
+		bc->mstr_lens_cap = ncap;
+	}
+	while(bc->mstr_lens_size < idx) {
+		bc->mstr_lens[bc->mstr_lens_size] = (uint32_t)strlen(bc_getstr(bc, bc->mstr_lens_size));
+		bc->mstr_lens_size++;
+	}
+	bc->mstr_lens[idx] = len;
+	bc->mstr_lens_size = idx + 1;
+}
+
+/* Length-aware append: `len` is the full byte length and may exceed strlen
+ * when the payload carries embedded NULs (a `\u0000` string literal). Such
+ * entries stay OUT of the strcmp-based hash index - it would alias "a\0b"
+ * with plain "a" - and are tracked in mstr_nul_idx for full-byte dedup. */
+uint32_t bc_addstr_n(bytecode_t* bc, char* owned_str, uint32_t len) {
 	uint32_t sz = bc->mstr_table.size;
 	if(sz >= OFF_MASK) {
 		static bool warned = false;
@@ -1948,28 +1981,68 @@ uint32_t bc_addstr(bytecode_t* bc, char* owned_str) {
 		return OFF_MASK;
 	}
 	array_add(&bc->mstr_table, owned_str);
-	hash_map_add_fresh(&bc->mstr_index, owned_str, (void*)(uintptr_t)(sz + 1)); /* freshness: the get above just missed */
+	bc_record_len(bc, sz, len);
+	if(memchr(owned_str, 0, len) != NULL) {
+		if(bc->mstr_nul_size >= bc->mstr_nul_cap) {
+			uint32_t ncap = bc->mstr_nul_cap == 0 ? 32 : bc->mstr_nul_cap * 2;
+			uint32_t* ni = (uint32_t*)mario_malloc(ncap * sizeof(uint32_t));
+			if(ni != NULL) {
+				if(bc->mstr_nul_idx != NULL) {
+					memcpy(ni, bc->mstr_nul_idx, bc->mstr_nul_size * sizeof(uint32_t));
+					mario_free(bc->mstr_nul_idx);
+				}
+				bc->mstr_nul_idx = ni;
+				bc->mstr_nul_cap = ncap;
+			}
+		}
+		if(bc->mstr_nul_size < bc->mstr_nul_cap) /* OOM: skip dedup registration only */
+			bc->mstr_nul_idx[bc->mstr_nul_size++] = sz;
+	}
+	else {
+		hash_map_add_fresh(&bc->mstr_index, owned_str, (void*)(uintptr_t)(sz + 1)); /* freshness: the get above just missed */
+	}
 	return sz;
 }
 
 uint32_t bc_getstrindex(bytecode_t* bc, const char* str) {
+	if(str == NULL)
+		return OFF_MASK;
+	return bc_getstrindex_n(bc, str, (uint32_t)strlen(str));
+}
+
+/* Length-aware intern: string literals may carry embedded NUL (`\u0000`) that
+ * the strlen-bounded path would silently truncate (mapTracker's jsvmp cipher
+ * arrays decode to NaN forever when their literals lose bytes). */
+uint32_t bc_getstrindex_n(bytecode_t* bc, const char* str, uint32_t len) {
 	if(bc->skip_strtab)
 		return OFF_MASK;
-	if(str == NULL || str[0] == 0)
+	if(str == NULL || len == 0)
 		return OFF_MASK;
 
-	/* O(1) lookup: the linear strcmp scan this replaced made compiling a
-	 * multi-megabyte bundle quadratic in its distinct-string count. */
-	void* hit = hash_map_get(&bc->mstr_index, str);
-	if(hit != NULL)
-		return (uint32_t)((uintptr_t)hit - 1);
+	if(memchr(str, 0, len) != NULL) {
+		/* NUL-carrying literal: dedup by full bytes against the NUL-entry
+		 * list (the strcmp hash only sees the prefix before the first 0). */
+		for(uint32_t k = 0; k < bc->mstr_nul_size; k++) {
+			uint32_t idx = bc->mstr_nul_idx[k];
+			if(idx < bc->mstr_lens_size && bc->mstr_lens[idx] == len &&
+			   memcmp(bc_getstr(bc, idx), str, len) == 0)
+				return idx;
+		}
+	}
+	else {
+		/* O(1) lookup: the linear strcmp scan this replaced made compiling a
+		 * multi-megabyte bundle quadratic in its distinct-string count. */
+		void* hit = hash_map_get(&bc->mstr_index, str);
+		if(hit != NULL)
+			return (uint32_t)((uintptr_t)hit - 1);
+	}
 
-	uint32_t len = (uint32_t)strlen(str);
 	char* p = (char*)mario_malloc(len + 1);
 	if(p == NULL) /* OOM: intern the empty string instead of faulting */
 		return bc_addstr(bc, "");
-	memcpy(p, str, len+1);
-	return bc_addstr(bc, p);
+	memcpy(p, str, len);
+	p[len] = 0;
+	return bc_addstr_n(bc, p, len);
 }
 
 void bc_init(bytecode_t* bc) {
@@ -1979,6 +2052,10 @@ void bc_init(bytecode_t* bc) {
 	bc->buf_size = 0;
 	bc->jmptgt_marked = 0;
 	array_init(&bc->mstr_table);
+	bc->mstr_lens = NULL;
+	bc->mstr_lens_cap = bc->mstr_lens_size = 0;
+	bc->mstr_nul_idx = NULL;
+	bc->mstr_nul_size = bc->mstr_nul_cap = 0;
 	/* Lazy index buckets: prescan scratch buffers (skip_strtab=true) never
 	 * touch mstr_index at all, so the bucket malloc was pure churn there;
 	 * a real bc pays it on its first bc_addstr through hash_map_add's
@@ -2011,6 +2088,14 @@ void bc_release(bytecode_t* bc) {
 		s_fspan_src = NULL;
 	array_clean(&bc->mstr_table, NULL);
 	hash_map_clean(&bc->mstr_index, mario_free, NULL);
+	if(bc->mstr_lens != NULL)
+		mario_free(bc->mstr_lens);
+	bc->mstr_lens = NULL;
+	bc->mstr_lens_cap = bc->mstr_lens_size = 0;
+	if(bc->mstr_nul_idx != NULL)
+		mario_free(bc->mstr_nul_idx);
+	bc->mstr_nul_idx = NULL;
+	bc->mstr_nul_size = bc->mstr_nul_cap = 0;
 	bc->jmptgt_marked = 0;
 	if(bc->code_buf != NULL)
 		mario_free(bc->code_buf);
@@ -2371,6 +2456,17 @@ PC bc_gen_str(bytecode_t* bc, opr_code_t instr, const char* str) {
 
 PC bc_gen(bytecode_t* bc, opr_code_t instr) {
 	return bc_gen_str(bc, instr, "");
+}
+
+/* Length-aware literal emit: a string literal may carry embedded NUL (\u0000)
+ * that the C-string bc_gen_str path truncates at intern time. Numeric literal
+ * text never contains NUL, so the other opcodes delegate unchanged. */
+PC bc_gen_str_n(bytecode_t* bc, opr_code_t instr, const char* str, uint32_t len) {
+	if(instr != INSTR_STR)
+		return bc_gen_str(bc, instr, str);
+	uint32_t i = bc_getstrindex_n(bc, str, len);
+	bc_add(bc, INS(instr, i));
+	return bc->cindex;
 }
 
 PC bc_gen_imm(bytecode_t* bc, opr_code_t instr, uint32_t imm) {
@@ -10512,18 +10608,32 @@ void do_get(vm_t* vm, var_t* v, const char* name, bool for_write) {
 	 * owner still points at it (a replaced `F.prototype = {...}` orphan keeps a
 	 * stale tag but fails the identity check and is skipped). */
 	if(!for_write && name != NULL && strcmp(name, CONSTRUCTOR) == 0 &&
-	   v != NULL && !v->is_func && !v->is_class &&
-	   (n == NULL ||
-	    (vm->builtin_vars.var_Object != NULL &&
-	     n == var_find_own_member(var_get_prototype(vm->builtin_vars.var_Object), CONSTRUCTOR)))) {
+	   v != NULL && !v->is_func && !v->is_class) {
+		node_t* op_ctor = (vm->builtin_vars.var_Object != NULL) ?
+			var_find_own_member(var_get_prototype(vm->builtin_vars.var_Object), CONSTRUCTOR) : NULL;
 		var_t* walk = v;
 		int guard = 0;
 		while(walk != NULL && guard++ < 64) {
 			node_t* pon = var_find_own_member(walk, "@@proto_owner");
 			var_t* owner = (pon != NULL) ? pon->var : NULL;
-			if(owner != NULL && owner->is_func && var_get_prototype(owner) == walk) {
-				vm_push(vm, owner);
-				return;
+			if(owner != NULL && var_get_prototype(owner) == walk) {
+				if(owner->is_func && (n == NULL || n == op_ctor)) {
+					vm_push(vm, owner);
+					return;
+				}
+				/* Native class template (vm_new_class tags the class var): the
+				 * own "constructor" is the native ctor func, but scripts must
+				 * read the class wrapper itself (C.prototype.constructor === C,
+				 * so `({}).constructor === Object` and serialize's
+				 * `t.constructor.yk` see the registered class). Only while the
+				 * member still IS the pinned @@ctor - a script overwrite of
+				 * prototype.constructor wins over the synthesis. */
+				if(owner->is_class && n != NULL &&
+				   n == var_find_own_member(walk, CONSTRUCTOR) &&
+				   n->var == var_find_own_member_var(owner, "@@ctor")) {
+					vm_push(vm, owner);
+					return;
+				}
 			}
 			walk = var_get_prototype(walk);
 		}
@@ -11343,6 +11453,22 @@ var_t* vm_new_class(vm_t* vm, const char* cls) {
 	 * fresh prototype under Object.prototype as usual. */
 	if(!was_class || var_get_prototype(cls_var) == NULL) {
 		var_set_prototype(cls_var, var_new_obj_no_proto(vm, NULL, NULL));
+	}
+	/* ES: C.prototype.constructor === C. The prototype's own "constructor" is
+	 * the native ctor FUNCTION installed by vm_reg_native - a DISTINCT var from
+	 * the class wrapper scripts see as the global C. Without a back-pointer tag
+	 * `({}).constructor === Object` read false (the walk returned the native
+	 * function), so AMap's worker-RPC serialize() (`t.constructor.yk`) found no
+	 * registration on plain objects/Errors and every `new AMap.Map()` threw
+	 * "can't serialize object of unregistered class". Tag the template so
+	 * do_get's read-time synthesis returns the class var itself; handle_class
+	 * re-tags script-class templates with their ctor func (var_add replaces). */
+	{
+		var_t* cp = var_get_prototype(cls_var);
+		if(cp != NULL && var_find_own_member(cp, "@@proto_owner") == NULL) {
+			node_t* pon = var_add(cp, "@@proto_owner", cls_var);
+			if(pon != NULL) { pon->invisable = 1; pon->be_unenumerable = 1; }
+		}
 	}
 
 	if(strcmp(cls, "Object") != 0)
@@ -13038,7 +13164,9 @@ static inline void handle_float64(vm_t* vm, PC ins, opr_code_t instr, uint32_t o
 static inline void handle_str(vm_t* vm, PC ins, opr_code_t instr, uint32_t offset) {
 	register PC* code = vm->bc.code_buf;
 	const char* s = bc_getstr(&vm->bc, offset);
-	var_t* v = var_new_str(vm, s);
+	/* Full pooled length: a literal may carry embedded NUL (\u0000) that the
+	 * strlen-bounded var_new_str would drop (mapTracker's cipher arrays). */
+	var_t* v = var_new_str_bin(vm, s, bc_getstrlen(&vm->bc, offset));
 	try_var_cache(vm, &code[vm->pc-1], v);
 	vm_push(vm, v);
 }
@@ -16740,9 +16868,27 @@ static void array_at_push(vm_t* vm, var_t* v1, var_t* v2, bool for_write) {
 	else {
 		int32_t at = 0;
 		if(subscript_index(v2, &at)) {
-			/* var_array_get materializes holes up to `at` (needed for a write target);
-			 * a read peeks so `arr[9]` on a short array leaves length alone. */
-			n = for_write ? var_array_get(v1, at) : var_array_peek(v1, at);
+			if(for_write) {
+				/* var_array_get materializes holes up to `at` (needed for a write
+				 * target); the slot is always the receiver's own (outer children
+				 * hash for a plain object, _ARRAY_ for an array), never inherited. */
+				n = var_array_get(v1, at);
+			}
+			else if(v1->is_array) {
+				/* a read peeks so `arr[9]` on a short array leaves length alone. */
+				n = var_array_peek(v1, at);
+			}
+			else {
+				/* A plain object's canonical numeric key is an ORDINARY property:
+				 * "0" lives in the outer children hash and may be INHERITED (class
+				 * numeric method names land on the prototype, `n[0]` must find
+				 * them). var_array_peek only sees the receiver's own store, so
+				 * resolve through the prototype chain exactly like the canonical
+				 * numeric STRING key branch above. */
+				char key[32];
+				array_index_key(key, at);
+				n = var_find_member(v1, key);
+			}
 		}
 		else {
 			/* Non-index key: ToString(key) names an ordinary member (an array's
@@ -16800,8 +16946,9 @@ static void array_at_push(vm_t* vm, var_t* v1, var_t* v2, bool for_write) {
 	/* [[Set]] shadowing for computed keys (same rule as do_get): a data member
 	 * resolved through the prototype chain is shadowed by an own member on the
 	 * receiver, never written through to the ancestor. Only the string/symbol
-	 * paths can hit an inherited member (numeric keys resolve via var_array_get
-	 * inside the receiver's own _ARRAY_). Accessor nodes were handled above. */
+	 * READ paths can hand back an inherited node here; numeric writes resolve
+	 * via var_array_get to the receiver's own slot already. Accessor nodes were
+	 * handled above. */
 	if(for_write && n != NULL && v1->type == V_OBJECT) {
 		const char* wk = NULL;
 		if(var_is_symbol(v2))
@@ -16956,8 +17103,19 @@ static inline void handle_array_at_m(vm_t* vm, PC ins, opr_code_t instr, uint32_
 			n = var_find_member(v1, var_get_str(v2));
 		else {
 			int32_t at = 0;
-			if(subscript_index(v2, &at))
-				n = var_array_peek(v1, at);
+			if(subscript_index(v2, &at)) {
+				if(v1->is_array)
+					n = var_array_peek(v1, at);
+				else {
+					/* Plain object: a canonical numeric key is an ordinary,
+					 * possibly INHERITED property (class numeric method names
+					 * live on the prototype) - mirror array_at_push's read rule
+					 * instead of peeking only the receiver's own store. */
+					char key[32];
+					array_index_key(key, at);
+					n = var_find_member(v1, key);
+				}
+			}
 			else {
 				mstr_t* ks = mstr_new("");
 				var_to_str(v2, ks);

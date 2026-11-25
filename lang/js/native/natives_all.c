@@ -28,7 +28,44 @@ static var_t* native_Boolean_call(vm_t* vm, var_t* env, void* data) {
 			default: b = var_get_bool(v); break;
 		}
 	}
+	/* [[Construct]] (`new Boolean(x)` / Reflect.construct): stamp the boxed
+	 * value onto the passed `this` (see boolean_this_value). Guard: a real
+	 * object, not the scope root (plain `Boolean(x)` calls) and not a function. */
+	var_t* thisV = get_obj(env, THIS);
+	if(thisV != NULL && thisV->type == V_OBJECT &&
+	   thisV != vm->root && !thisV->is_func) {
+		node_t* sn = var_find_own_member(thisV, "@@b");
+		if(sn != NULL && sn->var != NULL)
+			node_replace(sn, var_new_bool(vm, b));
+		else {
+			sn = var_add(thisV, "@@b", var_new_bool(vm, b));
+			if(sn != NULL) { sn->be_unenumerable = 1; sn->invisable = 1; }
+		}
+	}
 	return var_new_bool(vm, b);
+}
+
+/* Boxed Boolean instances: `new Boolean(false)` / Reflect.construct(Boolean, ..)
+ * must yield an OBJECT carrying the coerced value. mario's construction path
+ * keeps the fresh object (the native's primitive return is discarded), so stamp
+ * the boolean into the passed `this` as a hidden @@b slot (Number's @@v trick)
+ * and let valueOf/toString unwrap it. Without the slot every wrapper read back
+ * true (var_get_bool of an object), which made babel's _isNativeReflectConstruct
+ * probe `!Boolean.prototype.valueOf.call(Reflect.construct(Boolean,[],fn))`
+ * evaluate false - _createSuper then fell back to Super.apply(this, arguments)
+ * and threw "target is not callable" on every ES class super() call. */
+static var_t* boolean_this_value(var_t* env) {
+	var_t* v = get_obj(env, THIS);
+	if(v == NULL)
+		return NULL;
+	if(v->type == V_BOOL)
+		return v;
+	if(v->type == V_OBJECT && !v->is_func) {
+		node_t* n = var_find_own_member(v, "@@b");
+		if(n != NULL && n->var != NULL)
+			return n->var;
+	}
+	return NULL;
 }
 
 /* Boolean.prototype.toString(): "true" / "false". mario has no wrapper objects,
@@ -38,7 +75,8 @@ static var_t* native_Boolean_call(vm_t* vm, var_t* env, void* data) {
  * threw "can not find function 'toString' on object{}". */
 static var_t* native_Boolean_toString(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* v = get_obj(env, THIS);
+	var_t* v = boolean_this_value(env);
+	if(v == NULL) v = get_obj(env, THIS);
 	bool b = (v != NULL) ? var_get_bool(v) : false;
 	return var_new_str(vm, b ? "true" : "false");
 }
@@ -46,7 +84,8 @@ static var_t* native_Boolean_toString(vm_t* vm, var_t* env, void* data) {
 /* Boolean.prototype.valueOf(): the primitive boolean behind `this`. */
 static var_t* native_Boolean_valueOf(vm_t* vm, var_t* env, void* data) {
 	(void)data;
-	var_t* v = get_obj(env, THIS);
+	var_t* v = boolean_this_value(env);
+	if(v == NULL) v = get_obj(env, THIS);
 	bool b = (v != NULL) ? var_get_bool(v) : false;
 	return var_new_bool(vm, b);
 }

@@ -866,6 +866,8 @@ var_t* native_Object_proto_toString(vm_t* vm, var_t* env, void* data) {
                 tag = "Number";
         else if(self->type == V_BOOL)
                 tag = "Boolean";
+        else if(var_find_own_member(self, "@@b") != NULL)
+                tag = "Boolean";   /* boxed Boolean wrapper (new Boolean(x)) */
         else {
                 node_t* tn = var_find_member(self, SYMKEY_TOSTRINGTAG);
                 if(tn != NULL && tn->var != NULL && tn->var->type == V_STRING &&

@@ -226,6 +226,18 @@ typedef struct st_bytecode {
 	PC                  cindex;
 	m_array_t           mstr_table;
 	hash_map_t          mstr_index;    /* string -> (index+1); O(1) dedup for bc_getstrindex */
+	/* Parallel to mstr_table: full byte length of each pooled string. The
+	 * C-string view truncates at an embedded NUL, but a string literal may
+	 * legally carry U+0000 (mapTracker's jsvmp cipher arrays do); handle_str
+	 * rebuilds the value with this length so `\u0000` is not dropped. */
+	uint32_t           *mstr_lens;
+	uint32_t            mstr_lens_cap;
+	uint32_t            mstr_lens_size; /* valid prefix of mstr_lens (OOM backfill) */
+	/* Indices of NUL-carrying pool entries. They stay OUT of mstr_index: the
+	 * strcmp/hash dedup there compares only up to the first NUL, so "a\0b"
+	 * would alias plain "a". bc_getstrindex_n dedups them via this list. */
+	uint32_t           *mstr_nul_idx;
+	uint32_t            mstr_nul_size, mstr_nul_cap;
 	PC                 *code_buf;
 	uint32_t            buf_size;
 	PC                  jmptgt_marked; /* code_buf[0..jmptgt_marked) scanned for jump targets */
@@ -491,6 +503,8 @@ typedef struct st_bytecode {
 
 PC          bc_gen(bytecode_t* bc, opr_code_t instr);
 PC          bc_gen_str(bytecode_t* bc, opr_code_t instr, const char* s);
+/* Length-aware literal emit: keeps embedded NUL (\u0000) in string literals. */
+PC          bc_gen_str_n(bytecode_t* bc, opr_code_t instr, const char* s, uint32_t len);
 PC          bc_gen_int(bytecode_t* bc, opr_code_t instr, int32_t i);
 PC          bc_gen_short(bytecode_t* bc, opr_code_t instr, int32_t i);
 /* Append a one-word instruction whose OFF field carries an immediate operand
@@ -499,7 +513,9 @@ PC          bc_gen_imm(bytecode_t* bc, opr_code_t instr, uint32_t imm);
 void        bc_set_instr(bytecode_t* bc, PC anchor, opr_code_t op, PC target);
 void        bc_remove_instr(bytecode_t* bc, PC from, uint32_t num);
 uint32_t    bc_getstrindex(bytecode_t* bc, const char* str);
+uint32_t    bc_getstrindex_n(bytecode_t* bc, const char* str, uint32_t len); /* NUL-safe intern */
 uint32_t    bc_addstr(bytecode_t* bc, char* owned_str); /* append (takes ownership) + index */
+uint32_t    bc_addstr_n(bytecode_t* bc, char* owned_str, uint32_t len); /* full-byte-length append */
 /* pc -> source map (always on; feeds Error.stack V8 frames + error report) */
 void        bc_srcmap_begin(bytecode_t* bc, const char* src);       /* new source being compiled */
 void        bc_srcmap_add(bytecode_t* bc, PC pc, uint32_t pos);     /* statement starts at pos */
@@ -533,6 +549,9 @@ PC          bc_add_instr(bytecode_t* bc, PC anchor, opr_code_t op, PC target);
 PC          bc_reserve(bytecode_t* bc);
 
 #define bc_getstr(bc, i) (((i)>=(bc)->mstr_table.size) ? "" : (const char*)(bc)->mstr_table.items[(i)])
+/* Full byte length of a pooled string (embedded NULs included). Entries whose
+ * length was never recorded (OOM) fall back to the C-string view. */
+#define bc_getstrlen(bc, i) (((i)<(bc)->mstr_lens_size) ? (bc)->mstr_lens[i] : (uint32_t)strlen(bc_getstr(bc, i)))
 
 void        bc_init(bytecode_t* bc);
 void        bc_release(bytecode_t* bc);

@@ -1392,6 +1392,7 @@ static void argu_mark_range(lex_t* l, pslot_frame_t* f, int32_t from) {
 static void argu_scan_braces(lex_t* l, pslot_frame_t* f, uint32_t* prev) {
     int d = 1;
     uint32_t ptk2 = '{';
+    int dot_run = 0; // consecutive '.' tokens ending at ptk2 (spread = 3)
     while (d > 0) {
         /* Pre-check '`': skip_advance consumes a template WHOLE (the loop
          * body never sees a backtick token), so raw-scan its source span
@@ -1418,6 +1419,8 @@ static void argu_scan_braces(lex_t* l, pslot_frame_t* f, uint32_t* prev) {
         } else if (tk == LEX_ID && strcmp(MSTR_CSTR(l->tk_str), "arguments") == 0) {
             if (ptk2 != '.' && ptk2 != LEX_OPTCHAIN)
                 f->uses_arguments = true;
+            else if (dot_run >= 3)
+                f->uses_arguments = true; // `...arguments`: spread dots, not a member
         } else if (tk == LEX_R_FUNCTION) {
             /* Nested plain function: skip it wholesale (own bindings, own
              * arguments; a parameter-list default value compiles into the
@@ -1455,6 +1458,7 @@ static void argu_scan_braces(lex_t* l, pslot_frame_t* f, uint32_t* prev) {
             ptk2 = 0;
             continue;
         }
+        dot_run = (tk == '.') ? dot_run + 1 : 0;
         ptk2 = tk;
     }
     skip_advance(l, prev);
@@ -1594,8 +1598,10 @@ static void pslot_scan_decl(lex_t* l, pslot_frame_t* f, uint32_t* prev, pslot_fr
                 f->enabled = false; // an eval( inside an initializer still runs
                                     // in this frame's scope - do not swallow it
             if (strcmp(MSTR_CSTR(l->tk_str), "arguments") == 0 &&
-                *prev != '.' && *prev != LEX_OPTCHAIN)
-                af->uses_arguments = true; // initializer reference (this frame)
+                (*prev != '.' && *prev != LEX_OPTCHAIN ||
+                 (l->tk_start >= 3 && memcmp(l->data + l->tk_start - 3, "...", 3) == 0)))
+                af->uses_arguments = true; // initializer reference (this frame);
+                                           // `...arguments` spread dots are not a member
             if (prev_end && dd == 0)
                 return; // ASI: `let a = b` <newline> `c` - c is a new statement
                         // (dd==0: inside brackets a value-adjacent identifier is
@@ -1769,8 +1775,10 @@ static void pslot_scan_var(lex_t* l, pslot_frame_t* f, uint32_t* prev, pslot_fra
                 f->enabled = false; // an eval( inside an initializer still runs
                                     // in this frame's scope - do not swallow it
             if (strcmp(MSTR_CSTR(l->tk_str), "arguments") == 0 &&
-                *prev != '.' && *prev != LEX_OPTCHAIN)
-                af->uses_arguments = true; // initializer reference (this frame)
+                (*prev != '.' && *prev != LEX_OPTCHAIN ||
+                 (l->tk_start >= 3 && memcmp(l->data + l->tk_start - 3, "...", 3) == 0)))
+                af->uses_arguments = true; // initializer reference (this frame);
+                                           // `...arguments` spread dots are not a member
             if (prev_end && dd == 0)
                 return; // ASI: `var a = b` <newline> `c` - c is a new statement
                         // (dd==0: see pslot_scan_decl)
@@ -1878,6 +1886,7 @@ static void pslot_prescan(lex_t* l, pslot_frame_t* f, pslot_frame_t* af) {
     char bmode[PSLOT_TRACK_MAX]; int btop = 0;  // per '{': 1 = object literal
     char pcall[PSLOT_TRACK_MAX]; int ptop = 0;  // per '(': 1 = call-like
     uint32_t ptk = 0;                           // previous token (0 = unknown)
+    int dot_run = 0;    // consecutive '.' tokens ending at ptk (spread = 3)
     bool method_cand = false; // last ')' closed a call-like '(' in an object
     while (l->tk != LEX_EOF) {
         uint32_t tk = l->tk;
@@ -2096,9 +2105,15 @@ static void pslot_prescan(lex_t* l, pslot_frame_t* f, pslot_frame_t* af) {
                    strcmp(MSTR_CSTR(l->tk_str), "arguments") == 0) {
             /* Bare `arguments` reference: this frame must materialize the
              * array at call time (INSTR_FUNCARGU). A `.`/`?.`-member is a
-             * property name, not a reference. Nested plain-function/class
-             * bodies never reach here (their branches skip them). */
+             * property name, not a reference - but `...arguments` lexes as
+             * three '.' tokens, so a 3-dot run is a SPREAD source, not a
+             * member (zod's `super(...arguments)` constructors died without
+             * the mark: the arguments array was never materialized). Nested
+             * plain-function/class bodies never reach here (their branches
+             * skip them). */
             if (ptk != '.' && ptk != LEX_OPTCHAIN)
+                af->uses_arguments = true;
+            else if (dot_run >= 3)
                 af->uses_arguments = true;
         } else if (tk == LEX_ID && strcmp(MSTR_CSTR(l->tk_str), "with") == 0) {
             f->enabled = false; // with-scope members shadow dynamically
@@ -2109,6 +2124,7 @@ static void pslot_prescan(lex_t* l, pslot_frame_t* f, pslot_frame_t* af) {
             ptk = 0;
             continue;
         }
+        dot_run = (tk == '.') ? dot_run + 1 : 0;
         ptk = tk;
         if (l->tk == '`') {
             /* Pre-check: skip_advance consumes a template WHOLE (the loop
@@ -3054,6 +3070,44 @@ bool func_params_and_body(lex_t* l, bytecode_t* bc) {
     return true;
 }
 
+/* ES PropertyName: a class member may be named by a string or numeric literal
+ * (`"~validate"(e){}`, `0(){}`, `get "~x"(){}` - zod's "~standard" protocol
+ * ships exactly this shape). Capture the literal into `name`; numbers
+ * canonicalise exactly like the object-literal key path (ToPropertyKey).
+ * Non-literal tokens are left unconsumed. */
+static bool lex_literal_member_name(lex_t* l, mstr_t* name) {
+    if (l->tk == LEX_STR) {
+        mstr_cpy(name, MSTR_CSTR(l->tk_str));
+        return lex_chkread(l, LEX_STR);
+    }
+    if (l->tk == LEX_INT || l->tk == LEX_FLOAT) {
+        int tk = l->tk;
+        char text[128];
+        snprintf(text, sizeof(text), "%s", MSTR_CSTR(l->tk_str));
+        if (tk == LEX_INT) {
+            if (strstr(text, "0x") != NULL || strstr(text, "0X") != NULL) {
+                errno = 0;
+                unsigned long long h = strtoull(text, NULL, 16);
+                if (errno == ERANGE || h > 0x7FFFFFFFFFFFFFFFULL)
+                    mstr_cpy(name, mstr_from_float64(strtod(text, NULL)));
+                else
+                    mstr_cpy(name, mstr_from_int64((int64_t)h, 10));
+            } else {
+                errno = 0;
+                long long ll = strtoll(text, NULL, 10);
+                if (errno == ERANGE)
+                    mstr_cpy(name, mstr_from_float64(strtod(text, NULL)));
+                else
+                    mstr_cpy(name, mstr_from_int64((int64_t)ll, 10));
+            }
+        } else {
+            mstr_cpy(name, mstr_from_float64(strtod(text, NULL)));
+        }
+        return lex_chkread(l, tk);
+    }
+    return false;
+}
+
 bool factor_def_func(lex_t* l, bytecode_t* bc, mstr_t* name) {
     /* Establish this function's async context, consuming g_async_pending so
      * that any nested definition defaults to synchronous. */
@@ -3099,25 +3153,32 @@ bool factor_def_func(lex_t* l, bytecode_t* bc, mstr_t* name) {
         if (!lex_chkread(l, tk)) {
             return false;
         }
-    }
-    if (l->tk == LEX_ID || (l->tk >= LEX_R_IF && l->tk < LEX_R_LIST_END &&
-                            (strcmp(MSTR_CSTR(name), "get") == 0 || strcmp(MSTR_CSTR(name), "set") == 0))) {
-        /* class get/set token; the accessor name may itself be a reserved
-         * word (`get class(){}`, `set default(v){}`). */
-        int ntk = l->tk;
-        if (strcmp(MSTR_CSTR(name), "get") == 0) {
-            mstr_cpy(name, MSTR_CSTR(l->tk_str));
-            if (!lex_chkread(l, ntk)) {
-                return false;
-            }
-            bc_gen(bc, INSTR_FUNC_GET);
-        } else if (strcmp(MSTR_CSTR(name), "set") == 0) {
-            mstr_cpy(name, MSTR_CSTR(l->tk_str));
-            if (!lex_chkread(l, ntk)) {
-                return false;
-            }
-            bc_gen(bc, INSTR_FUNC_SET);
+    } else if (l->tk == LEX_STR || l->tk == LEX_INT || l->tk == LEX_FLOAT) {
+        /* String/numeric literal method name (`"~validate"(e){}`, `0(){}`). */
+        if (!lex_literal_member_name(l, name)) {
+            return false;
         }
+    }
+    if ((strcmp(MSTR_CSTR(name), "get") == 0 || strcmp(MSTR_CSTR(name), "set") == 0) &&
+        (l->tk == LEX_ID || l->tk == LEX_STR || l->tk == LEX_INT || l->tk == LEX_FLOAT ||
+         (l->tk >= LEX_R_IF && l->tk < LEX_R_LIST_END))) {
+        /* class get/set token; the accessor name may itself be a reserved
+         * word (`get class(){}`, `set default(v){}`) or a literal
+         * (`get "~x"(){}`). A method literally named get/set (`get(e){}`)
+         * never lands here: '(' is not a property-name token. */
+        int ntk = l->tk;
+        bool is_get = (strcmp(MSTR_CSTR(name), "get") == 0);
+        if (ntk == LEX_STR || ntk == LEX_INT || ntk == LEX_FLOAT) {
+            if (!lex_literal_member_name(l, name)) {
+                return false;
+            }
+        } else {
+            mstr_cpy(name, MSTR_CSTR(l->tk_str));
+            if (!lex_chkread(l, ntk)) {
+                return false;
+            }
+        }
+        bc_gen(bc, is_get ? INSTR_FUNC_GET : INSTR_FUNC_SET);
     } else {
         /* A COMPUTED-key class accessor (`get [expr](){}` / `set [expr](v){}`):
          * the class-body parser recorded the kind in g_acc_pending and already
@@ -3785,7 +3846,7 @@ bool factor_new(lex_t* l, bytecode_t* bc) {
         } else if (ltk == LEX_FLOAT) {
             bc_gen_str(bc, INSTR_FLOAT, MSTR_CSTR(l->tk_str));
         } else {
-            bc_gen_str(bc, INSTR_STR, MSTR_CSTR(l->tk_str));
+            bc_gen_str_n(bc, INSTR_STR, MSTR_CSTR(l->tk_str), MSTR_LEN(l->tk_str));
         }
         if (!lex_chkread(l, ltk)) {
             return false;
@@ -4323,9 +4384,9 @@ bool factor_template(lex_t* l, bytecode_t* bc) {
         }
         if (c == '`') { // closing backtick: flush the trailing chunk
             if (first) {
-                bc_gen_str(bc, INSTR_STR, MSTR_CSTR(chunk));
+                bc_gen_str_n(bc, INSTR_STR, MSTR_CSTR(chunk), MSTR_LEN(chunk));
             } else {
-                bc_gen_str(bc, INSTR_STR, MSTR_CSTR(chunk));
+                bc_gen_str_n(bc, INSTR_STR, MSTR_CSTR(chunk), MSTR_LEN(chunk));
                 bc_gen(bc, INSTR_PLUS);
             }
             lex_get_nextch(l);
@@ -4333,10 +4394,10 @@ bool factor_template(lex_t* l, bytecode_t* bc) {
         }
         if (c == '$' && l->next_ch == '{') { // embedded expression
             if (first) {
-                bc_gen_str(bc, INSTR_STR, MSTR_CSTR(chunk));
+                bc_gen_str_n(bc, INSTR_STR, MSTR_CSTR(chunk), MSTR_LEN(chunk));
                 first = false;
             } else {
-                bc_gen_str(bc, INSTR_STR, MSTR_CSTR(chunk));
+                bc_gen_str_n(bc, INSTR_STR, MSTR_CSTR(chunk), MSTR_LEN(chunk));
                 bc_gen(bc, INSTR_PLUS);
             }
             mstr_reset(chunk);
@@ -4484,13 +4545,13 @@ bool factor_tagged_template(lex_t* l, bytecode_t* bc) {
     // ---- emit cooked `strings` array, then `raw` array, then attach ----
     bc_gen(bc, INSTR_ARRAY);
     for (int i = 0; i < nchunks; i++) {
-        bc_gen_str(bc, INSTR_STR, cooked[i]->cstr);
+        bc_gen_str_n(bc, INSTR_STR, cooked[i]->cstr, cooked[i]->len);
         bc_gen(bc, INSTR_MEMBER);
     }
     bc_gen(bc, INSTR_ARRAY_END);
     bc_gen(bc, INSTR_ARRAY);
     for (int i = 0; i < nchunks; i++) {
-        bc_gen_str(bc, INSTR_STR, raw[i]->cstr);
+        bc_gen_str_n(bc, INSTR_STR, raw[i]->cstr, raw[i]->len);
         bc_gen(bc, INSTR_MEMBER);
     }
     bc_gen(bc, INSTR_ARRAY_END);
@@ -4862,7 +4923,7 @@ bool factor(lex_t* l, bytecode_t* bc, bool member) {
             return false;
         }
     } else if (l->tk == LEX_STR) {
-        bc_gen_str(bc, INSTR_STR, MSTR_CSTR(l->tk_str));
+        bc_gen_str_n(bc, INSTR_STR, MSTR_CSTR(l->tk_str), MSTR_LEN(l->tk_str));
         if (!lex_chkread(l, LEX_STR)) {
             return false;
         }

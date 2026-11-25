@@ -365,8 +365,9 @@ void lex_read_u_escape(lex_t* lex) {
  * and `'` decode identically. Handles the ECMAScript forms: \b \f \v \n \r \t,
  * \xHH, \uHHHH / \u{...} (via lex_read_u_escape), legacy octal \0..\377,
  * \<LineContinuation>, and identity escapes (\', \", \\, \/, any other \c -> c).
- * Note: a decoded NUL (e.g. `\0`) is appended as a 0 byte; mstr_t is a C string
- * so the visible value truncates there, but tokenization stays in sync. */
+ * Note: a decoded NUL (e.g. `\0`) is appended as a 0 byte; mstr_t tracks the
+ * full length, and the compiler interns the literal with that length
+ * (bc_gen_str_n) so the value keeps the embedded U+0000. */
 void lex_read_escape(lex_t* lex) {
 	switch (lex->curr_ch) {
 		case 'b': mstr_add(lex->tk_str, '\b'); break;

@@ -631,6 +631,31 @@ var_t* native_Number_isSafeInteger(vm_t* vm, var_t* env, void* data) {
 	return var_new_bool(vm, d <= (double)LIMIT);
 }
 
+/* Skip leading ECMAScript StrWhiteSpaceChar (SP TAB LF VT FF CR + NBSP, BOM and
+ * the Unicode Space_Separator set) over a NUL-terminated UTF-8 string. parseInt
+ * must strip NBSP (U+00A0) etc., not just ASCII whitespace: mapTracker's decoder
+ * emits byte strings padded with 0xA0 that parseInt has to see past to reach the
+ * digits (jsc parses "\xA0\xA05" to 5; an ASCII-only skip yields NaN). */
+static const char* num_skip_ws(const char* p) {
+	for(;;) {
+		unsigned char c0 = (unsigned char)p[0];
+		if(c0==' '||c0=='\t'||c0=='\n'||c0=='\r'||c0=='\v'||c0=='\f') { p++; continue; }
+		if(c0 < 0xC2) break;
+		unsigned char c1 = (unsigned char)p[1];
+		if(c1 == 0) break; /* truncated lead byte: not whitespace, stop before p[2] */
+		if(c0==0xC2 && c1==0xA0) { p += 2; continue; } /* U+00A0 NBSP */
+		unsigned char c2 = (unsigned char)p[2];
+		if(c0==0xE1 && c1==0x9A && c2==0x80) { p += 3; continue; } /* U+1680 */
+		if(c0==0xE2 && c1==0x80 &&
+		   ((c2>=0x80 && c2<=0x8A) || c2==0xA8 || c2==0xA9 || c2==0xAF)) { p += 3; continue; } /* U+2000-200A/2028/2029/202F */
+		if(c0==0xE2 && c1==0x81 && c2==0x9F) { p += 3; continue; } /* U+205F */
+		if(c0==0xE3 && c1==0x80 && c2==0x80) { p += 3; continue; } /* U+3000 */
+		if(c0==0xEF && c1==0xBB && c2==0xBF) { p += 3; continue; } /* U+FEFF BOM */
+		break;
+	}
+	return p;
+}
+
 /* Number.parseInt(s, radix): skip leading whitespace, honour a 0x prefix when no
  * radix is given, then strtoll. Returns NaN when nothing was parsed. The integer
  * result is boxed at int32 or int64 width so large parses stay exact. */
@@ -641,9 +666,7 @@ var_t* native_Number_parseInt(vm_t* vm, var_t* env, void* data) {
 		return var_new_float64(vm, NAN);
 	mstr_t* s = mstr_new("");
 	var_to_str(v, s);
-	const char* p = MSTR_CSTR(s);
-	while(*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\v' || *p == '\f')
-		p++;
+	const char* p = num_skip_ws(MSTR_CSTR(s));
 	int radix = 0;
 	var_t* r = get_func_arg(env, 1);
 	if(r != NULL && (r->type == V_INT || r->type == V_INT64 ||
@@ -672,9 +695,7 @@ var_t* native_Number_parseFloat(vm_t* vm, var_t* env, void* data) {
 		return var_new_float64(vm, NAN);
 	mstr_t* s = mstr_new("");
 	var_to_str(v, s);
-	const char* p = MSTR_CSTR(s);
-	while(*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\v' || *p == '\f')
-		p++;
+	const char* p = num_skip_ws(MSTR_CSTR(s));
 	char* end = NULL;
 	double val = strtod(p, &end);
 	mstr_free(s);
@@ -708,9 +729,7 @@ var_t* native_global_isNaN(vm_t* vm, var_t* env, void* data) {
 				nan = (d != d);
 			} break;
 			case V_STRING: {
-				const char* p = var_get_str(v);
-				while(*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\v' || *p == '\f')
-					p++;
+				const char* p = num_skip_ws(var_get_str(v));
 				if(*p == 0) {
 					nan = false; /* Number("") === 0 */
 				}

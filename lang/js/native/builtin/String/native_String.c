@@ -1813,11 +1813,15 @@ static var_t* uri_encode(vm_t* vm, var_t* env, bool component) {
 	mstr_t* s = mstr_new("");
 	const char* str = uri_arg_cstr(env, s);
 	mstr_t* out = mstr_new("");
-	for(const unsigned char* p = (const unsigned char*)str; *p != 0; ++p) {
-		if(uri_unreserved(*p) || (!component && uri_reserved(*p)))
-			mstr_add(out, (char)*p);
+	/* Walk the stored byte length: an embedded U+0000 must encode to %00,
+	 * not terminate the scan (strlen semantics would drop the tail). */
+	uint32_t sn = MSTR_LEN(s), si;
+	for(si = 0; si < sn; ++si) {
+		unsigned char c = (unsigned char)str[si];
+		if(uri_unreserved(c) || (!component && uri_reserved(c)))
+			mstr_add(out, (char)c);
 		else
-			uri_append_escaped(out, *p);
+			uri_append_escaped(out, c);
 	}
 	mstr_free(s);
 	var_t* r = var_new_str(vm, MSTR_CSTR(out));
@@ -1852,7 +1856,10 @@ static var_t* uri_decode(vm_t* vm, var_t* env, bool component) {
 		}
 	}
 	mstr_free(s);
-	var_t* r = var_new_str(vm, MSTR_CSTR(out));
+	/* NUL-safe: %00 decodes to a real U+0000 code unit; the strlen-bounded
+	 * var_new_str would cut the result there (mapTracker's decoder finishes
+	 * its byte strings through decodeURIComponent). */
+	var_t* r = var_new_str_bin(vm, MSTR_CSTR(out), MSTR_LEN(out));
 	mstr_free(out);
 	return r;
 }
