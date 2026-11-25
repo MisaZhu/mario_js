@@ -6,7 +6,6 @@ extern "C" {
 #include "natives_builtin.h"
 #include <string.h>
 #include <stdio.h>
-#include <stdlib.h>  /* TEMP DIAGNOSTIC (getenv) */
 #include <math.h>
 
 /** Array */
@@ -1565,12 +1564,6 @@ var_t* native_Array_iterator(vm_t* vm, var_t* env, void* data) {
 	(void)data;
 	var_t* this_v = get_obj(env, THIS);
 	var_t* it = vm_new_array_iterator(vm, this_v); /* refs=0 */
-	/* TEMP DIAGNOSTIC (MARIO_TADB): why does the symiter call yield NULL at 909086? */
-	if(getenv("MARIO_TADB") != NULL && vm->pc >= 715843 && vm->pc < 912412)
-		fprintf(stderr, "[tadb-aiter] this=%p this.t=%u isarr=%d varr=%u -> it=%p it.status=%d pc=%u\n",
-			(void*)this_v, (unsigned)(this_v?this_v->type:99), (int)(this_v?this_v->is_array:0),
-			(unsigned)(this_v?var_array_size(this_v):0), (void*)it,
-			(int)(it?it->status:-1), (unsigned)vm->pc);
 	return it;
 }
 
