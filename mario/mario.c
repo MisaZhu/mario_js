@@ -2705,7 +2705,7 @@ static inline bool mario_ptr_wild(const void* p) {
 	return a < 0x10000u || (a >> 48) != 0 || (a & (sizeof(void*) - 1)) != 0;
 }
 
-/* TEMP DIAGNOSTIC (ghfix2 teardown crash): pending_save_t nodes are STACK objects
+/* Stack-band validation (ghfix2 teardown crash): pending_save_t nodes are STACK objects
  * owned by live vm_run frames, so every vm->pending_saves link must sit in this
  * thread's C stack near the current frame. A SIGSEGV recovered through the
  * embedder checkpoint bypasses vm_run's epilogue restore, and a stray store can
@@ -7675,46 +7675,12 @@ void vm_report_uncaught(vm_t* vm) {
 
 static var_t* vm_make_type_error(vm_t* vm, const char* type_name, const char* message);
 
-/* TEMP DIAGNOSTIC (taobao CSR bootstrap): print EVERY throw - caught or not -
- * so a bootstrap aborted inside a try/catch (invisible to vm_report_uncaught
- * and to the MARIO_THROWMSG propagate gate) becomes observable. Gated by
- * MARIO_THROWALL; goes straight to stderr so a release build still shows it.
- * Remove with the other temp probes. */
-static void mario_throw_trace(vm_t* vm, const char* tag, const char* message) {
-	static int s_on = -1;
-	if(s_on < 0) s_on = (getenv("MARIO_THROWALL") != NULL) ? 1 : 0;
-	if(!s_on) return;
-	fprintf(stderr, "[throwall] %s pc=%u msg=%s\n", tag, (unsigned)vm->pc,
-	        (message != NULL) ? message : "");
-	{
-		const char* turl = NULL; int tln = 0, tcl = 0;
-		if(bc_srcmap_locate_v8(&vm->bc, vm->pc, &turl, &tln, &tcl))
-			fprintf(stderr, "[throwall]   at %s:%d:%d\n", turl ? turl : "-", tln, tcl);
-	}
-	scope_t* sc = vm_get_scope(vm);
-	int hop = 0;
-	while(sc != NULL && hop++ < 6) {
-		if(sc->is_func && sc->func != NULL) {
-			const char* furl = NULL; int fln = 0, fcl = 0;
-			char floc[512];
-			if(bc_srcmap_locate_v8(&vm->bc, sc->func->pc, &furl, &fln, &fcl))
-				snprintf(floc, sizeof floc, "%s:%d:%d", furl ? furl : "-", fln, fcl);
-			else
-				snprintf(floc, sizeof floc, "<nosrc>");
-			fprintf(stderr, "[throwall]   frame[%d] entrypc=%u at %s\n", hop, (unsigned)sc->func->pc, floc);
-		}
-		sc = sc->prev;
-	}
-	fflush(stderr);
-}
-
 void vm_throw(vm_t* vm, const char *format, ...) {
 	char message[BUF_SIZE+1] = {0};
 	va_list ap;
 	va_start(ap, format);
 	vsnprintf(message, BUF_SIZE, format, ap);
 	va_end(ap);
-	mario_throw_trace(vm, "throw", message);
 
 	/* Build the instance exactly like vm_throw_type() does: [[Prototype]] must be
 	 * Error.prototype (NOT the Error class var - that put the class's static
@@ -7757,7 +7723,6 @@ void vm_throw_native(vm_t* vm, const char *format, ...) {
 	va_start(ap, format);
 	vsnprintf(message, BUF_SIZE, format, ap);
 	va_end(ap);
-	mario_throw_trace(vm, "native", message);
 
 	/* Build the instance exactly like vm_throw_type() does: [[Prototype]] must be
 	 * Error.prototype (NOT the Error class var - that put the class's static
@@ -7833,7 +7798,6 @@ void vm_throw_type_native(vm_t* vm, const char* type_name, const char* format, .
 	va_start(ap, format);
 	vsnprintf(message, BUF_SIZE, format, ap);
 	va_end(ap);
-	mario_throw_trace(vm, "tnative", message);
 
 	var_t* err = vm_make_type_error(vm, type_name, message);
 	if(vm->native_thrown != NULL)
@@ -7850,7 +7814,6 @@ void vm_throw_type(vm_t* vm, const char* type_name, const char* format, ...) {
 	va_start(ap, format);
 	vsnprintf(message, BUF_SIZE, format, ap);
 	va_end(ap);
-	mario_throw_trace(vm, type_name, message);
 
 	var_t* err = vm_make_type_error(vm, type_name, message);
 	vm_push(vm, err);
@@ -8618,53 +8581,6 @@ static bool func_call(vm_t* vm, var_t* obj, var_t* func_var, int arg_num, bool i
 			ret = NULL; // a callee of this native aborted: placeholder result, keep propagating
 		if(ret == NULL)
 			ret = var_new(vm);
-		/* TEMP DIAGNOSTIC (taobao baxia VMP al("") RCA): log every native/host call
-		 * whose CALL site is inside script_39's pc range, with the native's name and
-		 * a short repr of its return - surfaces which host API the VMP reads a
-		 * divergent value from. Gated by MARIO_NATDBG; remove with other probes. */
-		{
-			static int s_nd = -1;
-			if(s_nd < 0) s_nd = (getenv("MARIO_NATDBG") != NULL) ? 1 : 0;
-			if(s_nd && vm->dbg_tag != NULL &&
-			   strstr(vm->dbg_tag, "script_39") != NULL) {
-				const char* fnm = "-";
-				var_t* fnv = (func_var != NULL) ? var_find_own_member_var(func_var, "@@fname") : NULL;
-				if(fnv != NULL && fnv->type == V_STRING) fnm = var_get_str(fnv);
-				/* receiver brand: @@tostringtag, else constructor @@fname, else flags */
-				char ob[96]; ob[0] = 0;
-				if(obj != NULL) {
-					var_t* tg = var_find_member_var(obj, SYMKEY_TOSTRINGTAG);
-					var_t* ct = var_find_member_var(obj, "constructor");
-					const char* ctn = NULL;
-					if(ct != NULL) { var_t* cn = var_find_own_member_var(ct, "@@fname");
-						if(cn != NULL && cn->type == V_STRING) ctn = var_get_str(cn); }
-					snprintf(ob, sizeof(ob), "tag=%s ctor=%s t%u f%d c%d a%d",
-						(tg != NULL && tg->type == V_STRING) ? var_get_str(tg) : "-",
-						ctn != NULL ? ctn : "-", (unsigned)obj->type,
-						(int)obj->is_func, (int)obj->is_class, (int)obj->is_array);
-				}
-				char rb[160]; rb[0] = 0;
-				/* A native return is still unowned here.  Do not ref/unref it and do
-				 * not stringify objects: either operation can destroy or recurse into
-				 * the very value the caller is about to receive.  Primitive values can
-				 * be inspected in place without allocating or changing ownership. */
-				unsigned rtyp = (unsigned)ret->type;
-				if(ret->type == V_STRING) {
-					const char* sv = var_get_str(ret);
-					snprintf(rb, sizeof(rb), "t%u %.*s", rtyp, 120, sv != NULL ? sv : "");
-				} else if(ret->type == V_INT || ret->type == V_INT64) {
-					snprintf(rb, sizeof(rb), "t%u %lld", rtyp,
-						 (long long)var_get_int64(ret));
-				} else if(ret->type == V_FLOAT || ret->type == V_FLOAT64) {
-					snprintf(rb, sizeof(rb), "t%u %.12g", rtyp,
-						 (double)var_get_float64(ret));
-				} else {
-					snprintf(rb, sizeof(rb), "t%u", rtyp);
-				}
-				fprintf(stderr, "[natdbg] %s{%s} -> %s pc=%u\n", fnm, ob, rb, (unsigned)vm->pc);
-				fflush(stderr);
-			}
-		}
 	}
 	else if(func->is_generator) {
 		/* ES6 `function*`: calling a generator function does not run the body;
@@ -9991,28 +9907,9 @@ static inline void compare(vm_t* vm, opr_code_t op, var_t* v1, var_t* v2) {
 				case INSTR_TEQ:
 					i = (strcmp((const char*)v1->value, (const char*)v2->value) == 0);
 					break; 
-				case INSTR_NEQ: 
+				case INSTR_NEQ:
 				case INSTR_NTEQ:
 					i = (strcmp((const char*)v1->value, (const char*)v2->value) != 0);
-					/* TEMP DIAGNOSTIC (baxia et_f VMP al("") RCA): the VMP fingerprints
-					 * the environment with `u = typeof o; a = u !== expected`, so a
-					 * TRUE string-inequality where one side is a typeof keyword is a
-					 * direct typeof divergence from Chrome (mario's actual typeof vs the
-					 * VMP's hardcoded expected). Gated by MARIO_CMPDBG; not script-number
-					 * gated (they drift between runs) - filter by tag afterwards. Remove
-					 * with the other temp probes. */
-					if(i && getenv("MARIO_CMPDBG")) {
-						const char* s1 = (const char*)v1->value;
-						const char* s2 = (const char*)v2->value;
-						static const char* tk[] = {"undefined","object","boolean","number",
-							"string","function","symbol","bigint",NULL};
-						int istot = 0;
-						for(int k = 0; tk[k] != NULL; ++k)
-							if(strcmp(s1, tk[k]) == 0 || strcmp(s2, tk[k]) == 0) { istot = 1; break; }
-						if(istot)
-							fprintf(stderr, "[CMPDBG] typeof-mismatch tag=%s pc=%u a='%s' b='%s'\n",
-								vm->dbg_tag != NULL ? vm->dbg_tag : "-", (unsigned)vm->pc, s1, s2);
-					}
 					break;
 				/* Relational on two strings is lexicographic by code unit, not
 				 * numeric: these four cases were missing entirely, so "a"<"b"
@@ -10274,17 +10171,6 @@ static bool str_obj_index_push(vm_t* vm, var_t* v, const char* name, bool for_wr
  * node so handle_asign can invoke the setter; a read invokes the getter and
  * pushes its result. */
 void do_get(vm_t* vm, var_t* v, const char* name, bool for_write) {
-	/* TEMP DIAGNOSTIC (taobao): a member fetch whose base is undefined/null is
-	 * the exact site behind "undefined is not an object"; log the property name
-	 * (MARIO_GETUNDEF) so the failing expression can be identified. */
-	if(v != NULL && (v->type == V_UNDEF || v->type == V_NULL)) {
-		static int s_getundef = -1;
-		if(s_getundef < 0) s_getundef = (getenv("MARIO_GETUNDEF") != NULL) ? 1 : 0;
-		if(s_getundef)
-			fprintf(stderr, "[GETUNDEF] %s.%s pc=%u%s%s\n",
-				(v->type == V_NULL) ? "null" : "undef", name, (unsigned)vm->pc,
-				vm->dbg_tag != NULL ? "  [" : "", vm->dbg_tag != NULL ? vm->dbg_tag : "");
-	}
 	/* Chrome parity (MARIO_STRICTGET): a property READ on an undefined/null
 	 * base throws TypeError, exactly like Chrome, so site try/catch fallbacks
 	 * (wx flash detection: plugins["Shockwave Flash"].description) engage.
@@ -10367,31 +10253,6 @@ void do_get(vm_t* vm, var_t* v, const char* name, bool for_write) {
 		if(n != NULL)
 			mic_fill(vm, mic_site, v, name, n);
 	}
-	/* TEMP DIAGNOSTIC (taobao baxia VMP env-gap RCA): a READ whose name resolves to
-	 * nothing on the base (own + prototype chain) yields undefined - exactly the
-	 * signal of a host/BOM property Chrome has but this engine lacks. Log the name
-	 * for script_39 (gate on dbg_tag, immune to pc-base drift). Read-only, no value
-	 * mutation. Gated by MARIO_MISSGET; remove with the other temp probes. */
-	if(n == NULL && !for_write) {
-		static int s_mg = -1;
-		if(s_mg < 0) {
-			const char* me = getenv("MARIO_MISSGET");
-			s_mg = (me == NULL) ? 0 : (me[0] == '2' ? 2 : 1);
-		}
-		if(s_mg == 2)
-			fprintf(stderr, "[missget] '%s' base_type=%u pc=%u tag=%s\n", name, (unsigned)v->type, (unsigned)vm->pc, vm->dbg_tag != NULL ? vm->dbg_tag : "-");
-		else if(s_mg == 1 && vm->dbg_tag != NULL && strstr(vm->dbg_tag, "script_39") != NULL)
-			fprintf(stderr, "[missget] '%s' base_type=%u pc=%u\n", name, (unsigned)v->type, (unsigned)vm->pc);
-	}
-	if(getenv("MARIO_LMDBG") != NULL && strcmp(name, "lm") == 0) {
-		fprintf(stderr, "[lmdbg] GET base=%p type=%u refs=%d own=%p found=%p value=%p type=%u str=[%s] pc=%u\n",
-			(void*)v, (unsigned)v->type, (int)v->refs,
-			(void*)var_find_own_member(v, name), (void*)n,
-			(void*)(n != NULL ? n->var : NULL),
-			(unsigned)(n != NULL && n->var != NULL ? n->var->type : 999u),
-			(n != NULL && n->var != NULL && n->var->type == V_STRING) ? var_get_str(n->var) : "-",
-			(unsigned)vm->pc);
-	}
 	/* Function.prototype.toString: functions carry Object.prototype as their
 	 * prototype (see native_Function.c), so `fn.toString` would resolve to
 	 * Object.prototype.toString ("[object Function]") and core-js's
@@ -10423,19 +10284,6 @@ void do_get(vm_t* vm, var_t* v, const char* name, bool for_write) {
 			func_t* ff = var_get_func(v);
 			if(ff != NULL && ff->nfe_name != NULL)
 				nm = ff->nfe_name;
-		}
-		/* TEMP DIAGNOSTIC (taobao baxia VMP al("") RCA): log every empty fn.name
-		 * read so we can see whether the VMP resolves a symbol to "" via .name.
-		 * Gated by MARIO_NAMEDBG; remove with the other temp probes. */
-		if((nm == NULL || nm[0] == 0)) {
-			static int s_namedbg = -1;
-			if(s_namedbg < 0) s_namedbg = (getenv("MARIO_NAMEDBG") != NULL) ? 1 : 0;
-			if(s_namedbg) {
-				int inr = (vm->pc >= 715843 && vm->pc < 912412);
-				fprintf(stderr, "[namedbg] EMPTY fn.name pc=%u in_script39=%d tag=%s is_class=%d\n",
-					(unsigned)vm->pc, inr, vm->dbg_tag != NULL ? vm->dbg_tag : "-", (int)v->is_class);
-				fflush(stderr);
-			}
 		}
 		vm_push(vm, var_new_str(vm, (nm != NULL) ? nm : ""));
 		return;
@@ -10590,22 +10438,6 @@ void do_get(vm_t* vm, var_t* v, const char* name, bool for_write) {
 		vm_push(vm, n->var);
 	else
 		vm_push_node(vm, n);
-	/* TEMP DIAGNOSTIC (taobao baxia VMP al("") RCA): log member reads that yield
-	 * an EMPTY STRING inside script_39's pc range, with the property name - the
-	 * VMP feeds one of these into its ReferenceError(name+" is not defined") guard
-	 * as "". Gated by MARIO_EMPTYGET; remove with the other temp probes. */
-	{
-		static int s_eg = -1;
-		if(s_eg < 0) s_eg = (getenv("MARIO_EMPTYGET") != NULL) ? 1 : 0;
-		if(s_eg && n != NULL && n->var != NULL && n->var->type == V_STRING &&
-		   vm->pc >= 715843 && vm->pc < 912412) {
-			const char* sv = var_get_str(n->var);
-			if(sv != NULL && sv[0] == 0) {
-				fprintf(stderr, "[emptyget] prop='%s' -> \"\" pc=%u\n", name, (unsigned)vm->pc);
-				fflush(stderr);
-			}
-		}
-	}
 }
 /* Link cls_var under its superclass. `implicit_obj` marks the default
  * `extends Object` every class gets from vm_new_class()/INSTR_EXTENDS, as
@@ -13103,29 +12935,6 @@ static inline void handle_asign(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 	 * need it (node_replace() would then var_ref() freed memory). Keep the
 	 * collector out until v is back on the stack or released. See vm_step_op(). */
 	vm->gc.gc_defer++;
-	/* TEMP DIAGNOSTIC (baxia et_f VMP al("") RCA): log every store of an EMPTY
-	 * string into a numeric (array-index) target while running a page script. The
-	 * VMP register file r[] is an array; r[q]=="" at the failing dispatch means an
-	 * earlier opcode stored "" into a register, so this pinpoints the write's pc
-	 * (which maps back to the VMP source op that produced the empty name). Gated by
-	 * MARIO_EMPTYSTORE; read-only. Remove with the other temp probes. */
-	if(v != NULL && n != NULL && n->name != NULL && v->type == V_STRING) {
-		static int s_es = -1;
-		if(s_es < 0) s_es = (getenv("MARIO_EMPTYSTORE") != NULL) ? 1 : 0;
-		if(s_es && ((const char*)v->value)[0] == '\0' && vm->dbg_tag != NULL) {
-			const char* nm = n->name;
-			int numeric = (nm[0] != '\0');
-			for(const char* p = nm; *p != '\0'; ++p)
-				if(*p < '0' || *p > '9') { numeric = 0; break; }
-			if(numeric) {
-				mstr_t* sm = mstr_new("");
-				bc_srcmap_locate(&vm->bc, vm->pc, sm);
-				fprintf(stderr, "[emptystore] tag=%s pc=%u idx=%s src=%s\n",
-					vm->dbg_tag, (unsigned)vm->pc, nm, (sm != NULL && sm->cstr != NULL) ? sm->cstr : "");
-				mstr_free(sm);
-			}
-		}
-	}
 	/* NamedEvaluation: `f = () => {}` / `f = function(){}` names the function. */
 	if(v != NULL && n != NULL && n->name != NULL)
 		infer_func_name(v, n->name);
@@ -13834,24 +13643,6 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 	if(func == NULL && obj != NULL)
 		func = find_func(vm, obj, name->cstr, instr != INSTR_CALLO);
 
-	/* TEMP DIAGNOSTIC (baxia VMP al("") provenance): log the CALL-SITE pc of every
-	 * call to the VMP's ReferenceError guard `al` (a named function expression, so
-	 * nfe_name=="al") so the argument push sequence at that site can be mapped to a
-	 * script-local offset and disassembled. Gated by MARIO_ALDBG; remove with the
-	 * other temp probes. */
-	if(func != NULL && func->is_func) {
-		static int s_aldbg = -1;
-		if(s_aldbg < 0) s_aldbg = (getenv("MARIO_ALDBG") != NULL) ? 1 : 0;
-		if(s_aldbg) {
-			func_t* cf = var_get_func(func);
-			if(cf != NULL && cf->nfe_name != NULL && strcmp(cf->nfe_name, "al") == 0) {
-				fprintf(stderr, "[aldbg] CALL al callsite_pc=%u tag=%s argc=%d\n",
-					(unsigned)vm->pc, vm->dbg_tag != NULL ? vm->dbg_tag : "-", arg_num);
-				fflush(stderr);
-			}
-		}
-	}
-
 	/* A Proxy receiver on a fused member call (`proxy.method(args)`): find_func
 	 * walks the raw own/prototype member chain and never runs the proxy's `get`
 	 * trap, so the method mis-resolved to "can not find function 'method'". A
@@ -13884,29 +13675,6 @@ static inline void handle_call(vm_t* vm, PC ins, opr_code_t instr, uint32_t offs
 			var_ref(pf);
 			func = pf;
 			proxy_owned_func = true;
-		}
-	}
-
-	if(getenv("MARIO_CALLCHAIN") != NULL &&
-	   vm->pc == (PC)atoi(getenv("MARIO_CALLCHAIN"))) {
-		fprintf(stderr, "[callchain] name=%s pc=%u obj=%p type=%u resolved=%p fpc=%u\n",
-			name->cstr, (unsigned)vm->pc, (void*)obj,
-			(unsigned)(obj != NULL ? obj->type : 999u), (void*)func,
-			(unsigned)(func != NULL && func->is_func && func->value != NULL
-				? ((func_t*)func->value)->pc : 0u));
-		var_t* walk = obj;
-		for(int hop = 0; walk != NULL && hop < 32; ++hop) {
-			node_t* own = var_find_own_member(walk, name->cstr);
-			var_t* proto = var_get_prototype(walk);
-			fprintf(stderr,
-				"[callchain]   hop=%d var=%p own=%p value=%p type=%u fpc=%u proto=%p\n",
-				hop, (void*)walk, (void*)own,
-				(void*)(own != NULL ? own->var : NULL),
-				(unsigned)(own != NULL && own->var != NULL ? own->var->type : 999u),
-				(unsigned)(own != NULL && own->var != NULL && own->var->is_func &&
-					own->var->value != NULL ? ((func_t*)own->var->value)->pc : 0u),
-				(void*)proto);
-			walk = proto;
 		}
 	}
 
@@ -14764,13 +14532,6 @@ static inline void handle_member(vm_t* vm, PC ins, opr_code_t instr, uint32_t of
 		v = var_new(vm);
 
 	var_t *var = vm_get_scope_var(vm);
-	if(getenv("MARIO_LMDBG") != NULL && strcmp(s, "lm") == 0) {
-		fprintf(stderr, "[lmdbg] SET target=%p target_type=%u value=%p type=%u str=[%s] refs=%d pc=%u\n",
-			(void*)var, (unsigned)(var != NULL ? var->type : 999u), (void*)v,
-			(unsigned)(v != NULL ? v->type : 999u),
-			(v != NULL && v->type == V_STRING) ? var_get_str(v) : "-",
-			(v != NULL ? (int)v->refs : -1), (unsigned)vm->pc);
-	}
 	if(v == NULL || var == NULL) { /* OOM: value or target missing - drop the write */
 		if(v != NULL)
 			var_unref(v);
@@ -15127,28 +14888,16 @@ var_t* vm_new_string_iterator(vm_t* vm, var_t* str) {
 var_t* vm_get_iterator(vm_t* vm, var_t* iterable) {
 	if(iterable == NULL)
 		return NULL;
-	/* TEMP DIAGNOSTIC (MARIO_TADB): why does GetIterator return NULL for the
-	 * baxia VMP's array-like at pc=909086? Log the branch actually taken. */
-	int s39i = (getenv("MARIO_TADB") != NULL && vm->pc >= 715843 && vm->pc < 912412);
 	if(iterable->type == V_OBJECT) {
 		node_t* m = var_find_member(iterable, SYMKEY_ITERATOR);
-		if(s39i)
-			fprintf(stderr, "[tadb-iter] OBJ isarr=%d sym=%p symfunc=%d pc=%u\n",
-				(int)iterable->is_array, (void*)m,
-				(int)(m!=NULL && m->var!=NULL && m->var->is_func), (unsigned)vm->pc);
 		if(m != NULL && m->var != NULL && m->var->is_func) {
 			func_call(vm, iterable, m->var, 0, false); /* pushes the iterator */
 			var_t* it = vm_pop2(vm); /* carries the push ref */
-			if(s39i)
-				fprintf(stderr, "[tadb-iter]   => called symiter, ret=%p properr=%p pc=%u\n",
-					(void*)it, (void*)vm->propagating_err, (unsigned)vm->pc);
 			return it;
 		}
 		if(iterable->is_array) {
 			var_t* it = new_native_iter(vm, iterable, false);
 			var_ref(it);
-			if(s39i)
-				fprintf(stderr, "[tadb-iter]   => is_array native iter=%p pc=%u\n", (void*)it, (unsigned)vm->pc);
 			return it;
 		}
 	}
@@ -18662,44 +18411,6 @@ static inline void handle_throw(vm_t* vm, PC ins, opr_code_t instr, uint32_t off
 	vm_clear_pending(vm);
 	vm_throw_truncate(vm); // the thrown value is on top; drop operands the interrupted expression leaked
 	scope_t* try_sc = vm_find_inrange_handler(vm);
-	/* TEMP DIAGNOSTIC (baxia VMP empty-name ReferenceError): capture the exact pc
-	 * of a JS-level `throw`, whether an in-range try existed, and the frame chain,
-	 * so the throw site can be mapped into the script's local offset and
-	 * disassembled. Gated by MARIO_THROWJS; remove with the other temp probes. */
-	static int s_throwjs = -1;
-	if(s_throwjs < 0) s_throwjs = (getenv("MARIO_THROWJS") != NULL) ? 1 : 0;
-	if(s_throwjs) {
-		const char* tmsg = "";
-		var_t* tv0 = vm_peek_var(vm);
-		if(tv0 != NULL && tv0->type == V_OBJECT) {
-			var_t* mv = var_find_member_var(tv0, "message");
-			if(mv != NULL && mv->type == V_STRING) tmsg = var_get_str(mv);
-		}
-		fprintf(stderr, "[throwjs] pc=%u try_inrange=%d tag=%s msg='%s'\n",
-			(unsigned)vm->pc, (try_sc != NULL) ? 1 : 0,
-			vm->dbg_tag != NULL ? vm->dbg_tag : "-", tmsg);
-		{
-			const char* turl = NULL; int tln = 0, tcl = 0;
-			if(bc_srcmap_locate_v8(&vm->bc, vm->pc, &turl, &tln, &tcl))
-				fprintf(stderr, "[throwjs]   at %s:%d:%d\n", turl ? turl : "-", tln, tcl);
-		}
-		scope_t* tsc = vm_get_scope(vm);
-		int thop = 0;
-		while(tsc != NULL && thop++ < 8) {
-			if(tsc->is_func && tsc->func != NULL) {
-				const char* furl = NULL; int fln = 0, fcl = 0;
-				char floc[512];
-				if(bc_srcmap_locate_v8(&vm->bc, tsc->func->pc, &furl, &fln, &fcl))
-					snprintf(floc, sizeof floc, "%s:%d:%d", furl ? furl : "-", fln, fcl);
-				else
-					snprintf(floc, sizeof floc, "<nosrc>");
-				fprintf(stderr, "[throwjs]   frame[%d] entrypc=%u is_try=%d at %s\n",
-					thop, (unsigned)tsc->func->pc, (int)tsc->is_try, floc);
-			}
-			tsc = tsc->prev;
-		}
-		fflush(stderr);
-	}
 	if(try_sc == NULL || !try_sc->is_try) {
 		/* No catch here, or the innermost handler is a finally-only scope: an
 		 * unhandled user throw propagates outward (a vm_run frame with an

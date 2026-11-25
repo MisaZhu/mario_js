@@ -129,19 +129,9 @@ static var_t** ta_collect(vm_t* vm, var_t* src, int64_t* out_n) {
 	int64_t cap = 8, n = 0;
 	var_t** items = (var_t**)mario_malloc((uint32_t)(sizeof(var_t*) * cap));
 	var_t* iter = vm_get_iterator(vm, src);
-	/* TEMP DIAGNOSTIC (MARIO_TADB): why does the baxia VMP's iterable collect 0? */
-	int s39 = (getenv("MARIO_TADB") != NULL && vm->pc >= 715843 && vm->pc < 912412);
-	if(s39) {
-		var_t* sl = var_find_member_var(src, "length");
-		fprintf(stderr, "[tadb-collect] src.t=%u isarr=%d sz=%u iter=%p length=%s pc=%u\n",
-			(unsigned)src->type, (int)src->is_array, (unsigned)src->size, (void*)iter,
-			(sl != NULL) ? "set" : "none", (unsigned)vm->pc);
-	}
 	if(iter != NULL) {
 		for(;;) {
 			var_t* step = call_m_func_by_name(vm, iter, "next", 0);
-			if(s39 && n < 3)
-				fprintf(stderr, "[tadb-collect]   step[%lld]=%p\n", (long long)n, (void*)step);
 			if(step == NULL) break;
 			var_t* donev = var_find_member_var(step, "done");
 			if(donev != NULL && var_get_bool(donev)) { var_unref(step); break; }
@@ -156,11 +146,6 @@ static var_t** ta_collect(vm_t* vm, var_t* src, int64_t* out_n) {
 	else {
 		var_t* lenv = var_find_member_var(src, "length");
 		int64_t cnt = (lenv != NULL) ? var_get_int64(lenv) : 0;
-		if(s39) {
-			fprintf(stderr, "[tadb-collect]   fallback lenv=%p lenv.t=%u cnt=%lld varr_size=%u pc=%u\n",
-				(void*)lenv, (unsigned)(lenv?lenv->type:99), (long long)cnt,
-				(unsigned)var_array_size(src), (unsigned)vm->pc);
-		}
 		for(int64_t i = 0; i < cnt; i++) {
 			char key[32]; snprintf(key, sizeof(key), "%lld", (long long)i);
 			var_t* val = var_find_member_var(src, key);
@@ -170,8 +155,6 @@ static var_t** ta_collect(vm_t* vm, var_t* src, int64_t* out_n) {
 		}
 	}
 	*out_n = n;
-	if(s39)
-		fprintf(stderr, "[tadb-collect] => collected n=%lld pc=%u\n", (long long)n, (unsigned)vm->pc);
 	return items;
 }
 
@@ -212,22 +195,6 @@ var_t* native_TypedArray_constructor(vm_t* vm, var_t* env, void* data) {
 	var_t* b = get_obj(env, "b");
 	var_t* c = get_obj(env, "c");
 
-	/* TEMP DIAGNOSTIC (taobao baxia VMP al("") RCA): dump every TypedArray
-	 * construction inside script_39 with full provenance of the first arg so we can
-	 * see where the 0-byte buffer comes from. Gated by MARIO_TADB. */
-	if(getenv("MARIO_TADB") != NULL && vm->pc >= 715843 && vm->pc < 912412) {
-		char ab[160]; ab[0] = 0;
-		if(a != NULL) {
-			var_t* bl = var_find_own_member_var(a, "byteLength");
-			snprintf(ab, sizeof(ab), "a:t%u sz=%u ab=%d ta=%d dv=%d bl=%s",
-				(unsigned)a->type, (unsigned)a->size, (int)var_is_arraybuffer(a),
-				(int)var_is_typedarray(a), (int)var_is_dataview(a),
-				(bl != NULL && (bl->type==V_INT||bl->type==V_INT64)) ? "set" : "none");
-		}
-		fprintf(stderr, "[tadb-ctor] et=%d esz=%u %s b.t=%u c.t=%u pc=%u\n",
-			et, esz, ab, (unsigned)(b?b->type:99), (unsigned)(c?c->type:99), (unsigned)vm->pc);
-	}
-
 	vm->gc.gc_defer++;   // protects this_v's fresh members + collected items across JS calls
 
 	/* --- (buffer[, byteOffset[, length]]) : a view over an existing buffer --- */
@@ -244,10 +211,6 @@ var_t* native_TypedArray_constructor(vm_t* vm, var_t* env, void* data) {
 		if(c != NULL && c->type != V_UNDEF) {
 			length = var_get_int64(c);
 			if(length < 0 || byteOffset + length * (int64_t)esz > bufbytes) {
-				if(getenv("MARIO_TADB") != NULL)
-					fprintf(stderr, "[tadb] VIEW et=%d esz=%u bufbytes=%lld byteOffset=%lld length=%lld (a.t=%u b.t=%u c.t=%u) pc=%u\n",
-						et, esz, (long long)bufbytes, (long long)byteOffset, (long long)length,
-						(unsigned)(a?a->type:99), (unsigned)(b?b->type:99), (unsigned)(c?c->type:99), (unsigned)vm->pc);
 				vm_throw_type_native(vm, "RangeError", "Invalid TypedArray length");
 				ta_setup(vm, this_v, et, a, byteOffset, 0);
 				vm->gc.gc_defer--;
@@ -275,9 +238,6 @@ var_t* native_TypedArray_constructor(vm_t* vm, var_t* env, void* data) {
 	if(a == NULL || a->type == V_UNDEF || ta_is_number_var(a)) {
 		int64_t length = (a == NULL || a->type == V_UNDEF) ? 0 : var_get_int64(a);
 		if(length < 0) {
-			if(getenv("MARIO_TADB") != NULL)
-				fprintf(stderr, "[tadb] LEN et=%d esz=%u length=%lld a.t=%u pc=%u\n",
-					et, esz, (long long)length, (unsigned)(a?a->type:99), (unsigned)vm->pc);
 			vm_throw_type_native(vm, "RangeError", "Invalid TypedArray length");
 			length = 0;
 		}
